@@ -1,0 +1,72 @@
+name: "CI - PR Checks"
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: pr-checks-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  title:
+    name: PR title
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check PR title
+        uses: zrr1999/zendev/actions/validate-title@v0.0.5
+        with:
+          text: ${{ github.event.pull_request.title }}
+
+  body:
+    name: PR body
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check PR body headings
+        env:
+          GITHUB_EVENT_PATH: ${{ github.event_path }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          from pathlib import Path
+
+          def extract_h2_headings(text: str) -> list[str]:
+              in_fence = False
+              headings = []
+              for line in text.splitlines():
+                  stripped = line.strip()
+                  if stripped.startswith("```"):
+                      in_fence = not in_fence
+                      continue
+                  if in_fence:
+                      continue
+                  if re.match(r"^##\s+\S", stripped):
+                      headings.append(re.sub(r"^##\s+", "", stripped))
+              return headings
+
+          payload = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8"))
+          body = (payload.get("pull_request") or {}).get("body") or ""
+          template = Path(".github/pull_request_template.md").read_text(encoding="utf-8")
+
+          expected = extract_h2_headings(template)
+          actual = extract_h2_headings(body)
+
+          if actual != expected:
+              print("PR body headings do not match the repository template.", file=sys.stderr)
+              print(f"Expected headings: {expected}", file=sys.stderr)
+              print(f"Actual headings:   {actual}", file=sys.stderr)
+              raise SystemExit(1)
+
+          print("PR body headings match the repository template.")
+          PY

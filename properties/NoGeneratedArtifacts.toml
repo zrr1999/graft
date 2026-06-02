@@ -1,0 +1,20 @@
+[query]
+kind = "files"
+include = [
+  "target/*",
+  "dist/*",
+  "build/*",
+  "lcov.info",
+  "*.profraw",
+  "*.profdata"
+]
+exclude = []
+
+[evaluator]
+kind = "builtin"
+name = "paths_none_match"
+
+[evaluator.options]
+
+[judge]
+kind = "bool_true"

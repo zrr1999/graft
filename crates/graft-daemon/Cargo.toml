@@ -1,0 +1,20 @@
+[package]
+name = "graft-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "graftd"
+path = "src/main.rs"
+
+[dependencies]
+graft-client = { path = "../graft-client" }
+graft-core = { path = "../graft-core" }
+graft-runtime = { path = "../graft-runtime" }
+graft-scratch = { path = "../graft-scratch" }
+graft-store = { path = "../graft-store" }
+serde_json.workspace = true

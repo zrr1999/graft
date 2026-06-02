@@ -1,0 +1,14 @@
+[query]
+kind = "target_snapshot"
+
+[evaluator]
+kind = "command"
+command = "cargo fmt --all -- --check"
+args = []
+env = {}
+setup = []
+pre = []
+teardown = []
+
+[judge]
+kind = "exit_code_zero"

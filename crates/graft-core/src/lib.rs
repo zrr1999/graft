@@ -1,0 +1,1446 @@
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use time::OffsetDateTime;
+
+#[derive(Debug, thiserror::Error)]
+pub enum CoreError {
+    #[error("failed to canonicalize record for stable id: {0}")]
+    Canonicalize(#[from] serde_json::Error),
+}
+
+pub type Result<T> = std::result::Result<T, CoreError>;
+
+macro_rules! id_type {
+    ($name:ident) => {
+        #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+        #[serde(transparent)]
+        pub struct $name(String);
+
+        impl $name {
+            pub fn new(value: impl Into<String>) -> Self {
+                Self(value.into())
+            }
+
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+    };
+}
+
+id_type!(CandidateId);
+id_type!(PatchId);
+id_type!(EvidenceId);
+id_type!(ChangeId);
+id_type!(PropertyId);
+id_type!(RelationId);
+id_type!(PromotionId);
+id_type!(ScratchId);
+id_type!(FileViewHash);
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RepoBaseState {
+    pub repo_id: String,
+    pub treeish: String,
+    pub resolved_tree_oid: String,
+}
+
+impl RepoBaseState {
+    pub fn new(
+        repo_id: impl Into<String>,
+        treeish: impl Into<String>,
+        resolved_tree_oid: impl Into<String>,
+    ) -> Self {
+        Self {
+            repo_id: repo_id.into(),
+            treeish: treeish.into(),
+            resolved_tree_oid: resolved_tree_oid.into(),
+        }
+    }
+
+    pub fn display_ref(&self) -> String {
+        let short_oid = self
+            .resolved_tree_oid
+            .get(..12)
+            .unwrap_or(self.resolved_tree_oid.as_str());
+        format!("repo:{}@{}#{short_oid}", self.repo_id, self.treeish)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum StateId {
+    GitTree(String),
+    RepoTree(RepoBaseState),
+    GraftTree(String),
+}
+
+/// User-facing parsed form of a `--from <X>` / `base: <X>` reference.
+///
+/// Both the CLI (`graft create --from ...`) and `graftd` (`scratch_open` base)
+/// accept the same string forms, so they share one parser here. Each variant
+/// only carries the data the parser is sure about; resolving it to a concrete
+/// [`StateId`] (which may require a Git repo, a clone, or a registry lookup)
+/// is the consumer's responsibility.
+///
+/// Supported forms:
+///
+/// - `HEAD`, any other Git treeish (e.g. `main`, `abc1234`, `refs/heads/x`)
+///   parses to [`BaseRefSpec::GitTreeish`].
+/// - `repo:<id>@<treeish>` parses to [`BaseRefSpec::Repo`]; the `<id>` must be
+///   declared in `[repos.<id>]`.
+/// - `tree:<digest>` parses to [`BaseRefSpec::GraftTree`].
+/// - `candidate:<digest>` parses to [`BaseRefSpec::Candidate`].
+/// - `patch:<digest>` parses to [`BaseRefSpec::Patch`].
+/// - `graft:empty` parses to [`BaseRefSpec::Empty`], an explicit "start from
+///   nothing" sentinel for environments without a Git base.
+///
+/// Legacy display IDs such as `gt_<digest>`, `grc_<digest>`, and `gr_<digest>`
+/// are rejected with [`BaseRefParseError::LegacyId`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BaseRefSpec {
+    GitTreeish(String),
+    Repo { repo_id: String, treeish: String },
+    GraftTree(String),
+    Candidate(CandidateId),
+    Patch(PatchId),
+    Empty,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum BaseRefParseError {
+    #[error("empty base ref")]
+    Empty,
+    #[error("invalid repo base ref `{0}`; expected `repo:<id>@<treeish>`")]
+    InvalidRepo(String),
+    #[error("invalid prefixed base ref `{0}`; value after `{1}:` must not be empty")]
+    EmptyPrefix(String, &'static str),
+    #[error("[E_LEGACY_ID] legacy id `{0}` uses `{1}`; use `{2}:<digest>`")]
+    LegacyId(String, &'static str, &'static str),
+}
+
+fn legacy_id_prefix(value: &str) -> Option<(&'static str, &'static str)> {
+    [
+        ("graft-tree:", "tree"),
+        ("gt_", "tree"),
+        ("ch_", "change"),
+        ("grc_", "candidate"),
+        ("gr_", "patch"),
+        ("ev_", "evidence"),
+        ("cf_", "conflict"),
+        ("rel_", "relation"),
+        ("prm_", "promotion"),
+        ("scr_", "scratch"),
+        ("fv_", "file_view"),
+    ]
+    .into_iter()
+    .find(|(prefix, _)| value.starts_with(prefix))
+}
+
+impl BaseRefSpec {
+    /// Parses a single `--from`-style string. See [`BaseRefSpec`] for the
+    /// supported forms. Unknown free-form input is treated as a Git treeish so
+    /// existing flows like `--from main` keep working.
+    pub fn parse(value: &str) -> std::result::Result<Self, BaseRefParseError> {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Err(BaseRefParseError::Empty);
+        }
+        if trimmed == "graft:empty" {
+            return Ok(Self::Empty);
+        }
+        if let Some(rest) = trimmed.strip_prefix("repo:") {
+            let (repo_id, treeish) = rest
+                .split_once('@')
+                .ok_or_else(|| BaseRefParseError::InvalidRepo(trimmed.to_string()))?;
+            if repo_id.is_empty() || treeish.is_empty() {
+                return Err(BaseRefParseError::InvalidRepo(trimmed.to_string()));
+            }
+            return Ok(Self::Repo {
+                repo_id: repo_id.to_string(),
+                treeish: treeish.to_string(),
+            });
+        }
+        if let Some((legacy_prefix, typed_kind)) = legacy_id_prefix(trimmed) {
+            return Err(BaseRefParseError::LegacyId(
+                trimmed.to_string(),
+                legacy_prefix,
+                typed_kind,
+            ));
+        }
+        if let Some(rest) = trimmed.strip_prefix("tree:") {
+            if rest.is_empty() {
+                return Err(BaseRefParseError::EmptyPrefix(trimmed.to_string(), "tree"));
+            }
+            return Ok(Self::GraftTree(trimmed.to_string()));
+        }
+        if let Some(rest) = trimmed.strip_prefix("candidate:") {
+            if rest.is_empty() {
+                return Err(BaseRefParseError::EmptyPrefix(
+                    trimmed.to_string(),
+                    "candidate",
+                ));
+            }
+            return Ok(Self::Candidate(CandidateId::new(trimmed)));
+        }
+        if let Some(rest) = trimmed.strip_prefix("patch:") {
+            if rest.is_empty() {
+                return Err(BaseRefParseError::EmptyPrefix(trimmed.to_string(), "patch"));
+            }
+            return Ok(Self::Patch(PatchId::new(trimmed)));
+        }
+        Ok(Self::GitTreeish(trimmed.to_string()))
+    }
+
+    /// Pretty form suitable for logs and error messages.
+    pub fn display(&self) -> String {
+        match self {
+            Self::GitTreeish(value) => value.clone(),
+            Self::Repo { repo_id, treeish } => format!("repo:{repo_id}@{treeish}"),
+            Self::GraftTree(id) => id.clone(),
+            Self::Candidate(id) => id.as_str().to_string(),
+            Self::Patch(id) => id.as_str().to_string(),
+            Self::Empty => "graft:empty".to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum ChangeRef {
+    Stored(ChangeId),
+    InlineSummary(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TreeEntry {
+    pub path: String,
+    pub hash: String,
+    pub size: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TreeSnapshot {
+    pub entries: Vec<TreeEntry>,
+}
+
+impl TreeSnapshot {
+    pub fn new(mut entries: Vec<TreeEntry>) -> Self {
+        entries.sort_by(|left, right| left.path.cmp(&right.path));
+        Self { entries }
+    }
+
+    pub fn id(&self) -> Result<String> {
+        stable_typed_id("tree", self)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScratchNode {
+    pub version: u32,
+    pub base_state: StateId,
+    pub parent: Option<ScratchId>,
+    pub op: Option<CanonicalScratchOp>,
+    pub result_tree_digest: String,
+}
+
+impl ScratchNode {
+    pub const VERSION: u32 = 1;
+
+    pub fn root(base_state: StateId, result_tree_digest: impl Into<String>) -> Self {
+        Self {
+            version: Self::VERSION,
+            base_state,
+            parent: None,
+            op: None,
+            result_tree_digest: result_tree_digest.into(),
+        }
+    }
+
+    pub fn child(
+        parent: ScratchId,
+        base_state: StateId,
+        op: CanonicalScratchOp,
+        result_tree_digest: impl Into<String>,
+    ) -> Self {
+        Self {
+            version: Self::VERSION,
+            base_state,
+            parent: Some(parent),
+            op: Some(op),
+            result_tree_digest: result_tree_digest.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CanonicalScratchOp {
+    Edit {
+        path: String,
+        edits: Vec<HashlineEdit>,
+    },
+    Write {
+        path: String,
+        content_hash: String,
+        size: u64,
+    },
+    Delete {
+        path: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HashlineEdit {
+    ReplaceLine {
+        line: u64,
+        hash: String,
+        old: String,
+        new: String,
+    },
+    ReplaceRange {
+        start_line: u64,
+        start_hash: String,
+        end_line: u64,
+        end_hash: String,
+        new_lines: Vec<String>,
+    },
+    InsertAfter {
+        line: u64,
+        hash: String,
+        new_lines: Vec<String>,
+    },
+    InsertBefore {
+        line: u64,
+        hash: String,
+        new_lines: Vec<String>,
+    },
+    ReplaceText {
+        old_text: String,
+        new_text: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct FileViewHashSeed<'a> {
+    pub scratch: &'a ScratchId,
+    pub path: &'a str,
+    pub bytes_hash: &'a str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileChangeKind {
+    Added,
+    Modified,
+    Deleted,
+    Unchanged,
+    Captured,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FileChange {
+    pub path: String,
+    pub kind: FileChangeKind,
+    pub base_hash: Option<String>,
+    pub target_hash: Option<String>,
+    pub base_size: Option<u64>,
+    pub target_size: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ChangeSet {
+    pub base_state: StateId,
+    pub target_state: StateId,
+    pub files: Vec<FileChange>,
+}
+
+impl ChangeSet {
+    pub fn from_snapshots(
+        base_state: StateId,
+        base: Option<&TreeSnapshot>,
+        target_state: StateId,
+        target: &TreeSnapshot,
+    ) -> Self {
+        let mut files = Vec::new();
+        let target_entries = target
+            .entries
+            .iter()
+            .map(|entry| (entry.path.as_str(), entry))
+            .collect::<BTreeMap<_, _>>();
+
+        if let Some(base) = base {
+            let base_entries = base
+                .entries
+                .iter()
+                .map(|entry| (entry.path.as_str(), entry))
+                .collect::<BTreeMap<_, _>>();
+            for (path, base_entry) in &base_entries {
+                match target_entries.get(*path) {
+                    Some(target_entry) if target_entry.hash == base_entry.hash => {}
+                    Some(target_entry) => {
+                        files.push(FileChange {
+                            path: (*path).to_string(),
+                            kind: FileChangeKind::Modified,
+                            base_hash: Some(base_entry.hash.clone()),
+                            target_hash: Some(target_entry.hash.clone()),
+                            base_size: Some(base_entry.size),
+                            target_size: Some(target_entry.size),
+                        });
+                    }
+                    None => {
+                        files.push(FileChange {
+                            path: (*path).to_string(),
+                            kind: FileChangeKind::Deleted,
+                            base_hash: Some(base_entry.hash.clone()),
+                            target_hash: None,
+                            base_size: Some(base_entry.size),
+                            target_size: None,
+                        });
+                    }
+                }
+            }
+            for (path, target_entry) in target_entries {
+                if !base_entries.contains_key(path) {
+                    files.push(FileChange {
+                        path: path.to_string(),
+                        kind: FileChangeKind::Added,
+                        base_hash: None,
+                        target_hash: Some(target_entry.hash.clone()),
+                        base_size: None,
+                        target_size: Some(target_entry.size),
+                    });
+                }
+            }
+        } else {
+            files.extend(target.entries.iter().map(|entry| FileChange {
+                path: entry.path.clone(),
+                kind: FileChangeKind::Captured,
+                base_hash: None,
+                target_hash: Some(entry.hash.clone()),
+                base_size: None,
+                target_size: Some(entry.size),
+            }));
+        }
+
+        files.sort_by(|left, right| left.path.cmp(&right.path));
+        Self {
+            base_state,
+            target_state,
+            files,
+        }
+    }
+
+    pub fn id(&self) -> Result<ChangeId> {
+        Ok(ChangeId::new(stable_typed_id("change", self)?))
+    }
+
+    pub fn compose(first: &Self, second: &Self) -> Self {
+        #[derive(Default)]
+        struct Endpoints {
+            base_hash: Option<String>,
+            target_hash: Option<String>,
+            base_size: Option<u64>,
+            target_size: Option<u64>,
+            has_base: bool,
+        }
+
+        let mut endpoints = BTreeMap::<String, Endpoints>::new();
+        for file in &first.files {
+            let entry = endpoints.entry(file.path.clone()).or_default();
+            entry.base_hash = file.base_hash.clone();
+            entry.base_size = file.base_size;
+            entry.target_hash = file.target_hash.clone();
+            entry.target_size = file.target_size;
+            entry.has_base = true;
+        }
+        for file in &second.files {
+            let entry = endpoints.entry(file.path.clone()).or_default();
+            if !entry.has_base {
+                entry.base_hash = file.base_hash.clone();
+                entry.base_size = file.base_size;
+                entry.has_base = true;
+            }
+            entry.target_hash = file.target_hash.clone();
+            entry.target_size = file.target_size;
+        }
+
+        let files = endpoints
+            .into_iter()
+            .filter_map(|(path, entry)| {
+                let kind = file_change_kind(&entry.base_hash, &entry.target_hash)?;
+                Some(FileChange {
+                    path,
+                    kind,
+                    base_hash: entry.base_hash,
+                    target_hash: entry.target_hash,
+                    base_size: entry.base_size,
+                    target_size: entry.target_size,
+                })
+            })
+            .collect();
+
+        Self {
+            base_state: first.base_state.clone(),
+            target_state: second.target_state.clone(),
+            files,
+        }
+    }
+
+    pub fn migrated(&self, base_state: StateId) -> Self {
+        Self {
+            base_state,
+            target_state: self.target_state.clone(),
+            files: self.files.clone(),
+        }
+    }
+
+    pub fn reversed(&self) -> Self {
+        let mut files = self
+            .files
+            .iter()
+            .map(|file| {
+                let kind = match file.kind {
+                    FileChangeKind::Added | FileChangeKind::Captured => FileChangeKind::Deleted,
+                    FileChangeKind::Modified => FileChangeKind::Modified,
+                    FileChangeKind::Deleted => FileChangeKind::Added,
+                    FileChangeKind::Unchanged => FileChangeKind::Unchanged,
+                };
+                FileChange {
+                    path: file.path.clone(),
+                    kind,
+                    base_hash: file.target_hash.clone(),
+                    target_hash: file.base_hash.clone(),
+                    base_size: file.target_size,
+                    target_size: file.base_size,
+                }
+            })
+            .collect::<Vec<_>>();
+        files.sort_by(|left, right| left.path.cmp(&right.path));
+        Self {
+            base_state: self.target_state.clone(),
+            target_state: self.base_state.clone(),
+            files,
+        }
+    }
+
+    pub fn summary(&self) -> ChangeSummary {
+        let mut summary = ChangeSummary::default();
+        for file in &self.files {
+            summary.files += 1;
+            match file.kind {
+                FileChangeKind::Added => summary.added += 1,
+                FileChangeKind::Modified => summary.modified += 1,
+                FileChangeKind::Deleted => summary.deleted += 1,
+                FileChangeKind::Unchanged => summary.unchanged += 1,
+                FileChangeKind::Captured => summary.captured += 1,
+            }
+            summary.target_bytes += file.target_size.unwrap_or(0);
+        }
+        summary
+    }
+}
+
+fn file_change_kind(
+    base_hash: &Option<String>,
+    target_hash: &Option<String>,
+) -> Option<FileChangeKind> {
+    match (base_hash, target_hash) {
+        (None, None) => None,
+        (None, Some(_)) => Some(FileChangeKind::Added),
+        (Some(_), None) => Some(FileChangeKind::Deleted),
+        (Some(base), Some(target)) if base == target => None,
+        (Some(_), Some(_)) => Some(FileChangeKind::Modified),
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ChangeSummary {
+    pub files: usize,
+    pub added: usize,
+    pub modified: usize,
+    pub deleted: usize,
+    pub unchanged: usize,
+    pub captured: usize,
+    pub target_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PropertyRef {
+    pub id: PropertyId,
+    pub name: String,
+}
+
+impl PropertyRef {
+    pub fn new(id: PropertyId, name: impl Into<String>) -> Self {
+        Self {
+            id,
+            name: name.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Query {
+    ChangeMeta,
+    TargetSnapshot,
+    BaseAndTarget,
+    Change,
+    Files {
+        include: Vec<String>,
+        exclude: Vec<String>,
+    },
+    Command {
+        command: String,
+        args: Vec<String>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Evaluator {
+    Builtin {
+        name: String,
+        options: BTreeMap<String, String>,
+    },
+    Command {
+        command: String,
+        args: Vec<String>,
+        env: BTreeMap<String, String>,
+        setup: Vec<String>,
+        pre: Vec<String>,
+        teardown: Vec<String>,
+        timeout_secs: Option<u64>,
+    },
+    Pair {
+        command: String,
+        args: Vec<String>,
+        env: BTreeMap<String, String>,
+        setup: Vec<String>,
+        pre: Vec<String>,
+        teardown: Vec<String>,
+        timeout_secs: Option<u64>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Judge {
+    ExitOk,
+    BoolTrue,
+    Pairwise,
+    Command {
+        command: String,
+        args: Vec<String>,
+        env: BTreeMap<String, String>,
+        timeout_secs: Option<u64>,
+    },
+    ExitCodeZero,
+    StdoutContains {
+        text: String,
+    },
+    JsonEquals {
+        pointer: String,
+        value: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PropertyDef {
+    pub name: String,
+    pub query: Query,
+    pub evaluator: Evaluator,
+    pub judge: Judge,
+}
+
+impl PropertyDef {
+    pub fn property_id(&self) -> Result<PropertyId> {
+        let seed = PropertyDefSeed {
+            query: &self.query,
+            evaluator: &self.evaluator,
+            judge: &self.judge,
+        };
+        Ok(PropertyId::new(stable_typed_id("property", &seed)?))
+    }
+
+    pub fn property_ref(&self) -> Result<PropertyRef> {
+        Ok(PropertyRef::new(self.property_id()?, self.name.clone()))
+    }
+}
+
+#[derive(Serialize)]
+struct PropertyDefSeed<'a> {
+    query: &'a Query,
+    evaluator: &'a Evaluator,
+    judge: &'a Judge,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceResult {
+    Passed,
+    Failed { reason: String },
+    Unknown { reason: String },
+    Skipped { reason: String },
+}
+
+impl EvidenceResult {
+    pub fn satisfies_requirement(&self) -> bool {
+        matches!(self, Self::Passed)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Provenance {
+    pub producer: String,
+    pub message: Option<String>,
+    pub created_at: String,
+}
+
+impl Provenance {
+    pub fn now(producer: impl Into<String>, message: Option<String>) -> Self {
+        Self {
+            producer: producer.into(),
+            message,
+            created_at: OffsetDateTime::now_utc().to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GraftCandidate {
+    pub id: CandidateId,
+    pub base_state: StateId,
+    pub target_state: StateId,
+    pub change: ChangeRef,
+    pub expected: Vec<PropertyRef>,
+    pub provenance: Provenance,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PatchRecord {
+    pub id: PatchId,
+    pub base_state: StateId,
+    pub target_state: StateId,
+    pub change: ChangeRef,
+    pub properties: Vec<PropertyRef>,
+    pub provenance: Provenance,
+    pub admitted_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EvidenceRecord {
+    pub id: EvidenceId,
+    pub subject: String,
+    pub property: PropertyId,
+    pub verifier: String,
+    pub result: EvidenceResult,
+    pub created_at: String,
+}
+
+impl EvidenceRecord {
+    pub fn new(
+        subject: impl Into<String>,
+        property: PropertyId,
+        verifier: impl Into<String>,
+        result: EvidenceResult,
+    ) -> Result<Self> {
+        let mut record = Self {
+            id: EvidenceId::new("evidence:pending"),
+            subject: subject.into(),
+            property,
+            verifier: verifier.into(),
+            result,
+            created_at: OffsetDateTime::now_utc().to_string(),
+        };
+        record.id = evidence_id(&record)?;
+        Ok(record)
+    }
+
+    pub fn passed(
+        subject: impl Into<String>,
+        property: PropertyId,
+        verifier: impl Into<String>,
+    ) -> Result<Self> {
+        Self::new(subject, property, verifier, EvidenceResult::Passed)
+    }
+
+    pub fn failed(
+        subject: impl Into<String>,
+        property: PropertyId,
+        verifier: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Result<Self> {
+        Self::new(
+            subject,
+            property,
+            verifier,
+            EvidenceResult::Failed {
+                reason: reason.into(),
+            },
+        )
+    }
+
+    pub fn unknown(
+        subject: impl Into<String>,
+        property: PropertyId,
+        verifier: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Result<Self> {
+        Self::new(
+            subject,
+            property,
+            verifier,
+            EvidenceResult::Unknown {
+                reason: reason.into(),
+            },
+        )
+    }
+
+    pub fn skipped(
+        subject: impl Into<String>,
+        property: PropertyId,
+        verifier: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Result<Self> {
+        Self::new(
+            subject,
+            property,
+            verifier,
+            EvidenceResult::Skipped {
+                reason: reason.into(),
+            },
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PromotionRecord {
+    pub id: PromotionId,
+    pub patch_id: PatchId,
+    pub target: String,
+    pub dry_run: bool,
+    pub status: String,
+    pub promoted_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PatchRelationKind {
+    Composes,
+    Migrates,
+    Reverts,
+    Materializes,
+    Promotes,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PatchRelation {
+    pub id: RelationId,
+    pub kind: PatchRelationKind,
+    pub subject: String,
+    pub sources: Vec<String>,
+    pub created_at: String,
+}
+
+#[derive(Serialize)]
+struct EvidenceSeed {
+    subject: String,
+    property: PropertyId,
+    verifier: String,
+    result: EvidenceResult,
+}
+
+pub fn stable_typed_id(kind: &str, value: &impl Serialize) -> Result<String> {
+    let digest = stable_digest(value)?;
+    Ok(format!("{kind}:{digest}"))
+}
+
+pub fn stable_digest(value: &impl Serialize) -> Result<String> {
+    let bytes = serde_json::to_vec(value)?;
+    Ok(blake3_hex_digest(&bytes)[..12].to_string())
+}
+
+pub fn blake3_hex_digest(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()
+}
+
+pub fn scratch_id(node: &ScratchNode) -> Result<ScratchId> {
+    Ok(ScratchId::new(stable_typed_id("scratch", node)?))
+}
+
+pub fn file_view_hash(seed: &FileViewHashSeed<'_>) -> Result<FileViewHash> {
+    Ok(FileViewHash::new(stable_typed_id("file_view", seed)?))
+}
+
+pub fn candidate_id(candidate: &GraftCandidate) -> Result<CandidateId> {
+    let seed = CandidateSeed {
+        base_state: &candidate.base_state,
+        target_state: &candidate.target_state,
+        change: &candidate.change,
+        expected: &candidate.expected,
+        provenance: &candidate.provenance,
+    };
+    Ok(CandidateId::new(stable_typed_id("candidate", &seed)?))
+}
+
+pub fn patch_id(patch: &PatchRecord) -> Result<PatchId> {
+    let seed = PatchSeed {
+        base_state: &patch.base_state,
+        target_state: &patch.target_state,
+        change: &patch.change,
+        properties: &patch.properties,
+        producer: &patch.provenance.producer,
+        message: patch.provenance.message.as_deref(),
+    };
+    Ok(PatchId::new(stable_typed_id("patch", &seed)?))
+}
+
+pub fn evidence_id(evidence: &EvidenceRecord) -> Result<EvidenceId> {
+    let seed = EvidenceSeed {
+        subject: evidence.subject.clone(),
+        property: evidence.property.clone(),
+        verifier: evidence.verifier.clone(),
+        result: evidence.result.clone(),
+    };
+    Ok(EvidenceId::new(stable_typed_id("evidence", &seed)?))
+}
+
+pub fn relation_id(relation: &PatchRelation) -> Result<RelationId> {
+    let seed = RelationSeed {
+        kind: &relation.kind,
+        subject: &relation.subject,
+        sources: &relation.sources,
+    };
+    Ok(RelationId::new(stable_typed_id("relation", &seed)?))
+}
+
+pub fn promotion_id(promotion: &PromotionRecord) -> Result<PromotionId> {
+    let seed = PromotionSeed {
+        patch_id: &promotion.patch_id,
+        target: &promotion.target,
+        dry_run: promotion.dry_run,
+        status: &promotion.status,
+    };
+    Ok(PromotionId::new(stable_typed_id("promotion", &seed)?))
+}
+
+#[derive(Serialize)]
+struct CandidateSeed<'a> {
+    base_state: &'a StateId,
+    target_state: &'a StateId,
+    change: &'a ChangeRef,
+    expected: &'a [PropertyRef],
+    provenance: &'a Provenance,
+}
+
+#[derive(Serialize)]
+struct PatchSeed<'a> {
+    base_state: &'a StateId,
+    target_state: &'a StateId,
+    change: &'a ChangeRef,
+    properties: &'a [PropertyRef],
+    producer: &'a str,
+    message: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct RelationSeed<'a> {
+    kind: &'a PatchRelationKind,
+    subject: &'a str,
+    sources: &'a [String],
+}
+
+#[derive(Serialize)]
+struct PromotionSeed<'a> {
+    patch_id: &'a PatchId,
+    target: &'a str,
+    dry_run: bool,
+    status: &'a str,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_property_def(name: &str, command: &str) -> PropertyDef {
+        PropertyDef {
+            name: name.to_string(),
+            query: Query::ChangeMeta,
+            evaluator: Evaluator::Command {
+                command: command.to_string(),
+                args: Vec::new(),
+                env: BTreeMap::new(),
+                setup: Vec::new(),
+                pre: Vec::new(),
+                teardown: Vec::new(),
+                timeout_secs: Some(60),
+            },
+            judge: Judge::ExitOk,
+        }
+    }
+
+    fn test_property_ref(name: &str) -> PropertyRef {
+        test_property_def(name, "cargo test")
+            .property_ref()
+            .unwrap()
+    }
+
+    #[test]
+    fn stable_ids_use_typed_display_form() {
+        let property = test_property_def("TestsPass", "cargo test")
+            .property_id()
+            .unwrap();
+        let evidence = EvidenceRecord::passed("candidate:demo", property, "test-verifier").unwrap();
+        assert!(evidence.id.as_str().starts_with("evidence:"));
+    }
+
+    #[test]
+    fn property_id_ignores_name_and_tracks_verifier_content() {
+        let original = test_property_def("TestsPass", "cargo test");
+        let renamed = test_property_def("CargoTests", "cargo test");
+        let changed_verifier = test_property_def("TestsPass", "cargo test --all");
+
+        assert_eq!(
+            original.property_id().unwrap(),
+            renamed.property_id().unwrap()
+        );
+        assert_ne!(
+            original.property_id().unwrap(),
+            changed_verifier.property_id().unwrap()
+        );
+        assert!(
+            original
+                .property_id()
+                .unwrap()
+                .as_str()
+                .starts_with("property:")
+        );
+    }
+
+    #[test]
+    fn base_ref_parses_each_supported_form() {
+        assert_eq!(
+            BaseRefSpec::parse("HEAD").unwrap(),
+            BaseRefSpec::GitTreeish("HEAD".to_string())
+        );
+        assert_eq!(
+            BaseRefSpec::parse("main").unwrap(),
+            BaseRefSpec::GitTreeish("main".to_string())
+        );
+        assert_eq!(
+            BaseRefSpec::parse("  abc1234  ").unwrap(),
+            BaseRefSpec::GitTreeish("abc1234".to_string())
+        );
+        assert_eq!(
+            BaseRefSpec::parse("repo:graft@main").unwrap(),
+            BaseRefSpec::Repo {
+                repo_id: "graft".to_string(),
+                treeish: "main".to_string(),
+            }
+        );
+        assert_eq!(
+            BaseRefSpec::parse("tree:abc").unwrap(),
+            BaseRefSpec::GraftTree("tree:abc".to_string())
+        );
+        assert_eq!(
+            BaseRefSpec::parse("candidate:foo").unwrap(),
+            BaseRefSpec::Candidate(CandidateId::new("candidate:foo"))
+        );
+        assert_eq!(
+            BaseRefSpec::parse("patch:foo").unwrap(),
+            BaseRefSpec::Patch(PatchId::new("patch:foo"))
+        );
+        assert_eq!(
+            BaseRefSpec::parse("graft:empty").unwrap(),
+            BaseRefSpec::Empty
+        );
+    }
+
+    #[test]
+    fn base_ref_parses_rejects_malformed_input() {
+        assert!(matches!(
+            BaseRefSpec::parse(""),
+            Err(BaseRefParseError::Empty)
+        ));
+        assert!(matches!(
+            BaseRefSpec::parse("   "),
+            Err(BaseRefParseError::Empty)
+        ));
+        assert!(matches!(
+            BaseRefSpec::parse("repo:graft"),
+            Err(BaseRefParseError::InvalidRepo(_))
+        ));
+        assert!(matches!(
+            BaseRefSpec::parse("repo:@main"),
+            Err(BaseRefParseError::InvalidRepo(_))
+        ));
+        assert!(matches!(
+            BaseRefSpec::parse("tree:"),
+            Err(BaseRefParseError::EmptyPrefix(_, "tree"))
+        ));
+        assert!(matches!(
+            BaseRefSpec::parse("gt_abc"),
+            Err(BaseRefParseError::LegacyId(_, "gt_", "tree"))
+        ));
+        assert!(matches!(
+            BaseRefSpec::parse("grc_abc"),
+            Err(BaseRefParseError::LegacyId(_, "grc_", "candidate"))
+        ));
+        assert!(matches!(
+            BaseRefSpec::parse("graft-tree:abc"),
+            Err(BaseRefParseError::LegacyId(_, "graft-tree:", "tree"))
+        ));
+    }
+
+    #[test]
+    fn repo_base_state_serializes_with_resolved_tree_oid() {
+        let state = StateId::RepoTree(RepoBaseState::new(
+            "graft",
+            "main",
+            "0123456789abcdef0123456789abcdef01234567",
+        ));
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(json.contains("repo_tree"));
+        assert!(json.contains("resolved_tree_oid"));
+        assert!(json.contains("0123456789abcdef0123456789abcdef01234567"));
+        assert_eq!(state, serde_json::from_str::<StateId>(&json).unwrap());
+        let StateId::RepoTree(repo) = state else {
+            panic!("expected repo tree state");
+        };
+        assert_eq!(repo.display_ref(), "repo:graft@main#0123456789ab");
+    }
+
+    #[test]
+    fn state_id_json_accepts_typed_ids() {
+        let git = r#"{"kind":"git_tree","value":"abc123"}"#;
+        let graft = r#"{"kind":"graft_tree","value":"tree:abc"}"#;
+        assert_eq!(
+            serde_json::from_str::<StateId>(git).unwrap(),
+            StateId::GitTree("abc123".to_string())
+        );
+        assert_eq!(
+            serde_json::from_str::<StateId>(graft).unwrap(),
+            StateId::GraftTree("tree:abc".to_string())
+        );
+    }
+
+    #[test]
+    fn change_set_summarizes_snapshot_capture() {
+        let snapshot = TreeSnapshot::new(vec![TreeEntry {
+            path: "src/lib.rs".to_string(),
+            hash: "abc".to_string(),
+            size: 7,
+        }]);
+        let target = StateId::GraftTree(snapshot.id().unwrap());
+        let change = ChangeSet::from_snapshots(
+            StateId::GitTree("unknown".to_string()),
+            None,
+            target,
+            &snapshot,
+        );
+        assert_eq!(change.summary().captured, 1);
+        assert!(change.id().unwrap().as_str().starts_with("change:"));
+    }
+
+    #[test]
+    fn change_set_summarizes_snapshot_diff() {
+        let base = TreeSnapshot::new(vec![
+            TreeEntry {
+                path: "a.txt".to_string(),
+                hash: "old-a".to_string(),
+                size: 1,
+            },
+            TreeEntry {
+                path: "delete.txt".to_string(),
+                hash: "old-delete".to_string(),
+                size: 2,
+            },
+            TreeEntry {
+                path: "same.txt".to_string(),
+                hash: "same".to_string(),
+                size: 5,
+            },
+        ]);
+        let target = TreeSnapshot::new(vec![
+            TreeEntry {
+                path: "a.txt".to_string(),
+                hash: "new-a".to_string(),
+                size: 3,
+            },
+            TreeEntry {
+                path: "new.txt".to_string(),
+                hash: "new-file".to_string(),
+                size: 4,
+            },
+            TreeEntry {
+                path: "same.txt".to_string(),
+                hash: "same".to_string(),
+                size: 5,
+            },
+        ]);
+        let change = ChangeSet::from_snapshots(
+            StateId::GraftTree(base.id().unwrap()),
+            Some(&base),
+            StateId::GraftTree(target.id().unwrap()),
+            &target,
+        );
+        let summary = change.summary();
+        assert_eq!(summary.added, 1);
+        assert_eq!(summary.modified, 1);
+        assert_eq!(summary.deleted, 1);
+        assert_eq!(summary.unchanged, 0);
+        assert_eq!(summary.files, 3);
+        assert!(!change.files.iter().any(|file| file.path == "same.txt"));
+    }
+
+    #[test]
+    fn change_sets_compose_and_reverse() {
+        let first = ChangeSet {
+            base_state: StateId::GraftTree("a".to_string()),
+            target_state: StateId::GraftTree("b".to_string()),
+            files: vec![FileChange {
+                path: "src/lib.rs".to_string(),
+                kind: FileChangeKind::Added,
+                base_hash: None,
+                target_hash: Some("b1".to_string()),
+                base_size: None,
+                target_size: Some(10),
+            }],
+        };
+        let second = ChangeSet {
+            base_state: StateId::GraftTree("b".to_string()),
+            target_state: StateId::GraftTree("c".to_string()),
+            files: vec![FileChange {
+                path: "src/lib.rs".to_string(),
+                kind: FileChangeKind::Modified,
+                base_hash: Some("b1".to_string()),
+                target_hash: Some("c1".to_string()),
+                base_size: Some(10),
+                target_size: Some(12),
+            }],
+        };
+        let composed = ChangeSet::compose(&first, &second);
+        assert_eq!(composed.base_state, StateId::GraftTree("a".to_string()));
+        assert_eq!(composed.target_state, StateId::GraftTree("c".to_string()));
+        assert_eq!(composed.files[0].kind, FileChangeKind::Added);
+        assert_eq!(composed.files[0].target_hash.as_deref(), Some("c1"));
+
+        let reversed = composed.reversed();
+        assert_eq!(reversed.base_state, StateId::GraftTree("c".to_string()));
+        assert_eq!(reversed.target_state, StateId::GraftTree("a".to_string()));
+        assert_eq!(reversed.files[0].kind, FileChangeKind::Deleted);
+    }
+
+    #[test]
+    fn scratch_root_ids_are_stable() {
+        let root = ScratchNode::root(StateId::GitTree("tree-a".to_string()), "tree:a");
+        let same = ScratchNode::root(StateId::GitTree("tree-a".to_string()), "tree:a");
+        let other_base = ScratchNode::root(StateId::GitTree("tree-b".to_string()), "tree:b");
+
+        assert_eq!(scratch_id(&root).unwrap(), scratch_id(&same).unwrap());
+        assert_ne!(scratch_id(&root).unwrap(), scratch_id(&other_base).unwrap());
+        assert!(scratch_id(&root).unwrap().as_str().starts_with("scratch:"));
+    }
+
+    #[test]
+    fn scratch_edit_sequence_ids_are_stable() {
+        let base = StateId::GitTree("tree-a".to_string());
+        let root_id = scratch_id(&ScratchNode::root(base.clone(), "tree:a")).unwrap();
+        let edit = CanonicalScratchOp::Edit {
+            path: "src/lib.rs".to_string(),
+            edits: vec![HashlineEdit::ReplaceLine {
+                line: 7,
+                hash: "MQ".to_string(),
+                old: "x".to_string(),
+                new: "y".to_string(),
+            }],
+        };
+
+        let left = ScratchNode::child(root_id.clone(), base.clone(), edit.clone(), "tree:b");
+        let right = ScratchNode::child(root_id, base, edit, "tree:b");
+
+        assert_eq!(scratch_id(&left).unwrap(), scratch_id(&right).unwrap());
+    }
+
+    #[test]
+    fn scratch_op_order_is_identity_sensitive() {
+        let base = StateId::GitTree("tree-a".to_string());
+        let root_id = scratch_id(&ScratchNode::root(base.clone(), "tree:a")).unwrap();
+        let edit_one = CanonicalScratchOp::Write {
+            path: "a.txt".to_string(),
+            content_hash: "hash-a".to_string(),
+            size: 1,
+        };
+        let edit_two = CanonicalScratchOp::Write {
+            path: "b.txt".to_string(),
+            content_hash: "hash-b".to_string(),
+            size: 1,
+        };
+
+        let left_first = ScratchNode::child(
+            root_id.clone(),
+            base.clone(),
+            edit_one.clone(),
+            "tree:mid-1",
+        );
+        let left_first_id = scratch_id(&left_first).unwrap();
+        let left = ScratchNode::child(left_first_id, base.clone(), edit_two.clone(), "tree:final");
+
+        let right_first = ScratchNode::child(root_id, base.clone(), edit_two, "tree:mid-2");
+        let right_first_id = scratch_id(&right_first).unwrap();
+        let right = ScratchNode::child(right_first_id, base, edit_one, "tree:final");
+
+        assert_eq!(left.result_tree_digest, right.result_tree_digest);
+        assert_ne!(scratch_id(&left).unwrap(), scratch_id(&right).unwrap());
+    }
+
+    #[test]
+    fn file_view_hashes_bind_scratch_path_and_content() {
+        let scratch = ScratchId::new("scratch:demo");
+        let seed = FileViewHashSeed {
+            scratch: &scratch,
+            path: "src/lib.rs",
+            bytes_hash: "blob-a",
+        };
+        let same = FileViewHashSeed {
+            scratch: &scratch,
+            path: "src/lib.rs",
+            bytes_hash: "blob-a",
+        };
+        let different_path = FileViewHashSeed {
+            scratch: &scratch,
+            path: "src/main.rs",
+            bytes_hash: "blob-a",
+        };
+
+        assert_eq!(
+            file_view_hash(&seed).unwrap(),
+            file_view_hash(&same).unwrap()
+        );
+        assert_ne!(
+            file_view_hash(&seed).unwrap(),
+            file_view_hash(&different_path).unwrap()
+        );
+        assert!(
+            file_view_hash(&seed)
+                .unwrap()
+                .as_str()
+                .starts_with("file_view:")
+        );
+    }
+
+    /// Property-style coverage for ScratchId derivation.
+    ///
+    /// We sweep N pseudo-random `(base, ordered ops)` tuples and check that:
+    ///
+    /// 1. The same input deterministically produces the same `ScratchId`
+    ///    (replay equivalence; `scratch_id` is a pure function).
+    /// 2. Reordering two distinct leading ops in the same chain changes the
+    ///    chain `ScratchId` even though the final tree digest may stay the
+    ///    same (history is part of the identity).
+    ///
+    /// Inputs are derived from a deterministic counter so the test is fully
+    /// reproducible; we still cover enough variation in path / size / op
+    /// kind to exercise the canonical serialization, not just the trivial
+    /// path.
+    #[test]
+    fn scratch_id_is_replay_equivalent_and_order_sensitive() {
+        const CASES: usize = 50;
+        for case in 0..CASES {
+            let base_label = format!("tree-{case}");
+            let base = StateId::GitTree(base_label.clone());
+            let root = ScratchNode::root(base.clone(), format!("tree:root-{case}"));
+            let root_id_a = scratch_id(&root).unwrap();
+            let root_id_b = scratch_id(&root).unwrap();
+            assert_eq!(root_id_a, root_id_b, "root replay #{case}");
+
+            let ops: Vec<CanonicalScratchOp> =
+                (0..4).map(|step| pseudo_random_op(case, step)).collect();
+
+            let chain_a = build_chain(root_id_a.clone(), &base, &ops, case);
+            let chain_b = build_chain(root_id_b.clone(), &base, &ops, case);
+            assert_eq!(chain_a, chain_b, "chain replay #{case}");
+
+            if ops.len() >= 2 && ops[0] != ops[1] {
+                let mut swapped = ops.clone();
+                swapped.swap(0, 1);
+                let chain_swapped = build_chain(root_id_a, &base, &swapped, case);
+                assert_ne!(
+                    chain_a, chain_swapped,
+                    "swap-sensitivity #{case}: chains must diverge when leading ops swap"
+                );
+            }
+        }
+    }
+
+    fn build_chain(
+        root_id: ScratchId,
+        base: &StateId,
+        ops: &[CanonicalScratchOp],
+        case: usize,
+    ) -> ScratchId {
+        let mut parent = root_id;
+        for (step, op) in ops.iter().enumerate() {
+            let node = ScratchNode::child(
+                parent,
+                base.clone(),
+                op.clone(),
+                format!("tree:{case}-{step}"),
+            );
+            parent = scratch_id(&node).unwrap();
+        }
+        parent
+    }
+
+    fn pseudo_random_op(case: usize, step: usize) -> CanonicalScratchOp {
+        let kind = (case + step) % 3;
+        let path = format!("src/case-{case}/step-{step}.rs");
+        match kind {
+            0 => CanonicalScratchOp::Write {
+                path,
+                content_hash: format!("hash-{case}-{step}"),
+                size: ((case * 7 + step * 13) % 4096) as u64,
+            },
+            1 => CanonicalScratchOp::Edit {
+                path: path.clone(),
+                edits: vec![HashlineEdit::ReplaceLine {
+                    line: ((case * 3 + step) % 32 + 1) as u64,
+                    hash: "MQ".to_string(),
+                    old: format!("old-{case}-{step}"),
+                    new: format!("new-{case}-{step}"),
+                }],
+            },
+            _ => CanonicalScratchOp::Delete { path },
+        }
+    }
+
+    #[test]
+    fn patch_ids_ignore_admission_time() {
+        let patch = PatchRecord {
+            id: PatchId::new("patch:pending"),
+            base_state: StateId::GitTree("base".to_string()),
+            target_state: StateId::GraftTree("target".to_string()),
+            change: ChangeRef::InlineSummary("demo".to_string()),
+            properties: vec![test_property_ref("TestsPass")],
+            provenance: Provenance {
+                producer: "test".to_string(),
+                message: None,
+                created_at: "time-a".to_string(),
+            },
+            admitted_at: "time-a".to_string(),
+        };
+        let mut later = patch.clone();
+        later.admitted_at = "time-b".to_string();
+        later.provenance.created_at = "time-b".to_string();
+        assert_eq!(patch_id(&patch).unwrap(), patch_id(&later).unwrap());
+    }
+}

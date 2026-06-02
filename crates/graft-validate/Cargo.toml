@@ -1,0 +1,12 @@
+[package]
+name = "graft-validate"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+graft-core = { path = "../graft-core" }
+thiserror.workspace = true

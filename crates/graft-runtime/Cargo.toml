@@ -1,0 +1,25 @@
+[package]
+name = "graft-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+graft-client = { path = "../graft-client" }
+graft-core = { path = "../graft-core" }
+graft-explain = { path = "../graft-explain" }
+graft-policy = { path = "../graft-policy" }
+graft-promote = { path = "../graft-promote" }
+graft-repo = { path = "../graft-repo" }
+graft-store = { path = "../graft-store" }
+graft-sync = { path = "../graft-sync" }
+graft-validate = { path = "../graft-validate" }
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+toml.workspace = true

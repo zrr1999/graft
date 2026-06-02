@@ -1,0 +1,13 @@
+[query]
+kind = "files"
+include = ["tests/*", "*/tests/*", "*_test.rs", "*_tests.rs"]
+exclude = []
+
+[evaluator]
+kind = "builtin"
+name = "paths_all_match"
+
+[evaluator.options]
+
+[judge]
+kind = "bool_true"

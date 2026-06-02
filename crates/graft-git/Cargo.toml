@@ -1,0 +1,14 @@
+[package]
+name = "graft-git"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+graft-core = { path = "../graft-core" }
+graft-promote = { path = "../graft-promote" }
+graft-repo = { path = "../graft-repo" }
+thiserror.workspace = true
