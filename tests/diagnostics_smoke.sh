@@ -9,64 +9,54 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-cargo build -p graft-cli -p graft-daemon >/dev/null 2>&1
-GRAFT_BIN="$PWD/target/debug/graft"
-GRAFTD_BIN="$PWD/target/debug/graftd"
+source tests/lib/smoke.sh
 
-WORKDIR="$(mktemp -d)"
-cleanup() {
-  find "$WORKDIR" -path '*/.graft/run/daemon.sock' -type s -exec "$GRAFTD_BIN" stop --socket {} \; >/dev/null 2>&1 || true
-  rm -rf "$WORKDIR"
-}
-trap cleanup EXIT
+setup_bins
+setup_workspace
+trap cleanup_workspace EXIT
 
 cd "$WORKDIR"
 echo "smoke" > hello.txt
 
 "$GRAFT_BIN" init >/dev/null
 
-# 1) `create` with no git base in the workspace must fail with a structured
-#    diagnostic (B001) instead of leaking raw `fatal: not a git repository`
-#    stderr from gix/git.
-if "$GRAFT_BIN" create --expect ValidPatch --message b001-smoke >/tmp/create-ok 2>/tmp/create-err; then
-  echo "FAIL: create unexpectedly succeeded in a no-git workdir"
-  cat /tmp/create-ok
-  exit 1
-fi
-if ! grep -qE '\[B001\] cannot resolve git base `HEAD`' /tmp/create-err; then
-  echo "FAIL: B001 not surfaced for unresolved git base"
-  cat /tmp/create-err
-  exit 1
-fi
-if grep -qE '^Caused by:' /tmp/create-err; then
-  echo "FAIL: raw cause chain (git stderr) leaked under B001"
-  cat /tmp/create-err
-  exit 1
-fi
-if grep -q 'graft:empty' /tmp/create-err; then
-  :
-else
-  echo "FAIL: B001 fix hint did not mention --from graft:empty"
-  cat /tmp/create-err
-  exit 1
-fi
-
-# 2) `--from graft:empty` produces a real candidate whose ValidPatch evidence
-#    passes, even with no git context.
-out=$("$GRAFT_BIN" create --from graft:empty --expect ValidPatch --validate --message empty-base-smoke)
+# 1) `scratch write --base graft:empty` + `candidate from-scratch` produces a
+#    real candidate whose core patch integrity passes, even with no git context.
+scratch_out=$("$GRAFT_BIN" scratch write --base graft:empty hello.txt --content $'smoke\n')
+scratch=$(grep -oE 'scratch:[0-9a-f]+' <<<"$scratch_out" | tail -n1)
+[[ -n $scratch ]] || { echo "FAIL: no scratch id captured for graft:empty base"; echo "$scratch_out"; exit 1; }
+out=$("$GRAFT_BIN" candidate from-scratch "$scratch" --message empty-base-smoke)
 candidate=$(grep -oE 'candidate:[0-9a-f]+' <<<"$out" | head -n1)
 [[ -n $candidate ]] || { echo "FAIL: no candidate id captured for graft:empty base"; echo "$out"; exit 1; }
-if ! grep -qE 'evidence: 1 passed,' <<<"$out"; then
-  echo "FAIL: ValidPatch did not pass against graft:empty base"
-  echo "$out"
+validate_out=$("$GRAFT_BIN" validate "$candidate")
+if ! grep -q 'validation completed' <<<"$validate_out"; then
+  echo "FAIL: core validation did not complete against graft:empty base"
+  echo "$validate_out"
   exit 1
 fi
 
-# 3) Admit without passing evidence must surface A001/A002 diagnostics.
-out2=$("$GRAFT_BIN" create --from graft:empty --expect ValidPatch --message admit-smoke)
+write_properties_roto <<'ROTO'
+fn touches_unvalidated(app: Application) -> Property {
+    property(
+        [
+            app.changed_paths().any_match(["unvalidated.txt"]).success(),
+        ],
+        "change touches the intentionally unvalidated smoke file",
+        Severity.Blocking,
+        [],
+    )
+}
+ROTO
+lock_properties
+
+# 2) Admit without passing evidence for an explicit property must surface A001/A002 diagnostics.
+scratch_out2=$("$GRAFT_BIN" scratch write --base graft:empty unvalidated.txt --content $'unvalidated\n')
+scratch2=$(grep -oE 'scratch:[0-9a-f]+' <<<"$scratch_out2" | tail -n1)
+[[ -n $scratch2 ]] || { echo "FAIL: no scratch captured for admit smoke"; echo "$scratch_out2"; exit 1; }
+out2=$("$GRAFT_BIN" candidate from-scratch "$scratch2" --expect workspace:touches_unvalidated --message admit-smoke)
 candidate2=$(grep -oE 'candidate:[0-9a-f]+' <<<"$out2" | head -n1)
 [[ -n $candidate2 ]] || { echo "FAIL: no candidate captured for admit smoke"; echo "$out2"; exit 1; }
-if "$GRAFT_BIN" admit "$candidate2" --require ValidPatch >/tmp/admit-ok 2>/tmp/admit-err; then
+if "$GRAFT_BIN" admit "$candidate2" --require workspace:touches_unvalidated >/tmp/admit-ok 2>/tmp/admit-err; then
   echo "FAIL: admit unexpectedly succeeded"
   cat /tmp/admit-ok
   exit 1
@@ -77,4 +67,4 @@ if ! grep -qE '\[A00[12]\]' /tmp/admit-err; then
   exit 1
 fi
 
-echo "OK: B001/A00x surface as graft-explain diagnostics with code, fix, and see-also."
+echo "OK: scratch/candidate no-git path works and A00x diagnostics surface with code, fix, and see-also."

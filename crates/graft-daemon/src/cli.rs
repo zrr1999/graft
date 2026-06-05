@@ -1,5 +1,6 @@
 use std::env;
 use std::fs::{self, OpenOptions};
+use std::io;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -7,11 +8,16 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use graft_client::{WireResponse, default_socket_path, encode_response, request};
-use graft_scratch::ScratchEngine;
+use graft_client::{
+    DaemonSocketState, WireResponse, daemon_socket_path, daemon_socket_state, encode_response,
+    prepare_daemon_socket_for_bind, request_result as client_request_result,
+};
 use graft_store::GraftStore;
+use serde::Deserialize;
 
-use crate::handle_frame;
+use crate::{DaemonState, handle_frame};
+
+const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 pub fn run() {
     if let Err(error) = run_inner() {
@@ -23,21 +29,28 @@ pub fn run() {
 fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     let args = env::args().skip(1).collect::<Vec<_>>();
     let command = args.first().map(String::as_str).unwrap_or("start");
-    let socket = option_value(&args, "--socket")
-        .map(PathBuf::from)
-        .unwrap_or_else(default_socket_path);
-    let cwd = option_value(&args, "--cwd")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
+    let socket = match option_value(&args, "--socket") {
+        Some(socket) => PathBuf::from(socket),
+        None => daemon_socket_path()?,
+    };
 
     match command {
-        "start" => start(
-            &cwd,
-            &socket,
-            has_flag(&args, "--fg") || has_flag(&args, "-f"),
-        ),
-        "serve" => serve(&cwd, &socket),
-        "restart" => restart(&cwd, &socket),
+        "start" => {
+            let cwd = resolve_daemon_cwd(&args)?;
+            start(
+                &cwd,
+                &socket,
+                has_flag(&args, "--fg") || has_flag(&args, "-f"),
+            )
+        }
+        "serve" => {
+            let cwd = resolve_daemon_cwd(&args)?;
+            serve(&cwd, &socket)
+        }
+        "restart" => {
+            let cwd = resolve_daemon_cwd(&args)?;
+            restart(&cwd, &socket)
+        }
         "status" => request_once(&socket, "status", serde_json::json!({})),
         "stop" | "shutdown" => request_once(&socket, "shutdown", serde_json::json!({})),
         "help" | "--help" | "-h" => {
@@ -56,20 +69,21 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn start(cwd: &Path, socket: &Path, foreground: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let _run_dir = socket_run_dir(socket)?;
     if foreground {
         return serve(cwd, socket);
     }
 
     // Already running? Treat as success so `graftd start` is idempotent.
-    if socket_is_live(socket) {
-        return Ok(());
+    match daemon_socket_state(socket)
+        .map_err(|error| -> Box<dyn std::error::Error> { error.to_string().into() })?
+    {
+        DaemonSocketState::Live => return Ok(()),
+        DaemonSocketState::Missing => {}
+        DaemonSocketState::Stale => prepare_daemon_socket_for_bind(socket)
+            .map_err(|error| -> Box<dyn std::error::Error> { error.to_string().into() })?,
     }
-    if socket.exists() {
-        // Stale socket from a previous crash; remove so the spawned child
-        // can bind cleanly. Failing to remove here is non-fatal because the
-        // child will attempt removal again before bind.
-        let _ = fs::remove_file(socket);
-    }
+    idle_timeout(cwd)?;
 
     // Spawn a detached child running our own `serve` so the client can
     // exit immediately. We re-exec the same binary (current_exe) rather
@@ -100,8 +114,11 @@ fn start(cwd: &Path, socket: &Path, foreground: bool) -> Result<(), Box<dyn std:
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut delay = Duration::from_millis(50);
     while Instant::now() < deadline {
-        if socket_is_live(socket) {
-            return Ok(());
+        match daemon_socket_state(socket)
+            .map_err(|error| -> Box<dyn std::error::Error> { error.to_string().into() })?
+        {
+            DaemonSocketState::Live => return Ok(()),
+            DaemonSocketState::Missing | DaemonSocketState::Stale => {}
         }
         thread::sleep(delay);
         delay = (delay * 2).min(Duration::from_millis(400));
@@ -114,34 +131,81 @@ fn start(cwd: &Path, socket: &Path, foreground: bool) -> Result<(), Box<dyn std:
 }
 
 fn restart(cwd: &Path, socket: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    if socket_is_live(socket) {
-        let _ = request(socket, "shutdown", serde_json::json!({}));
+    restart_after_shutdown(
+        cwd,
+        socket,
+        Duration::from_secs(5),
+        Duration::from_millis(50),
+    )
+}
+
+fn restart_after_shutdown(
+    cwd: &Path,
+    socket: &Path,
+    shutdown_timeout: Duration,
+    poll_interval: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _run_dir = socket_run_dir(socket)?;
+    if matches!(
+        daemon_socket_state(socket)
+            .map_err(|error| -> Box<dyn std::error::Error> { error.to_string().into() })?,
+        DaemonSocketState::Live
+    ) {
+        let _shutdown = client_request_result(socket, "shutdown", serde_json::json!({}))?;
         // Give the previous serve loop a moment to remove the socket/PID
         // before we try to spawn a replacement.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            if !socket_is_live(socket) {
-                break;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
+        wait_for_socket_release(socket, shutdown_timeout, poll_interval)?;
     }
     start(cwd, socket, false)
 }
 
-fn serve(cwd: &Path, socket: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(parent) = socket.parent() {
-        fs::create_dir_all(parent)?;
+fn wait_for_socket_release(
+    socket: &Path,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        match daemon_socket_state(socket)
+            .map_err(|error| -> Box<dyn std::error::Error> { error.to_string().into() })?
+        {
+            DaemonSocketState::Live => thread::sleep(poll_interval),
+            DaemonSocketState::Missing | DaemonSocketState::Stale => return Ok(()),
+        }
     }
-
-    let primary_socket = cwd.join(".graft").join("run").join("daemon.sock");
-    if socket != primary_socket && socket_is_live(&primary_socket) {
-        return Err(format!(
-            "another graftd already owns this workspace (socket {})",
-            primary_socket.display()
+    match daemon_socket_state(socket)
+        .map_err(|error| -> Box<dyn std::error::Error> { error.to_string().into() })?
+    {
+        DaemonSocketState::Live => Err(format!(
+            "[E_DAEMON_SHUTDOWN_TIMEOUT] graftd did not release socket {} within {}ms",
+            socket.display(),
+            timeout.as_millis()
         )
-        .into());
+        .into()),
+        DaemonSocketState::Missing | DaemonSocketState::Stale => Ok(()),
     }
+}
+
+fn socket_run_dir(socket: &Path) -> Result<&Path, Box<dyn std::error::Error>> {
+    socket
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| {
+            format!(
+                "[E_SOCKET_PARENT_REQUIRED] graftd socket path must include an explicit parent directory: {}",
+                socket.display()
+            )
+            .into()
+        })
+}
+
+fn serve(cwd: &Path, socket: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let run_dir = socket_run_dir(socket)?;
+    // Ownership checks must precede workspace cleanup. If another daemon is
+    // live, `serve` should fail before touching pid files or run caches.
+    prepare_daemon_socket_for_bind(socket)
+        .map_err(|error| -> Box<dyn std::error::Error> { error.to_string().into() })?;
+    fs::create_dir_all(run_dir)?;
 
     let store = GraftStore::open(cwd);
     store.init_storage().map_err(|err| {
@@ -156,36 +220,29 @@ fn serve(cwd: &Path, socket: &Path) -> Result<(), Box<dyn std::error::Error>> {
         store.paths().cache_trials(),
         store.paths().cache_worktrees(),
     ] {
-        let _ = fs::remove_dir_all(&path);
+        remove_dir_all_if_exists(&path)?;
         fs::create_dir_all(&path)?;
     }
+    let idle_timeout = idle_timeout(cwd)?;
 
-    // v2 uses the daemon PID/socket as the writer ownership anchor. There is
-    // intentionally no `.graft/.lock`: a live daemon owns writes, and a stale
-    // pid/socket from a crashed daemon is cleaned up before serving.
-    let _ = fs::remove_file(store.paths().root().join(".lock"));
-    let pid_path = store.paths().root().join("run").join("daemon.pid");
-    if pid_path.exists() {
-        if socket_is_live(&primary_socket) {
-            return Err(format!(
-                "another graftd already owns this workspace (pid file {})",
-                pid_path.display()
-            )
-            .into());
-        }
-        fs::remove_file(&pid_path)?;
-    }
+    // The daemon PID/socket are now anchored in $GRAFT_HOME/run (the socket
+    // parent), not in each workspace. There is intentionally no `.graft/.lock`:
+    // a live daemon owns writes, and stale PID/socket files are cleaned up
+    // before serving.
+    remove_file_if_exists(&store.paths().root().join(".lock"))?;
+    let pid_path = run_dir.join("daemon.pid");
+    remove_file_if_exists(&pid_path)?;
     claim_pid_file(&pid_path)?;
 
-    if socket.exists() {
-        fs::remove_file(socket)?;
-    }
+    // Re-check immediately before bind in case another process claimed the
+    // socket while this process was preparing the workspace.
+    prepare_daemon_socket_for_bind(socket)
+        .map_err(|error| -> Box<dyn std::error::Error> { error.to_string().into() })?;
     let listener = UnixListener::bind(socket)
         .map_err(|err| format!("graftd cannot bind socket at {}: {err}", socket.display()))?;
     listener.set_nonblocking(true)?;
 
-    let engine = ScratchEngine::new(store);
-    let idle_timeout = idle_timeout(cwd);
+    let state = DaemonState::new(store);
 
     let outcome = (|| -> Result<(), Box<dyn std::error::Error>> {
         let mut last_activity = Instant::now();
@@ -193,8 +250,12 @@ fn serve(cwd: &Path, socket: &Path) -> Result<(), Box<dyn std::error::Error>> {
             match listener.accept() {
                 Ok((stream, _addr)) => {
                     last_activity = Instant::now();
-                    if handle_connection(&engine, stream)? {
-                        break;
+                    match handle_connection(&state, stream) {
+                        Ok(true) => break,
+                        Ok(false) => {}
+                        Err(error) => {
+                            eprintln!("graftd: connection error: {error}");
+                        }
                     }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -212,9 +273,12 @@ fn serve(cwd: &Path, socket: &Path) -> Result<(), Box<dyn std::error::Error>> {
     // Always tear down side state, regardless of whether the loop returned
     // an error: leaving a stale socket or pid file would confuse the next
     // `graftd start`.
-    let _ = fs::remove_file(socket);
-    let _ = fs::remove_file(&pid_path);
-    outcome
+    let socket_cleanup = remove_file_if_exists(socket);
+    let pid_cleanup = remove_file_if_exists(&pid_path);
+    outcome?;
+    socket_cleanup?;
+    pid_cleanup?;
+    Ok(())
 }
 
 fn claim_pid_file(pid_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -239,49 +303,67 @@ fn claim_pid_file(pid_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-fn idle_timeout(cwd: &Path) -> Duration {
+fn idle_timeout(cwd: &Path) -> Result<Duration, Box<dyn std::error::Error>> {
     let path = cwd.join(".graft").join("config.toml");
-    let text = fs::read_to_string(path).unwrap_or_default();
-    let mut in_daemon = false;
-    for raw in text.lines() {
-        let line = raw.split("#").next().unwrap_or("").trim();
-        if line.starts_with("[") && line.ends_with("]") {
-            in_daemon = line == "[daemon]";
-            continue;
-        }
-        if !in_daemon {
-            continue;
-        }
-        if let Some(value) = parse_u64_setting(line, "idle_timeout_seconds") {
-            return Duration::from_secs(value.max(1));
-        }
-        if let Some(value) = parse_u64_setting(line, "idle_timeout_minutes") {
-            return Duration::from_secs(value.max(1) * 60);
-        }
+    if !path.exists() {
+        return Ok(DEFAULT_IDLE_TIMEOUT);
     }
-    Duration::from_secs(30 * 60)
+    let text = fs::read_to_string(&path)
+        .map_err(|err| format!("read daemon config {}: {err}", path.display()))?;
+    let config: LocalDaemonConfig = toml::from_str(&text)
+        .map_err(|err| format!("parse daemon config {}: {err}", path.display()))?;
+    config
+        .daemon
+        .idle_timeout()
+        .map_err(|err| format!("invalid daemon config {}: {err}", path.display()).into())
 }
 
-fn parse_u64_setting(line: &str, key: &str) -> Option<u64> {
-    let (left, right) = line.split_once("=")?;
-    if left.trim() != key {
-        return None;
-    }
-    right.trim().trim_matches('"').parse().ok()
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalDaemonConfig {
+    #[serde(default)]
+    daemon: DaemonConfig,
 }
 
-/// Quick liveness check for a daemon socket: file exists *and* connect
-/// succeeds. A bare exists() check is not enough because socket files
-/// linger after a graftd crash.
-fn socket_is_live(socket: &Path) -> bool {
-    if !socket.exists() {
-        return false;
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DaemonConfig {
+    idle_timeout_seconds: Option<u64>,
+    idle_timeout_minutes: Option<u64>,
+}
+
+impl DaemonConfig {
+    fn idle_timeout(&self) -> Result<Duration, &'static str> {
+        match (self.idle_timeout_seconds, self.idle_timeout_minutes) {
+            (Some(_), Some(_)) => {
+                Err("set only one of idle_timeout_seconds or idle_timeout_minutes")
+            }
+            (Some(0), None) | (None, Some(0)) => Err("idle timeout must be greater than zero"),
+            (Some(seconds), None) => Ok(Duration::from_secs(seconds)),
+            (None, Some(minutes)) => Ok(Duration::from_secs(minutes * 60)),
+            (None, None) => Ok(DEFAULT_IDLE_TIMEOUT),
+        }
     }
-    UnixStream::connect(socket).is_ok()
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("remove file {}: {error}", path.display()).into()),
+    }
+}
+
+fn remove_dir_all_if_exists(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("remove directory {}: {error}", path.display()).into()),
+    }
 }
 
 /// Detach the child from this process group/session so it survives the
-/// parent exiting (e.g. when `graft create` returns to the shell).
+/// parent exiting after a foreground CLI request returns to the shell.
 #[cfg(unix)]
 fn detach(command: &mut Command) {
     use std::os::unix::process::CommandExt;
@@ -313,7 +395,7 @@ fn libc_setsid() -> i32 {
 }
 
 fn handle_connection(
-    engine: &ScratchEngine,
+    state: &DaemonState,
     mut stream: UnixStream,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let mut shutdown = false;
@@ -323,7 +405,7 @@ fn handle_connection(
         if line.trim().is_empty() {
             continue;
         }
-        let (response, should_shutdown) = match handle_frame(engine, &line) {
+        let (response, should_shutdown) = match handle_frame(state, &line) {
             Ok(value) => value,
             Err(error) => (
                 WireResponse::error("unknown", "E_BAD_FRAME", error.to_string()),
@@ -345,8 +427,8 @@ fn request_once(
     op: &str,
     params: serde_json::Value,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let response = request(socket, op, params)?;
-    println!("{}", serde_json::to_string(&response)?);
+    let result = client_request_result(socket, op, params)?;
+    println!("{}", serde_json::to_string(&result)?);
     Ok(())
 }
 
@@ -360,9 +442,28 @@ fn has_flag(args: &[String], name: &str) -> bool {
     args.iter().any(|arg| arg == name)
 }
 
+fn resolve_daemon_cwd(args: &[String]) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    resolve_daemon_cwd_with(args, env::current_dir)
+}
+
+fn resolve_daemon_cwd_with<F>(
+    args: &[String],
+    current_dir: F,
+) -> Result<PathBuf, Box<dyn std::error::Error>>
+where
+    F: FnOnce() -> io::Result<PathBuf>,
+{
+    if let Some(cwd) = option_value(args, "--cwd") {
+        return Ok(PathBuf::from(cwd));
+    }
+    current_dir().map_err(|error| {
+        format!("[E_CWD_UNAVAILABLE] cannot resolve default daemon cwd: {error}").into()
+    })
+}
+
 fn print_help() {
     println!(
-        "graftd {}\n\nUsage:\n  graftd start [--fg] [--cwd PATH] [--socket PATH]\n  graftd serve [--cwd PATH] [--socket PATH]\n  graftd restart [--cwd PATH] [--socket PATH]\n  graftd status [--socket PATH]\n  graftd stop [--socket PATH]\n  graftd shutdown [--socket PATH]\n\nCommands:\n  start     Start the daemon. Without --fg, spawn a detached background\n            child and wait for the socket to come up before returning.\n  serve     Run the daemon in the foreground (also used by the spawned\n            background child). Holds .graft/.lock for its whole lifetime.\n  restart   Stop the running daemon (if any) and start a fresh one.\n  status    Check daemon status over the Unix socket.\n  stop      Request graceful daemon shutdown.\n  shutdown  Alias for stop.",
+        "graftd {}\n\nUsage:\n  graftd start [--fg] [--cwd PATH] [--socket PATH]\n  graftd serve [--cwd PATH] [--socket PATH]\n  graftd restart [--cwd PATH] [--socket PATH]\n  graftd status [--socket PATH]\n  graftd stop [--socket PATH]\n  graftd shutdown [--socket PATH]\n\nCommands:\n  start     Start the daemon. Without --fg, spawn a detached background\n            child and wait for the socket to come up before returning.\n  serve     Run the daemon in the foreground (also used by the spawned\n            background child). Owns $GRAFT_HOME/run/daemon.sock and daemon.pid.\n  restart   Stop the running daemon (if any) and start a fresh one.\n  status    Check daemon status over the Unix socket.\n  stop      Request graceful daemon shutdown.\n  shutdown  Alias for stop.",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -370,6 +471,96 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn idle_timeout_defaults_when_local_config_is_missing() {
+        let dir = temp_dir("missing-config");
+        fs::create_dir_all(&dir).unwrap();
+
+        assert_eq!(idle_timeout(&dir).unwrap(), DEFAULT_IDLE_TIMEOUT);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn idle_timeout_accepts_seconds_or_minutes() {
+        let seconds_dir = temp_dir("seconds-config");
+        write_local_config(
+            &seconds_dir,
+            r#"
+[daemon]
+idle_timeout_seconds = 7
+"#,
+        );
+        assert_eq!(idle_timeout(&seconds_dir).unwrap(), Duration::from_secs(7));
+        let _ = fs::remove_dir_all(&seconds_dir);
+
+        let minutes_dir = temp_dir("minutes-config");
+        write_local_config(
+            &minutes_dir,
+            r#"
+[daemon]
+idle_timeout_minutes = 2
+"#,
+        );
+        assert_eq!(
+            idle_timeout(&minutes_dir).unwrap(),
+            Duration::from_secs(120)
+        );
+        let _ = fs::remove_dir_all(&minutes_dir);
+    }
+
+    #[test]
+    fn idle_timeout_rejects_ambiguous_or_invalid_config() {
+        for (name, text, expected) in [
+            (
+                "both-config",
+                r#"
+[daemon]
+idle_timeout_seconds = 1
+idle_timeout_minutes = 1
+"#,
+                "set only one",
+            ),
+            (
+                "zero-config",
+                r#"
+[daemon]
+idle_timeout_seconds = 0
+"#,
+                "greater than zero",
+            ),
+            (
+                "unknown-field-config",
+                r#"
+[daemon]
+idle_timeout_hours = 1
+"#,
+                "unknown field",
+            ),
+            (
+                "bad-type-config",
+                r#"
+[daemon]
+idle_timeout_seconds = "fast"
+"#,
+                "invalid type",
+            ),
+        ] {
+            let dir = temp_dir(name);
+            write_local_config(&dir, text);
+
+            let error = idle_timeout(&dir).unwrap_err().to_string();
+            assert!(error.contains(expected), "{error}");
+
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
 
     #[test]
     fn option_value_reads_socket_path() {
@@ -380,8 +571,251 @@ mod tests {
     }
 
     #[test]
+    fn socket_run_dir_requires_explicit_parent_directory() {
+        let error = socket_run_dir(Path::new("graft.sock"))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("[E_SOCKET_PARENT_REQUIRED]"), "{error}");
+        assert!(error.contains("graft.sock"), "{error}");
+        assert_eq!(
+            socket_run_dir(Path::new("run/graft.sock")).unwrap(),
+            Path::new("run")
+        );
+        assert_eq!(
+            socket_run_dir(Path::new("/tmp/graft.sock")).unwrap(),
+            Path::new("/tmp")
+        );
+    }
+
+    #[test]
+    fn daemon_cwd_uses_explicit_arg_without_reading_process_cwd() {
+        let cwd = resolve_daemon_cwd_with(
+            &["start".into(), "--cwd".into(), "/workspace/project".into()],
+            || panic!("explicit --cwd must not inspect process cwd"),
+        )
+        .unwrap();
+
+        assert_eq!(cwd, PathBuf::from("/workspace/project"));
+    }
+
+    #[test]
+    fn daemon_cwd_defaults_to_current_dir() {
+        let cwd = resolve_daemon_cwd_with(&["start".into()], || {
+            Ok(PathBuf::from("/workspace/current"))
+        })
+        .unwrap();
+
+        assert_eq!(cwd, PathBuf::from("/workspace/current"));
+    }
+
+    #[test]
+    fn daemon_cwd_reports_unavailable_current_dir() {
+        let error = resolve_daemon_cwd_with(&["start".into()], || {
+            Err(io::Error::new(io::ErrorKind::NotFound, "cwd vanished"))
+        })
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("[E_CWD_UNAVAILABLE]"), "{error}");
+        assert!(error.contains("cwd vanished"), "{error}");
+    }
+
+    #[test]
     fn has_flag_finds_foreground_aliases() {
         assert!(has_flag(&["start".into(), "--fg".into()], "--fg"));
         assert!(!has_flag(&["start".into()], "--fg"));
+    }
+
+    #[test]
+    fn remove_file_if_exists_ignores_missing_and_rejects_directory() {
+        let dir = temp_dir("remove-file-contract");
+        fs::create_dir_all(&dir).unwrap();
+        let missing = dir.join("missing.pid");
+
+        remove_file_if_exists(&missing).unwrap();
+        let error = remove_file_if_exists(&dir).unwrap_err().to_string();
+
+        assert!(error.contains("remove file"), "{error}");
+        assert!(dir.exists(), "directory must not be deleted as a file");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_dir_all_if_exists_ignores_missing_and_rejects_file() {
+        let dir = temp_dir("remove-dir-contract");
+        fs::create_dir_all(&dir).unwrap();
+        let missing = dir.join("missing-cache");
+        let file = dir.join("cache-path");
+        fs::write(&file, "not a directory").unwrap();
+
+        remove_dir_all_if_exists(&missing).unwrap();
+        let error = remove_dir_all_if_exists(&file).unwrap_err().to_string();
+
+        assert!(error.contains("remove directory"), "{error}");
+        assert!(file.exists(), "file must not be deleted as a directory");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn serve_rejects_live_socket_before_workspace_side_effects() {
+        let workspace = temp_dir("serve-live-socket-workspace");
+        let run_dir = short_temp_dir("live");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&run_dir).unwrap();
+        let socket = run_dir.join("daemon.sock");
+        let pid_path = run_dir.join("daemon.pid");
+        fs::write(&pid_path, "existing-pid\n").unwrap();
+
+        let store = GraftStore::open(&workspace);
+        let legacy_lock = store.paths().root().join(".lock");
+        fs::create_dir_all(store.paths().cache_tmp().join("stale")).unwrap();
+        fs::create_dir_all(store.paths().cache_trials().join("stale")).unwrap();
+        fs::create_dir_all(store.paths().cache_worktrees().join("stale")).unwrap();
+        fs::write(store.paths().cache_tmp().join("stale/file"), "tmp").unwrap();
+        fs::write(store.paths().cache_trials().join("stale/file"), "trial").unwrap();
+        fs::write(
+            store.paths().cache_worktrees().join("stale/file"),
+            "worktree",
+        )
+        .unwrap();
+        fs::write(&legacy_lock, "legacy-lock\n").unwrap();
+
+        let _listener = UnixListener::bind(&socket).unwrap();
+
+        let error = serve(&workspace, &socket).unwrap_err().to_string();
+
+        assert!(error.contains("[E_DAEMON_ALREADY_RUNNING]"), "{error}");
+        assert_eq!(fs::read_to_string(&pid_path).unwrap(), "existing-pid\n");
+        assert!(
+            legacy_lock.exists(),
+            "legacy lock marker must not be removed"
+        );
+        assert!(
+            store.paths().cache_tmp().join("stale/file").exists(),
+            "run/tmp must not be cleaned when socket is already live"
+        );
+        assert!(
+            store.paths().cache_trials().join("stale/file").exists(),
+            "run/trials must not be cleaned when socket is already live"
+        );
+        assert!(
+            store.paths().cache_worktrees().join("stale/file").exists(),
+            "run/worktrees must not be cleaned when socket is already live"
+        );
+
+        let _ = fs::remove_dir_all(&workspace);
+        let _ = fs::remove_dir_all(&run_dir);
+    }
+
+    #[test]
+    fn restart_fails_when_shutdown_does_not_release_socket() {
+        let workspace = temp_dir("restart-timeout-workspace");
+        let run_dir = short_temp_dir("restart");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&run_dir).unwrap();
+        let socket = run_dir.join("daemon.sock");
+        let stubborn_daemon = StubbornDaemon::listen(&socket);
+
+        let error = restart_after_shutdown(
+            &workspace,
+            &socket,
+            Duration::from_millis(20),
+            Duration::from_millis(1),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("[E_DAEMON_SHUTDOWN_TIMEOUT]"), "{error}");
+        assert!(
+            matches!(
+                daemon_socket_state(&socket).unwrap(),
+                DaemonSocketState::Live
+            ),
+            "stubborn daemon should still own the socket"
+        );
+
+        stubborn_daemon.stop();
+        let _ = fs::remove_dir_all(&workspace);
+        let _ = fs::remove_dir_all(&run_dir);
+    }
+
+    struct StubbornDaemon {
+        running: Arc<AtomicBool>,
+        handle: thread::JoinHandle<()>,
+    }
+
+    impl StubbornDaemon {
+        fn listen(socket: &Path) -> Self {
+            let listener = UnixListener::bind(socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let running = Arc::new(AtomicBool::new(true));
+            let thread_running = Arc::clone(&running);
+            let handle = thread::spawn(move || {
+                while thread_running.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((mut stream, _addr)) => {
+                            stream.set_nonblocking(true).unwrap();
+                            let mut line = String::new();
+                            let mut reader = BufReader::new(stream.try_clone().unwrap());
+                            for _ in 0..10 {
+                                match reader.read_line(&mut line) {
+                                    Ok(0) => break,
+                                    Ok(_) => break,
+                                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                                        thread::sleep(Duration::from_millis(1));
+                                    }
+                                    Err(error) => panic!("stubborn daemon read failed: {error}"),
+                                }
+                            }
+                            if line.contains(r#""op":"shutdown""#) {
+                                writeln!(
+                                    stream,
+                                    r#"{{"id":"graft-cli","ok":true,"result":{{"status":"ignored"}}}}"#
+                                )
+                                .unwrap();
+                            }
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(error) => panic!("stubborn daemon accept failed: {error}"),
+                    }
+                }
+            });
+            Self { running, handle }
+        }
+
+        fn stop(self) {
+            self.running.store(false, Ordering::SeqCst);
+            self.handle.join().unwrap();
+        }
+    }
+
+    fn write_local_config(dir: &Path, text: &str) {
+        let graft_dir = dir.join(".graft");
+        fs::create_dir_all(&graft_dir).unwrap();
+        fs::write(graft_dir.join("config.toml"), text).unwrap();
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "graft-daemon-{name}-{}-{nanos}",
+            std::process::id()
+        ))
+    }
+
+    fn short_temp_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("gd-{name}-{}-{nanos}", std::process::id()))
     }
 }

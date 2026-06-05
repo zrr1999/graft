@@ -10,33 +10,33 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-cargo build -p graft-cli -p graft-daemon >/dev/null 2>&1
-GRAFT_BIN="$PWD/target/debug/graft"
-GRAFTD_BIN="$PWD/target/debug/graftd"
+source tests/lib/smoke.sh
 
-WORKDIR="$(mktemp -d)"
-cleanup() {
-  find "$WORKDIR" -path '*/.graft/run/daemon.sock' -type s -exec "$GRAFTD_BIN" stop --socket {} \; >/dev/null 2>&1 || true
-  rm -rf "$WORKDIR"
-}
-trap cleanup EXIT
+setup_bins
+setup_workspace
+trap cleanup_workspace EXIT
 
 cd "$WORKDIR"
 echo "smoke" > hello.txt
 
 "$GRAFT_BIN" init >/dev/null
-out=$("$GRAFT_BIN" create --from graft:empty --expect ValidPatch --message t5-smoke)
-candidate=$(grep -oE 'candidate:[0-9a-f]+' <<<"$out" | head -n1)
-[[ -n $candidate ]] || { echo "FAIL: no candidate id captured"; exit 1; }
+scratch_out=$("$GRAFT_BIN" scratch write --base graft:empty hello.txt --content $'smoke\n')
+scratch=$(grep -oE 'scratch:[0-9a-f]+' <<<"$scratch_out" | tail -n1)
+[[ -n $scratch ]] || { echo "FAIL: no scratch id captured"; echo "$scratch_out"; exit 1; }
+candidate_out=$("$GRAFT_BIN" candidate from-scratch "$scratch" --message t5-smoke)
+candidate=$(grep -oE 'candidate:[0-9a-f]+' <<<"$candidate_out" | head -n1)
+[[ -n $candidate ]] || { echo "FAIL: no candidate id captured"; echo "$candidate_out"; exit 1; }
+
+out=$("$GRAFT_BIN" validate "$candidate")
 
 # 1) human output must end with a Hole Report block (header `next:` + at
 #    least one `[kind] command` row).
 if ! grep -qE '^next:$' <<<"$out"; then
-  echo "FAIL: create human output missing Hole Report header"
+  echo "FAIL: validate human output missing Hole Report header"
   echo "----"; echo "$out"; exit 1
 fi
-if ! grep -qE '^[[:space:]]+\[recommended\] graft validate ' <<<"$out"; then
-  echo "FAIL: create Hole Report missing [recommended] action"
+if ! grep -qE '^[[:space:]]+\[recommended\] graft admit ' <<<"$out"; then
+  echo "FAIL: validate Hole Report missing [recommended] admit action"
   echo "----"; echo "$out"; exit 1
 fi
 if grep -qE '^next: graft ' <<<"$out"; then
@@ -56,18 +56,14 @@ if ! grep -qE '"why":' <<<"$json"; then
 fi
 
 # 3) The --json next_actions on validate must include human-readable why text
-#    referencing the recommended next step. (Historically this stage was used
-#    to assert that V003 surfaced in unknown-only flows; with --from
-#    graft:empty as the documented no-git escape hatch, ValidPatch now passes
-#    in this fixture, so we just confirm the Hole Report wording stays
-#    informative.)
+#    referencing the recommended next step.
 validate=$("$GRAFT_BIN" validate "$candidate")
 if ! grep -qE '\[recommended\]' <<<"$validate"; then
   echo "FAIL: validate output missing [recommended] action"
   echo "----"; echo "$validate"; exit 1
 fi
-if ! grep -qE '^[[:space:]]+candidate has passing evidence' <<<"$validate"; then
-  echo "FAIL: validate why text missing for passing-evidence stage"
+if ! grep -qE '^[[:space:]]+no property evidence is required' <<<"$validate"; then
+  echo "FAIL: validate why text missing for core-integrity-only stage"
   echo "----"; echo "$validate"; exit 1
 fi
 

@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -18,12 +19,12 @@ pub enum ValidateError {
 
 pub type Result<T> = std::result::Result<T, ValidateError>;
 
+type CommandEnv = BTreeMap<String, OsString>;
+
 #[derive(Clone, Debug)]
 pub struct ValidationSubject {
     pub id: String,
     pub changed_paths: Vec<String>,
-    pub has_change: bool,
-    pub patch_validity: Option<EvidenceResult>,
     pub base_worktree: Option<PathBuf>,
     pub target_worktree: Option<PathBuf>,
 }
@@ -33,8 +34,6 @@ impl ValidationSubject {
         Self {
             id: id.into(),
             changed_paths: Vec::new(),
-            has_change: false,
-            patch_validity: None,
             base_worktree: None,
             target_worktree: None,
         }
@@ -44,16 +43,9 @@ impl ValidationSubject {
         Self {
             id: id.into(),
             changed_paths,
-            has_change: true,
-            patch_validity: None,
             base_worktree: None,
             target_worktree: None,
         }
-    }
-
-    pub fn with_patch_validity(mut self, result: EvidenceResult) -> Self {
-        self.patch_validity = Some(result);
-        self
     }
 
     pub fn with_base_worktree(mut self, path: impl Into<PathBuf>) -> Self {
@@ -100,12 +92,12 @@ impl ValidationEngine {
             Err(reason) => return unknown_record(subject, property_id, verifier, reason),
         };
 
-        let answer = match self.evaluate(subject, property, &context) {
+        let answer = match self.evaluate(subject, property, &property_id, &context) {
             Ok(answer) => answer,
             Err(reason) => return unknown_record(subject, property_id, verifier, reason),
         };
 
-        let result = self.judge(subject, property, &context, &answer);
+        let result = self.judge(subject, property, &property_id, &context, &answer);
         EvidenceRecord::new(subject.id.clone(), property_id, verifier, result)
             .map_err(ValidateError::from)
     }
@@ -114,6 +106,7 @@ impl ValidationEngine {
         &self,
         subject: &ValidationSubject,
         property: &PropertyDef,
+        property_id: &PropertyId,
         context: &QueryContext,
     ) -> std::result::Result<EvaluationAnswer, String> {
         match &property.evaluator {
@@ -128,19 +121,17 @@ impl ValidationEngine {
                 timeout_secs,
             } => {
                 let cwd = context.target_or_default();
-                let env = runtime_env(subject, property, context, env);
-                run_phase_list("setup", setup, cwd, &env, *timeout_secs)?;
-                run_phase_list("pre", pre, cwd, &env, *timeout_secs)?;
-                let answer =
-                    run_command(command, args, cwd, &env, *timeout_secs).map_err(|error| {
-                        format!("command failed before producing an answer: {error}")
-                    })?;
-                if answer.status_code.is_none() {
-                    run_teardown(teardown, cwd, &env, *timeout_secs);
-                    return Err("command terminated without an exit code".to_string());
-                }
-                run_teardown(teardown, cwd, &env, *timeout_secs);
-                Ok(EvaluationAnswer::Command(answer))
+                let env = runtime_env(subject, property, property_id, context, env);
+                run_evaluator_lifecycle(setup, pre, teardown, &[cwd], &env, *timeout_secs, || {
+                    let answer =
+                        run_command(command, args, cwd, &env, *timeout_secs).map_err(|error| {
+                            phase_error(ValidationPhase::Command, "producing an answer", error)
+                        })?;
+                    if answer.status_code.is_none() {
+                        return Err("command terminated without an exit code".to_string());
+                    }
+                    Ok(EvaluationAnswer::Command(answer))
+                })
             }
             Evaluator::Pair {
                 command,
@@ -159,35 +150,44 @@ impl ValidationEngine {
                     .target
                     .as_deref()
                     .ok_or_else(|| "target worktree was not prepared".to_string())?;
-                let env = runtime_env(subject, property, context, env);
+                let env = runtime_env(subject, property, property_id, context, env);
 
-                for cwd in [base, target] {
-                    run_phase_list("setup", setup, cwd, &env, *timeout_secs)?;
-                    run_phase_list("pre", pre, cwd, &env, *timeout_secs)?;
-                }
+                run_evaluator_lifecycle(
+                    setup,
+                    pre,
+                    teardown,
+                    &[base, target],
+                    &env,
+                    *timeout_secs,
+                    || {
+                        let base_answer = run_command(command, args, base, &env, *timeout_secs)
+                            .map_err(|error| {
+                                phase_error(
+                                    ValidationPhase::Command,
+                                    "producing a base answer",
+                                    error,
+                                )
+                            })?;
+                        let target_answer = run_command(command, args, target, &env, *timeout_secs)
+                            .map_err(|error| {
+                                phase_error(
+                                    ValidationPhase::Command,
+                                    "producing a target answer",
+                                    error,
+                                )
+                            })?;
 
-                let base_answer =
-                    run_command(command, args, base, &env, *timeout_secs).map_err(|error| {
-                        format!("base command failed before producing an answer: {error}")
-                    })?;
-                let target_answer = run_command(command, args, target, &env, *timeout_secs)
-                    .map_err(|error| {
-                        format!("target command failed before producing an answer: {error}")
-                    })?;
+                        if base_answer.status_code.is_none() || target_answer.status_code.is_none()
+                        {
+                            return Err("pair command terminated without an exit code".to_string());
+                        }
 
-                let missing_exit =
-                    base_answer.status_code.is_none() || target_answer.status_code.is_none();
-                for cwd in [base, target] {
-                    run_teardown(teardown, cwd, &env, *timeout_secs);
-                }
-                if missing_exit {
-                    return Err("pair command terminated without an exit code".to_string());
-                }
-
-                Ok(EvaluationAnswer::Pair {
-                    base: base_answer,
-                    target: target_answer,
-                })
+                        Ok(EvaluationAnswer::Pair {
+                            base: base_answer,
+                            target: target_answer,
+                        })
+                    },
+                )
             }
         }
     }
@@ -196,11 +196,13 @@ impl ValidationEngine {
         &self,
         subject: &ValidationSubject,
         property: &PropertyDef,
+        property_id: &PropertyId,
         context: &QueryContext,
         answer: &EvaluationAnswer,
     ) -> EvidenceResult {
         match &property.judge {
             Judge::BoolTrue => judge_bool_true(answer),
+            Judge::BoolFalse => judge_bool_false(answer),
             Judge::ExitOk | Judge::ExitCodeZero => judge_exit_ok(answer),
             Judge::Pairwise => judge_pairwise(answer),
             Judge::Command {
@@ -210,7 +212,7 @@ impl ValidationEngine {
                 timeout_secs,
             } => {
                 let cwd = context.target_or_default();
-                let env = runtime_env(subject, property, context, env);
+                let env = runtime_env(subject, property, property_id, context, env);
                 match run_command(command, args, cwd, &env, *timeout_secs) {
                     Ok(output) if output.status_code.is_none() => EvidenceResult::Unknown {
                         reason: "judge command terminated without an exit code".to_string(),
@@ -220,18 +222,22 @@ impl ValidationEngine {
                         reason: non_empty_reason(&output, "judge command exited unsuccessfully"),
                     },
                     Err(error) => EvidenceResult::Unknown {
-                        reason: format!(
-                            "judge command failed before producing a decision: {error}"
-                        ),
+                        reason: phase_error(ValidationPhase::Judge, "producing a decision", error),
                     },
                 }
             }
             Judge::StdoutContains { text } => match answer {
-                EvaluationAnswer::Command(output) if output.stdout.contains(text) => {
+                EvaluationAnswer::Command(output)
+                    if bytes_contain(&output.stdout, text.as_bytes()) =>
+                {
                     EvidenceResult::Passed
                 }
                 EvaluationAnswer::Command(output) => EvidenceResult::Failed {
-                    reason: format!("stdout did not contain `{text}`: {}", output.stdout.trim()),
+                    reason: single_line_reason(format!(
+                        "stdout did not contain {:?}: {}",
+                        text,
+                        render_bytes_for_reason(&output.stdout)
+                    )),
                 },
                 _ => EvidenceResult::Failed {
                     reason: "stdout_contains judge requires a command answer".to_string(),
@@ -313,16 +319,16 @@ enum EvaluationAnswer {
 struct CommandAnswer {
     status_code: Option<i32>,
     success: bool,
-    stdout: String,
-    stderr: String,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
 }
 
 impl CommandAnswer {
     fn reason(&self) -> String {
-        if self.stderr.trim().is_empty() {
-            self.stdout.trim().to_string()
+        if trim_ascii_whitespace(&self.stderr).is_empty() {
+            render_bytes_for_reason(&self.stdout)
         } else {
-            self.stderr.trim().to_string()
+            render_bytes_for_reason(&self.stderr)
         }
     }
 }
@@ -341,28 +347,16 @@ fn evaluate_builtin(
     options: &BTreeMap<String, String>,
 ) -> std::result::Result<EvaluationAnswer, String> {
     match normalize_builtin_name(name).as_str() {
-        "has_change" => Ok(EvaluationAnswer::Bool(subject.has_change)),
-        "valid_patch" => match &subject.patch_validity {
-            Some(EvidenceResult::Passed) => Ok(EvaluationAnswer::Bool(true)),
-            Some(EvidenceResult::Failed { .. }) => Ok(EvaluationAnswer::Bool(false)),
-            Some(EvidenceResult::Unknown { reason } | EvidenceResult::Skipped { reason }) => {
-                Err(reason.clone())
-            }
-            None => Err("no patch validity result was available".to_string()),
-        },
-        "paths_none_match" => {
-            let patterns = option_patterns(options);
-            let matched = subject
+        "changed_paths_any_match" => {
+            let patterns = option_patterns(options)?;
+            let any_match = subject
                 .changed_paths
                 .iter()
                 .any(|path| patterns.iter().any(|pattern| path_matches(pattern, path)));
-            Ok(EvaluationAnswer::Bool(!matched))
+            Ok(EvaluationAnswer::Bool(any_match))
         }
-        "paths_all_match" => {
-            if subject.changed_paths.is_empty() {
-                return Err("no changed paths were available".to_string());
-            }
-            let patterns = option_patterns(options);
+        "changed_paths_all_match" => {
+            let patterns = option_patterns(options)?;
             let all_match = subject
                 .changed_paths
                 .iter()
@@ -381,6 +375,18 @@ fn judge_bool_true(answer: &EvaluationAnswer) -> EvidenceResult {
         },
         _ => EvidenceResult::Failed {
             reason: "bool_true judge requires a boolean answer".to_string(),
+        },
+    }
+}
+
+fn judge_bool_false(answer: &EvaluationAnswer) -> EvidenceResult {
+    match answer {
+        EvaluationAnswer::Bool(false) => EvidenceResult::Passed,
+        EvaluationAnswer::Bool(true) => EvidenceResult::Failed {
+            reason: "boolean answer was true".to_string(),
+        },
+        _ => EvidenceResult::Failed {
+            reason: "bool_false judge requires a boolean answer".to_string(),
         },
     }
 }
@@ -423,11 +429,11 @@ fn judge_pairwise(answer: &EvaluationAnswer) -> EvidenceResult {
             }
         }
         EvaluationAnswer::Pair { base, target } => EvidenceResult::Failed {
-            reason: format!(
+            reason: single_line_reason(format!(
                 "pairwise stdout differed: base=`{}`, target=`{}`",
-                base.stdout.trim(),
-                target.stdout.trim()
-            ),
+                render_bytes_for_reason(&base.stdout),
+                render_bytes_for_reason(&target.stdout)
+            )),
         },
         _ => EvidenceResult::Failed {
             reason: "pairwise judge requires a pair answer".to_string(),
@@ -435,35 +441,96 @@ fn judge_pairwise(answer: &EvaluationAnswer) -> EvidenceResult {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ValidationPhase {
+    Setup,
+    Pre,
+    Command,
+    Judge,
+    Teardown,
+}
+
+impl ValidationPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Setup => "setup",
+            Self::Pre => "pre",
+            Self::Command => "command",
+            Self::Judge => "judge",
+            Self::Teardown => "teardown",
+        }
+    }
+}
+
+fn run_evaluator_lifecycle<T, F>(
+    setup: &[String],
+    pre: &[String],
+    teardown: &[String],
+    worktrees: &[&Path],
+    env: &CommandEnv,
+    timeout_secs: Option<u64>,
+    main: F,
+) -> std::result::Result<T, String>
+where
+    F: FnOnce() -> std::result::Result<T, String>,
+{
+    let mut teardown_worktrees = Vec::new();
+    for cwd in worktrees {
+        teardown_worktrees.push(*cwd);
+        if let Err(reason) = run_phase_list(ValidationPhase::Setup, setup, cwd, env, timeout_secs) {
+            run_teardown_for_all(teardown, &teardown_worktrees, env, timeout_secs);
+            return Err(reason);
+        }
+    }
+
+    let result = (|| {
+        for cwd in worktrees {
+            run_phase_list(ValidationPhase::Pre, pre, cwd, env, timeout_secs)?;
+        }
+        main()
+    })();
+    run_teardown_for_all(teardown, &teardown_worktrees, env, timeout_secs);
+    result
+}
+
 fn run_phase_list(
-    phase: &str,
+    phase: ValidationPhase,
     commands: &[String],
     cwd: &Path,
-    env: &BTreeMap<String, String>,
+    env: &CommandEnv,
     timeout_secs: Option<u64>,
 ) -> std::result::Result<(), String> {
     for command in commands {
         let output = run_shell_command(command, cwd, env, timeout_secs)
-            .map_err(|error| format!("{phase} failed before producing an answer: {error}"))?;
+            .map_err(|error| phase_error(phase, "producing an answer", error))?;
         if output.status_code.is_none() {
-            return Err(format!("{phase} terminated without an exit code"));
+            return Err(format!(
+                "{} terminated without an exit code",
+                phase.as_str()
+            ));
         }
         if !output.success {
             return Err(non_empty_reason(
                 &output,
-                &format!("{phase} command exited unsuccessfully"),
+                &format!("{} command exited unsuccessfully", phase.as_str()),
             ));
         }
     }
     Ok(())
 }
 
-fn run_teardown(
+fn run_teardown_for_all(
     commands: &[String],
-    cwd: &Path,
-    env: &BTreeMap<String, String>,
+    cwds: &[&Path],
+    env: &CommandEnv,
     timeout_secs: Option<u64>,
 ) {
+    for cwd in cwds {
+        run_teardown(commands, cwd, env, timeout_secs);
+    }
+}
+
+fn run_teardown(commands: &[String], cwd: &Path, env: &CommandEnv, timeout_secs: Option<u64>) {
     for command in commands {
         match run_shell_command(command, cwd, env, timeout_secs) {
             Ok(output) if output.success => {}
@@ -471,15 +538,25 @@ fn run_teardown(
                 "warning: verifier teardown failed: {}",
                 non_empty_reason(&output, "teardown command exited unsuccessfully")
             ),
-            Err(error) => eprintln!("warning: verifier teardown failed: {error}"),
+            Err(error) => eprintln!(
+                "warning: verifier teardown failed: {}",
+                phase_error(ValidationPhase::Teardown, "completing cleanup", error)
+            ),
         }
     }
+}
+
+fn phase_error(phase: ValidationPhase, action: &str, error: RunError) -> String {
+    single_line_reason(format!(
+        "{} failed before {action}: {error}",
+        phase.as_str()
+    ))
 }
 
 fn run_shell_command(
     command: &str,
     cwd: &Path,
-    env: &BTreeMap<String, String>,
+    env: &CommandEnv,
     timeout_secs: Option<u64>,
 ) -> std::result::Result<CommandAnswer, RunError> {
     run_command(command, &[], cwd, env, timeout_secs)
@@ -489,7 +566,7 @@ fn run_command(
     command: &str,
     args: &[String],
     cwd: &Path,
-    env: &BTreeMap<String, String>,
+    env: &CommandEnv,
     timeout_secs: Option<u64>,
 ) -> std::result::Result<CommandAnswer, RunError> {
     let mut process = if args.is_empty() {
@@ -535,45 +612,52 @@ fn command_answer(output: std::process::Output) -> CommandAnswer {
     CommandAnswer {
         status_code: output.status.code(),
         success: output.status.success(),
-        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        stdout: output.stdout,
+        stderr: output.stderr,
     }
 }
 
 fn runtime_env(
     subject: &ValidationSubject,
     property: &PropertyDef,
+    property_id: &PropertyId,
     context: &QueryContext,
     custom: &BTreeMap<String, String>,
-) -> BTreeMap<String, String> {
+) -> CommandEnv {
     let mut env = BTreeMap::new();
-    env.insert("GRAFT_SUBJECT".to_string(), subject.id.clone());
-    env.insert("GRAFT_PROPERTY_NAME".to_string(), property.name.clone());
+    env.insert("GRAFT_SUBJECT".to_string(), OsString::from(&subject.id));
+    env.insert(
+        "GRAFT_PROPERTY_NAME".to_string(),
+        OsString::from(&property.name),
+    );
     env.insert(
         "GRAFT_PROPERTY_ID".to_string(),
-        property
-            .property_id()
-            .unwrap_or_else(|_| PropertyId::new("property:unknown"))
-            .as_str()
-            .to_string(),
+        OsString::from(property_id.as_str()),
     );
-    env.insert("GRAFT_QUERY_KIND".to_string(), context.kind.to_string());
+    env.insert(
+        "GRAFT_QUERY_KIND".to_string(),
+        OsString::from(context.kind.to_string()),
+    );
     env.insert(
         "GRAFT_CHANGED_PATHS".to_string(),
-        subject.changed_paths.join("\n"),
+        OsString::from(subject.changed_paths.join("\n")),
     );
     if let Some(base) = &context.base {
         env.insert(
             "GRAFT_BASE_WORKTREE".to_string(),
-            base.to_string_lossy().to_string(),
+            base.as_os_str().to_os_string(),
         );
     }
     if let Some(target) = &context.target {
-        let target = target.to_string_lossy().to_string();
+        let target = target.as_os_str().to_os_string();
         env.insert("GRAFT_TARGET_WORKTREE".to_string(), target.clone());
         env.insert("GRAFT_VALIDATION_WORKTREE".to_string(), target);
     }
-    env.extend(custom.clone());
+    env.extend(
+        custom
+            .iter()
+            .map(|(key, value)| (key.clone(), OsString::from(value))),
+    );
     env
 }
 
@@ -595,8 +679,13 @@ fn unknown_record(
     verifier: String,
     reason: impl Into<String>,
 ) -> Result<EvidenceRecord> {
-    EvidenceRecord::unknown(subject.id.clone(), property, verifier, reason.into())
-        .map_err(ValidateError::from)
+    EvidenceRecord::unknown(
+        subject.id.clone(),
+        property,
+        verifier,
+        single_line_reason(reason.into()),
+    )
+    .map_err(ValidateError::from)
 }
 
 fn verifier_id(property: &PropertyDef) -> String {
@@ -616,20 +705,96 @@ fn non_empty_reason(output: &CommandAnswer, fallback: &str) -> String {
     }
 }
 
-fn option_patterns(options: &BTreeMap<String, String>) -> Vec<String> {
-    options
-        .get("patterns")
-        .or_else(|| options.get("pattern"))
-        .map(|value| {
-            value
-                .split([',', '\n'])
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-        })
-        .filter(|patterns| !patterns.is_empty())
-        .unwrap_or_else(|| vec!["*".to_string()])
+fn render_bytes_for_reason(bytes: &[u8]) -> String {
+    let bytes = trim_ascii_whitespace(bytes);
+    if bytes.is_empty() {
+        return String::new();
+    }
+    match std::str::from_utf8(bytes) {
+        Ok(text) => truncate_reason(single_line_reason(text)),
+        Err(_) => truncate_reason(format!("non-UTF-8 bytes: {}", hex_preview(bytes))),
+    }
+}
+
+fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map(|index| index + 1)
+        .unwrap_or(start);
+    &bytes[start..end]
+}
+
+fn hex_preview(bytes: &[u8]) -> String {
+    const MAX_BYTES: usize = 32;
+    let mut rendered = bytes
+        .iter()
+        .take(MAX_BYTES)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if bytes.len() > MAX_BYTES {
+        rendered.push_str(" …");
+    }
+    rendered
+}
+
+fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
+    needle.is_empty()
+        || haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+}
+
+fn single_line_reason(reason: impl AsRef<str>) -> String {
+    reason
+        .as_ref()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn truncate_reason(mut reason: String) -> String {
+    const MAX_CHARS: usize = 240;
+    if reason.chars().count() <= MAX_CHARS {
+        return reason;
+    }
+    let mut end = 0;
+    for (count, (index, ch)) in reason.char_indices().enumerate() {
+        if count == MAX_CHARS {
+            break;
+        }
+        end = index + ch.len_utf8();
+    }
+    reason.truncate(end);
+    reason.push('…');
+    reason
+}
+
+fn option_patterns(options: &BTreeMap<String, String>) -> std::result::Result<Vec<String>, String> {
+    let Some(value) = options.get("patterns").or_else(|| options.get("pattern")) else {
+        return Ok(vec!["*".to_string()]);
+    };
+
+    let patterns = value
+        .split([',', '\n'])
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+
+    if patterns.is_empty() {
+        return Err(
+            "builtin evaluator option `patterns` must contain at least one non-empty pattern"
+                .to_string(),
+        );
+    }
+
+    Ok(patterns)
 }
 
 fn normalize_builtin_name(name: &str) -> String {
@@ -707,6 +872,9 @@ mod tests {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStringExt;
+
     fn temp_dir(name: &str) -> PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -755,13 +923,13 @@ mod tests {
     }
 
     #[test]
-    fn change_meta_builtin_bool_true_passes() {
+    fn changed_paths_any_match_builtin_bool_true_passes() {
         let subject =
             ValidationSubject::with_change("candidate:demo", vec!["src/lib.rs".to_string()]);
         let property = property(
             Query::ChangeMeta,
             Evaluator::Builtin {
-                name: "has_change".to_string(),
+                name: "changed_paths_any_match".to_string(),
                 options: BTreeMap::new(),
             },
             Judge::BoolTrue,
@@ -770,6 +938,50 @@ mod tests {
         let evidence = validate_property(&subject, &property).unwrap();
 
         assert_eq!(evidence.result, EvidenceResult::Passed);
+    }
+
+    #[test]
+    fn changed_paths_any_match_with_bool_false_expresses_empty_change() {
+        let subject = ValidationSubject::new("candidate:empty");
+        let property = property(
+            Query::ChangeMeta,
+            Evaluator::Builtin {
+                name: "changed_paths_any_match".to_string(),
+                options: BTreeMap::new(),
+            },
+            Judge::BoolFalse,
+        );
+
+        let evidence = validate_property(&subject, &property).unwrap();
+
+        assert_eq!(evidence.result, EvidenceResult::Passed);
+    }
+
+    #[test]
+    fn changed_paths_builtin_rejects_explicit_empty_patterns() {
+        let subject =
+            ValidationSubject::with_change("candidate:demo", vec!["src/lib.rs".to_string()]);
+
+        for key in ["patterns", "pattern"] {
+            let property = property(
+                Query::ChangeMeta,
+                Evaluator::Builtin {
+                    name: "changed_paths_any_match".to_string(),
+                    options: BTreeMap::from([(key.to_string(), "  \n, ".to_string())]),
+                },
+                Judge::BoolTrue,
+            );
+
+            let evidence = validate_property(&subject, &property).unwrap();
+
+            match evidence.result {
+                EvidenceResult::Unknown { reason } => {
+                    assert!(reason.contains("patterns"));
+                    assert!(reason.contains("at least one non-empty pattern"));
+                }
+                other => panic!("expected Unknown for `{key}` option, got {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -789,6 +1001,50 @@ mod tests {
 
         assert_eq!(evidence.result, EvidenceResult::Passed);
         let _ = fs::remove_dir_all(target);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_env_preserves_non_utf8_worktree_paths() {
+        let base = PathBuf::from(OsString::from_vec(b"/tmp/graft-base-\xFF".to_vec()));
+        let target = PathBuf::from(OsString::from_vec(b"/tmp/graft-target-\xFE".to_vec()));
+        let subject = ValidationSubject::with_change("candidate:demo", vec!["x".to_string()])
+            .with_base_worktree(&base)
+            .with_target_worktree(&target);
+        let property = property(
+            Query::ChangeMeta,
+            Evaluator::Builtin {
+                name: "changed_paths_any_match".to_string(),
+                options: BTreeMap::new(),
+            },
+            Judge::BoolTrue,
+        );
+        let property_id = property.property_id().unwrap();
+        let context = QueryContext::prepare(&subject, &property, Path::new(".")).unwrap();
+
+        let env = runtime_env(
+            &subject,
+            &property,
+            &property_id,
+            &context,
+            &BTreeMap::new(),
+        );
+
+        assert_eq!(
+            env.get("GRAFT_BASE_WORKTREE")
+                .map(|value| value.as_os_str()),
+            Some(base.as_os_str())
+        );
+        assert_eq!(
+            env.get("GRAFT_TARGET_WORKTREE")
+                .map(|value| value.as_os_str()),
+            Some(target.as_os_str())
+        );
+        assert_eq!(
+            env.get("GRAFT_VALIDATION_WORKTREE")
+                .map(|value| value.as_os_str()),
+            Some(target.as_os_str())
+        );
     }
 
     #[test]
@@ -822,6 +1078,56 @@ mod tests {
         let _ = fs::remove_dir_all(target);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn pairwise_compares_raw_stdout_bytes() {
+        let base = temp_dir("pair-raw-base");
+        let target = temp_dir("pair-raw-target");
+        fs::write(base.join("value.bin"), [0xff]).unwrap();
+        fs::write(target.join("value.bin"), [0xfe]).unwrap();
+        let subject =
+            ValidationSubject::with_change("candidate:demo", vec!["value.bin".to_string()])
+                .with_base_worktree(&base)
+                .with_target_worktree(&target);
+        let property = property(
+            Query::BaseAndTarget,
+            pair_eval("cat value.bin"),
+            Judge::Pairwise,
+        );
+
+        let evidence = validate_property(&subject, &property).unwrap();
+
+        assert!(matches!(evidence.result, EvidenceResult::Failed { .. }));
+        let _ = fs::remove_dir_all(base);
+        let _ = fs::remove_dir_all(target);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdout_contains_does_not_match_lossy_replacement_text() {
+        let target = temp_dir("stdout-raw-contains");
+        let subject = ValidationSubject::with_change("candidate:demo", vec!["x".to_string()])
+            .with_target_worktree(&target);
+        let property = property(
+            Query::TargetSnapshot,
+            command_eval("printf '\\377'"),
+            Judge::StdoutContains {
+                text: "�".to_string(),
+            },
+        );
+
+        let evidence = validate_property(&subject, &property).unwrap();
+
+        match evidence.result {
+            EvidenceResult::Failed { reason } => {
+                assert!(reason.contains("non-UTF-8 bytes"));
+                assert!(!reason.contains('\n'));
+            }
+            other => panic!("expected Failed for byte-level stdout_contains, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(target);
+    }
+
     #[test]
     fn exit_ok_judge_turns_nonzero_command_into_failed() {
         let target = temp_dir("command-fail");
@@ -833,6 +1139,27 @@ mod tests {
         let evidence = validate_property(&subject, &property).unwrap();
 
         assert!(matches!(evidence.result, EvidenceResult::Failed { .. }));
+        let _ = fs::remove_dir_all(target);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn evidence_failure_reason_is_single_line() {
+        let target = temp_dir("single-line-reason");
+        let subject = ValidationSubject::with_change("candidate:demo", vec!["x".to_string()])
+            .with_target_worktree(&target);
+        let property = property(
+            Query::TargetSnapshot,
+            command_eval("printf 'line1\\nline2' >&2; exit 7"),
+            Judge::ExitOk,
+        );
+
+        let evidence = validate_property(&subject, &property).unwrap();
+
+        match evidence.result {
+            EvidenceResult::Failed { reason } => assert_eq!(reason, "line1 line2"),
+            other => panic!("expected Failed with normalized reason, got {other:?}"),
+        }
         let _ = fs::remove_dir_all(target);
     }
 
@@ -853,6 +1180,34 @@ mod tests {
         let _ = fs::remove_dir_all(target);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn command_teardown_runs_after_setup_failure() {
+        let target = temp_dir("setup-fail-teardown");
+        let subject = ValidationSubject::with_change("candidate:demo", vec!["x".to_string()])
+            .with_target_worktree(&target);
+        let mut evaluator = command_eval("true");
+        if let Evaluator::Command {
+            setup, teardown, ..
+        } = &mut evaluator
+        {
+            setup.push("printf setup > marker.txt".to_string());
+            setup.push("exit 2".to_string());
+            teardown.push("rm -f marker.txt; printf teardown > teardown.txt".to_string());
+        }
+        let property = property(Query::TargetSnapshot, evaluator, Judge::ExitOk);
+
+        let evidence = validate_property(&subject, &property).unwrap();
+
+        assert!(matches!(evidence.result, EvidenceResult::Unknown { .. }));
+        assert!(!target.join("marker.txt").exists());
+        assert_eq!(
+            fs::read_to_string(target.join("teardown.txt")).unwrap(),
+            "teardown"
+        );
+        let _ = fs::remove_dir_all(target);
+    }
+
     #[test]
     fn pre_failure_is_unknown() {
         let target = temp_dir("pre-fail");
@@ -867,6 +1222,96 @@ mod tests {
         let evidence = validate_property(&subject, &property).unwrap();
 
         assert!(matches!(evidence.result, EvidenceResult::Unknown { .. }));
+        let _ = fs::remove_dir_all(target);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_teardown_runs_after_pre_failure() {
+        let target = temp_dir("pre-fail-teardown");
+        let subject = ValidationSubject::with_change("candidate:demo", vec!["x".to_string()])
+            .with_target_worktree(&target);
+        let mut evaluator = command_eval("true");
+        if let Evaluator::Command {
+            setup,
+            pre,
+            teardown,
+            ..
+        } = &mut evaluator
+        {
+            setup.push("printf setup > marker.txt".to_string());
+            pre.push("exit 3".to_string());
+            teardown.push("rm -f marker.txt; printf teardown > teardown.txt".to_string());
+        }
+        let property = property(Query::TargetSnapshot, evaluator, Judge::ExitOk);
+
+        let evidence = validate_property(&subject, &property).unwrap();
+
+        assert!(matches!(evidence.result, EvidenceResult::Unknown { .. }));
+        assert!(!target.join("marker.txt").exists());
+        assert_eq!(
+            fs::read_to_string(target.join("teardown.txt")).unwrap(),
+            "teardown"
+        );
+        let _ = fs::remove_dir_all(target);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pair_teardown_runs_after_pre_failure_in_both_worktrees() {
+        let base = temp_dir("pair-pre-fail-teardown-base");
+        let target = temp_dir("pair-pre-fail-teardown-target");
+        let subject = ValidationSubject::with_change("candidate:demo", vec!["x".to_string()])
+            .with_base_worktree(&base)
+            .with_target_worktree(&target);
+        let mut evaluator = pair_eval("cat marker.txt");
+        if let Evaluator::Pair {
+            setup,
+            pre,
+            teardown,
+            ..
+        } = &mut evaluator
+        {
+            setup.push("printf setup > marker.txt".to_string());
+            pre.push("exit 3".to_string());
+            teardown.push("rm -f marker.txt; printf teardown > teardown.txt".to_string());
+        }
+        let property = property(Query::BaseAndTarget, evaluator, Judge::Pairwise);
+
+        let evidence = validate_property(&subject, &property).unwrap();
+
+        assert!(matches!(evidence.result, EvidenceResult::Unknown { .. }));
+        for worktree in [&base, &target] {
+            assert!(!worktree.join("marker.txt").exists());
+            assert_eq!(
+                fs::read_to_string(worktree.join("teardown.txt")).unwrap(),
+                "teardown"
+            );
+        }
+        let _ = fs::remove_dir_all(base);
+        let _ = fs::remove_dir_all(target);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_teardown_runs_after_command_failure() {
+        let target = temp_dir("command-fail-teardown");
+        let subject = ValidationSubject::with_change("candidate:demo", vec!["x".to_string()])
+            .with_target_worktree(&target);
+        let mut evaluator = command_eval("printf dirty > marker.txt; exit 7");
+        if let Evaluator::Command { teardown, .. } = &mut evaluator {
+            teardown.push("rm -f marker.txt; printf teardown > teardown.txt".to_string());
+        }
+        let property = property(Query::TargetSnapshot, evaluator, Judge::ExitOk);
+
+        let evidence = validate_property(&subject, &property).unwrap();
+
+        assert!(matches!(evidence.result, EvidenceResult::Failed { .. }));
+        assert!(!target.join("marker.txt").exists());
+        assert_eq!(
+            fs::read_to_string(target.join("teardown.txt")).unwrap(),
+            "teardown"
+        );
         let _ = fs::remove_dir_all(target);
     }
 
@@ -893,6 +1338,37 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn command_teardown_runs_after_timeout() {
+        let target = temp_dir("timeout-teardown");
+        let subject = ValidationSubject::with_change("candidate:demo", vec!["x".to_string()])
+            .with_target_worktree(&target);
+        let mut evaluator = command_eval("sleep 2");
+        if let Evaluator::Command {
+            setup,
+            teardown,
+            timeout_secs,
+            ..
+        } = &mut evaluator
+        {
+            setup.push("printf setup > marker.txt".to_string());
+            teardown.push("rm -f marker.txt; printf teardown > teardown.txt".to_string());
+            *timeout_secs = Some(1);
+        }
+        let property = property(Query::TargetSnapshot, evaluator, Judge::ExitOk);
+
+        let evidence = validate_property(&subject, &property).unwrap();
+
+        assert!(matches!(evidence.result, EvidenceResult::Unknown { .. }));
+        assert!(!target.join("marker.txt").exists());
+        assert_eq!(
+            fs::read_to_string(target.join("teardown.txt")).unwrap(),
+            "teardown"
+        );
+        let _ = fs::remove_dir_all(target);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn signal_without_exit_code_is_unknown() {
         let target = temp_dir("signal");
         let subject = ValidationSubject::with_change("candidate:demo", vec!["x".to_string()])
@@ -906,6 +1382,29 @@ mod tests {
         let evidence = validate_property(&subject, &property).unwrap();
 
         assert!(matches!(evidence.result, EvidenceResult::Unknown { .. }));
+        let _ = fs::remove_dir_all(target);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_teardown_runs_after_signal_without_exit_code() {
+        let target = temp_dir("signal-teardown");
+        let subject = ValidationSubject::with_change("candidate:demo", vec!["x".to_string()])
+            .with_target_worktree(&target);
+        let mut evaluator = command_eval("printf dirty > marker.txt; kill -TERM $$");
+        if let Evaluator::Command { teardown, .. } = &mut evaluator {
+            teardown.push("rm -f marker.txt; printf teardown > teardown.txt".to_string());
+        }
+        let property = property(Query::TargetSnapshot, evaluator, Judge::ExitOk);
+
+        let evidence = validate_property(&subject, &property).unwrap();
+
+        assert!(matches!(evidence.result, EvidenceResult::Unknown { .. }));
+        assert!(!target.join("marker.txt").exists());
+        assert_eq!(
+            fs::read_to_string(target.join("teardown.txt")).unwrap(),
+            "teardown"
+        );
         let _ = fs::remove_dir_all(target);
     }
 
@@ -982,14 +1481,24 @@ mod tests {
             },
         );
 
+        let property_id = property.property_id().unwrap();
         let env = runtime_env(
             &subject,
             &property,
+            &property_id,
             &QueryContext::prepare(&subject, &property, Path::new(".")).unwrap(),
             &BTreeMap::new(),
         );
+        assert_eq!(
+            env.get("GRAFT_PROPERTY_ID")
+                .and_then(|value| value.to_str()),
+            Some(property_id.as_str())
+        );
         let output = run_shell_command(smoke, &target, &env, Some(5)).unwrap();
-        println!("real command verifier smoke stdout: {}", output.stdout);
+        println!(
+            "real command verifier smoke stdout: {}",
+            render_bytes_for_reason(&output.stdout)
+        );
 
         let evidence = validate_property(&subject, &property).unwrap();
         assert_eq!(evidence.result, EvidenceResult::Passed);

@@ -2,14 +2,15 @@
 //!
 //! This crate is the single home for "compiler-as-documentation" output:
 //! - [`Explainable`] surfaces structure-resident, single-line metadata about a
-//!   concept (a builtin property, a CLI subcommand, a state, a diagnostic, ...).
+//!   concept (a builtin evaluator, a CLI subcommand, a state, a diagnostic, ...).
 //! - [`NextAction`] is the unit consumed by the Hole Report block that replaces
 //!   the legacy `next:` line on every successful command.
 //! - [`Diagnostic`] is the three-layer error/unknown carrier (precise locus →
 //!   one-line fix hint → see-also list of related ids/codes).
 //!
-//! Narrative text is restricted to a single short line everywhere; long-form
-//! tutorial/markdown belongs in `graft learn` walkthroughs, not here.
+//! Structure-resident metadata stays concise, while curated `graft explain`
+//! workflow topics carry the longer plain-text guidance shared by CLI users and
+//! pi-graft tools.
 
 #![forbid(unsafe_code)]
 
@@ -29,7 +30,7 @@ pub mod properties;
 /// disallowed by the project's "compiler-as-documentation" rule.
 pub trait Explainable {
     /// Stable identifier used by `graft explain <id>` and as a `see_also`
-    /// target. Examples: `"admit"`, `"V003"`, `"ValidPatch"`,
+    /// target. Examples: `"admit"`, `"V003"`, `"EmptyChange"`,
     /// `"evidence-result.unknown"`.
     fn id(&self) -> &'static str;
 
@@ -41,15 +42,15 @@ pub trait Explainable {
         &[]
     }
 
-    /// Optional single-line elaboration. Default empty. Multi-line strings are
-    /// considered a violation of the project's narrative rule.
+    /// Optional concise elaboration. Default empty; richer workflow walkthroughs
+    /// are modeled as curated `graft explain` concept cards.
     fn narrative(&self) -> Option<&'static str> {
         None
     }
 }
 
 /// What kind of next step a [`NextAction`] is, used to render Hole Report
-/// labels and to drive `--non-interactive` defaults in `graft learn`.
+/// labels and guide non-interactive command consumers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NextActionKind {
@@ -78,6 +79,7 @@ impl NextActionKind {
 
 /// One row in a Hole Report block.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NextAction {
     /// Stable id for machine consumers (`--json` uses this verbatim).
     pub id: String,
@@ -121,7 +123,7 @@ pub enum DiagDomain {
     Materialize,
     /// `P` — promote (git object → branch / PR / release).
     Promote,
-    /// `C` — create / candidate capture.
+    /// `C` — candidate generation / transformation.
     Create,
     /// `R` — registry storage and search.
     Registry,
@@ -171,6 +173,7 @@ impl DiagDomain {
 
 /// A diagnostic code such as `V003`. Always rendered as `<letter><3-digit>`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DiagCode {
     pub domain: DiagDomain,
     pub number: u16,
@@ -212,6 +215,7 @@ impl fmt::Display for DiagCode {
 /// 2. one-line fix hint(s),
 /// 3. see-also list of related concept ids or sibling codes.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Diagnostic {
     pub code: DiagCode,
     /// Single-line summary of what this diagnostic means. No newlines.
@@ -356,6 +360,29 @@ mod tests {
     }
 
     #[test]
+    fn diagnostic_json_rejects_unknown_fields() {
+        let top_level_error = serde_json::from_str::<Diagnostic>(
+            r#"{"code":{"domain":"VALIDATE","number":3},"summary":"base unmaterializable","surprise":true}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            top_level_error.contains("unknown field `surprise`"),
+            "{top_level_error}"
+        );
+
+        let nested_error = serde_json::from_str::<Diagnostic>(
+            r#"{"code":{"domain":"VALIDATE","number":3,"surprise":true},"summary":"base unmaterializable"}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            nested_error.contains("unknown field `surprise`"),
+            "{nested_error}"
+        );
+    }
+
+    #[test]
     fn next_action_kind_labels_are_bracketed() {
         for (kind, expected) in [
             (NextActionKind::Recommended, "[recommended]"),
@@ -374,8 +401,8 @@ mod tests {
             "base unmaterializable",
         )
         .at("candidate:bd96ac3cd1ae")
-        .fix("re-run inside a git repo, or pass --base graft:empty")
-        .fix("declare a different base in graft.toml [create]")
+        .fix("start scratch edits from --base graft:empty")
+        .fix("turn the scratch into a candidate with graft candidate from-scratch")
         .see("valid-patch")
         .see("V004");
         assert_eq!(diag.code.to_string(), "V003");

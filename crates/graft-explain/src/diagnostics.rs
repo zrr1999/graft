@@ -11,7 +11,7 @@
 //!   A — admit (candidate → registry)
 //!   M — materialize (registry → git object)
 //!   P — promote (git object → branch / PR / release)
-//!   C — create / candidate capture
+//!   C — candidate generation / transformation
 //!   R — registry storage and search
 //!   G — git bridge (gitoxide / explicit Git CLI bridge)
 
@@ -59,10 +59,10 @@ pub fn v003_base_unmaterializable(detail: &str) -> Diagnostic {
         "base state could not be materialized for verification",
     )
     .at(one_line(detail))
-    .fix("run inside a git repo, or pass `--from graft:empty` if you have no base")
-    .fix("or declare a different base under [create].default_base in graft.toml")
+    .fix("start scratch edits from an explicit materializable base such as `--base graft:empty`, then run `graft candidate from-scratch`")
     .see("valid-patch")
-    .see("create")
+    .see("scratch")
+    .see("candidate")
     .see("evidence-result.unknown")
 }
 
@@ -166,20 +166,8 @@ pub fn m003_target_not_materializable(target: &str, why: &str) -> Diagnostic {
 }
 
 // =====================================================================
-// C — create / candidate capture
+// C — candidate generation / transformation
 // =====================================================================
-
-/// C001 — `[create].default_mode` in graft.toml is not a recognized value.
-pub fn c001_unsupported_create_mode(mode: &str) -> Diagnostic {
-    Diagnostic::new(
-        DiagCode::new(DiagDomain::Create, 1),
-        format!("unsupported create.default_mode `{mode}`"),
-    )
-    .at("graft.toml [create].default_mode".to_string())
-    .fix("set [create].default_mode = \"cache-only\" (the only supported value)")
-    .see("create")
-    .see("graft.toml")
-}
 
 /// C002 — change is inline-only and cannot be transformed (composed,
 /// migrated, etc.).
@@ -189,8 +177,8 @@ pub fn c002_inline_change_not_transformable(summary: &str) -> Diagnostic {
         "cannot transform an inline-only change",
     )
     .at(one_line(summary))
-    .fix("re-capture the candidate from a real worktree so the change is stored, not inline")
-    .see("create")
+    .fix("rebuild the candidate through scratch edits and `graft candidate from-scratch` so the change is stored, not inline")
+    .see("candidate")
     .see("compose")
 }
 
@@ -288,10 +276,14 @@ pub const ALL_DIAGNOSTICS: &[DiagnosticDoc] = &[
         code: DiagCode::new(DiagDomain::Validate, 3),
         summary: "base state required by the verifier could not be materialized",
         fix_hints: &[
-            "run inside a git repo, or pass `--from graft:empty` if you have no base",
-            "or declare a different base under [create].default_base in graft.toml",
+            "start scratch edits from an explicit materializable base such as `--base graft:empty`, then run `graft candidate from-scratch`",
         ],
-        see_also: &["valid-patch", "create", "evidence-result.unknown"],
+        see_also: &[
+            "valid-patch",
+            "scratch",
+            "candidate",
+            "evidence-result.unknown",
+        ],
     },
     DiagnosticDoc {
         code: DiagCode::new(DiagDomain::Validate, 4),
@@ -342,20 +334,14 @@ pub const ALL_DIAGNOSTICS: &[DiagnosticDoc] = &[
         ],
         see_also: &["materialize", "compose", "migrate"],
     },
-    // C — create / candidate capture
-    DiagnosticDoc {
-        code: DiagCode::new(DiagDomain::Create, 1),
-        summary: "unsupported create.default_mode in graft.toml",
-        fix_hints: &["set [create].default_mode = \"cache-only\" (the only supported value)"],
-        see_also: &["create", "graft.toml"],
-    },
+    // C — candidate generation / transformation
     DiagnosticDoc {
         code: DiagCode::new(DiagDomain::Create, 2),
         summary: "cannot transform an inline-only change",
         fix_hints: &[
-            "re-capture the candidate from a real worktree so the change is stored, not inline",
+            "rebuild the candidate through scratch edits and `graft candidate from-scratch` so the change is stored, not inline",
         ],
-        see_also: &["create", "compose"],
+        see_also: &["candidate", "compose"],
     },
     // R — registry storage / search
     DiagnosticDoc {
@@ -422,8 +408,8 @@ mod tests {
 
     #[test]
     fn admit_codes_distinct_and_in_admit_domain() {
-        let a1 = a001_missing_required_evidence("ValidPatch");
-        let a2 = a002_failed_required_evidence("ValidPatch");
+        let a1 = a001_missing_required_evidence("ReviewPolicy");
+        let a2 = a002_failed_required_evidence("ReviewPolicy");
         assert_eq!(a1.code.domain, DiagDomain::Admit);
         assert_eq!(a2.code.domain, DiagDomain::Admit);
         assert_ne!(a1.code, a2.code);
@@ -437,7 +423,7 @@ mod tests {
             a001_missing_required_evidence("X").code,
             m001_registry_tree_id_mismatch("X").code,
             // P-domain codes are added by promote-required-from-config.
-            c001_unsupported_create_mode("X").code,
+            c002_inline_change_not_transformable("X").code,
             r001_registry_index_corrupt("X").code,
             g001_unsupported_path("X").code,
         ];
@@ -473,7 +459,7 @@ mod tests {
         }
         // Catalog must have exactly the same number of entries as builders
         // exercised by every_diagnostic_summary_and_loc_are_single_line.
-        assert_eq!(ALL_DIAGNOSTICS.len(), 15);
+        assert_eq!(ALL_DIAGNOSTICS.len(), 14);
     }
 
     #[test]
@@ -498,7 +484,6 @@ mod tests {
             m001_registry_tree_id_mismatch("id"),
             m002_registry_change_id_mismatch("id"),
             m003_target_not_materializable("t", "why"),
-            c001_unsupported_create_mode("m"),
             c002_inline_change_not_transformable("s"),
             r001_registry_index_corrupt("d"),
             g001_unsupported_path("p"),
@@ -513,7 +498,7 @@ mod tests {
                 assert!(!h.contains('\n'), "{}: fix hint multi-line", d.code);
             }
         }
-        // 15 builders covering 6 subsystems (P stays for T7).
-        assert_eq!(all.len(), 15);
+        // 14 builders covering 6 subsystems (P stays for T7).
+        assert_eq!(all.len(), 14);
     }
 }

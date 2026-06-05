@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::path::Path;
 
 use graft_core::{StateId, TreeSnapshot};
@@ -19,7 +20,11 @@ pub type Result<T> = std::result::Result<T, GitError>;
 pub struct GixBackend;
 
 impl GixBackend {
-    pub fn ensure_repo(&self, url: &str, path: impl AsRef<Path>) -> Result<EnsuredRepo> {
+    pub fn ensure_repo(
+        &self,
+        url: impl AsRef<OsStr>,
+        path: impl AsRef<Path>,
+    ) -> Result<EnsuredRepo> {
         Ok(graft_repo::GixBackend.ensure_repo(url, path)?)
     }
 

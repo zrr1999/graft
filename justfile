@@ -18,21 +18,25 @@ package-cli-sdist:
 # Format all code
 format:
     just --fmt --unstable
-    cargo fmt
+    cargo fmt --all
 
-# Run static checks
+# Run static checks (rustfmt + clippy)
 check:
     cargo fmt --all -- --check
-    cargo clippy --all-targets -- -D warnings
+    cargo clippy --locked --workspace --all-targets -- -D warnings
 
-# Run tests
+# Run locked workspace tests and doc tests
 test *ARGS:
-    cargo test --all-targets {{ ARGS }}
-    cargo test --doc --all-features
+    cargo test --locked --workspace --all-targets {{ ARGS }}
+    cargo test --locked --doc --workspace
 
-# Run tests with coverage (requires cargo-llvm-cov)
+# Run end-to-end CLI smoke tests
+smoke:
+    @set -e; for script in tests/*.sh; do echo "==> $script"; bash "$script"; done
+
+# Run locked tests with coverage (requires cargo-llvm-cov)
 cov:
-    cargo llvm-cov test --lcov --output-path lcov.info -- --no-capture
+    cargo llvm-cov test --locked --workspace --all-targets --lcov --output-path lcov.info -- --no-capture
 
 # Check the declared MSRV where rustup is available; otherwise check with the active 1.95-compatible cargo
 msrv:
@@ -48,9 +52,12 @@ clean:
     rm -rf dist
     rm -f lcov.info
 
-# Run pre-commit on all files
-pre-commit:
+# Run prek on all files
+prek:
     uvx prek run --all-files
+
+# Alias for the prek all-files gate
+pre-commit: prek
 
 # Display project information
 info:

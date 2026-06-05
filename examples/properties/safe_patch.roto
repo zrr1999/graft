@@ -1,0 +1,27 @@
+// Pattern: property composition through `requires`.
+//
+// `safe_patch` does not redefine path or command checks; it requires that
+// `no_generated_artifacts` and `cargo_tests_pass` already hold. The Roto
+// 0.11 ICE on user-fn-to-user-fn `Check` composition does not apply:
+// `requires` lists names, not function calls.
+//
+// Evaluation semantics:
+//   - dependencies are evaluated first;
+//   - if any required property is `Failure` or `NotApplicable`, the
+//     dependent property is `NotApplicable` (it does not run its own
+//     `checks`);
+//   - if any required property is `Error`, the dependent property is
+//     `Error`;
+//   - cycles are rejected at load time.
+
+fn safe_patch(app: Application) -> Property {
+    property(
+        [],
+        "patch passes both artifact policy and the test suite",
+        Severity.Blocking,
+        [
+            "no_generated_artifacts",
+            "cargo_tests_pass",
+        ],
+    )
+}

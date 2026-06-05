@@ -9,49 +9,39 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-cargo build -p graft-cli -p graft-daemon >/dev/null 2>&1
-GRAFT_BIN="$PWD/target/debug/graft"
-GRAFTD_BIN="$PWD/target/debug/graftd"
+source tests/lib/smoke.sh
 
-WORKDIR="$(mktemp -d)"
-cleanup() {
-  find "$WORKDIR" -path '*/.graft/run/daemon.sock' -type s -exec "$GRAFTD_BIN" stop --socket {} \; >/dev/null 2>&1 || true
-  rm -rf "$WORKDIR"
-}
-trap cleanup EXIT
+setup_bins
+setup_workspace
+trap cleanup_workspace EXIT
 
 cd "$WORKDIR"
 printf 'hello\n' > hello.txt
 "$GRAFT_BIN" init >/dev/null
-cat >> graft-properties.toml <<'EOF'
+write_properties_roto <<'ROTO'
+fn retry_passes(app: Application) -> Property {
+    let run = call(["false"], app.target());
 
-[[properties]]
-name = "RetryPasses"
+    property(
+        [
+            run.exit_code_is(0).success(),
+        ],
+        "retry verifier that can be changed from failing to passing",
+        Severity.Blocking,
+        [],
+    )
+}
+ROTO
+lock_properties
 
-[properties.query]
-kind = "target_snapshot"
-
-[properties.evaluator]
-kind = "command"
-command = "false"
-args = []
-env = {}
-setup = []
-pre = []
-teardown = []
-
-[properties.judge]
-kind = "exit_code_zero"
-EOF
-"$GRAFT_BIN" property lock >/dev/null
-
-created=$("$GRAFT_BIN" create --from graft:empty --expect ValidPatch --message retry-evidence)
+scratch_out=$("$GRAFT_BIN" scratch write --base graft:empty hello.txt --content $'hello\n')
+scratch=$(grep -oE 'scratch:[0-9a-f]+' <<<"$scratch_out" | tail -n1)
+[[ -n $scratch ]] || { echo "FAIL: no scratch captured"; echo "$scratch_out"; exit 1; }
+created=$("$GRAFT_BIN" candidate from-scratch "$scratch" --message retry-evidence)
 candidate=$(grep -oE 'candidate:[0-9a-f]+' <<<"$created" | head -n1)
 [[ -n $candidate ]] || { echo "FAIL: no candidate captured"; echo "$created"; exit 1; }
 
-"$GRAFT_BIN" validate "$candidate" --expect ValidPatch >/dev/null
-
-failed=$("$GRAFT_BIN" validate "$candidate" --expect RetryPasses)
+failed=$("$GRAFT_BIN" validate "$candidate" --expect workspace:retry_passes)
 if ! grep -q 'failed:' <<<"$failed"; then
   echo "FAIL: first validation should record failed evidence"
   echo "$failed"; exit 1
@@ -60,21 +50,21 @@ fi
 python3 - <<'PY'
 from pathlib import Path
 
-path = Path("graft-properties.toml")
+path = Path("properties.roto")
 text = path.read_text()
-path.write_text(text.replace('command = "false"', 'command = "true"', 1))
+path.write_text(text.replace('["false"]', '["true"]', 1))
 PY
-"$GRAFT_BIN" property lock >/dev/null
+lock_properties
 
-passed=$("$GRAFT_BIN" validate "$candidate" --expect RetryPasses)
+passed=$("$GRAFT_BIN" validate "$candidate" --expect workspace:retry_passes)
 if ! grep -q 'passed' <<<"$passed"; then
   echo "FAIL: second validation should record passing evidence"
   echo "$passed"; exit 1
 fi
 
-admitted=$("$GRAFT_BIN" admit "$candidate" --require ValidPatch)
+admitted=$("$GRAFT_BIN" admit "$candidate" --require workspace:retry_passes)
 if ! grep -qE 'admitted patch patch:[0-9a-f]+ from candidate' <<<"$admitted"; then
-  echo "FAIL: admit should accept independent passing ValidPatch evidence even after RetryPasses is retried"
+  echo "FAIL: admit should accept latest passing retry_passes evidence after retry"
   echo "$admitted"; exit 1
 fi
 

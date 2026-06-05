@@ -19,6 +19,7 @@ graft-repo = { path = "../graft-repo" }
 graft-store = { path = "../graft-store" }
 graft-sync = { path = "../graft-sync" }
 graft-validate = { path = "../graft-validate" }
+roto = "0.11.0"
 serde.workspace = true
 serde_json.workspace = true
 time.workspace = true

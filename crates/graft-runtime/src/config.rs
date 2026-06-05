@@ -1,61 +1,83 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use graft_core::{Evaluator, Judge, PropertyDef, Query};
+use graft_core::{PropertyRef, PropertySpec};
+
+use crate::roto_properties::load_roto_property_specs;
 use graft_store::GraftStore;
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GraftConfig {
-    #[serde(default)]
-    pub(crate) create: CreateConfig,
+    #[serde(default = "default_config_schema")]
+    pub(crate) schema: u32,
     #[serde(default)]
     pub(crate) admission: AdmissionConfig,
     #[serde(default)]
     pub(crate) promotion: PromotionConfig,
     #[serde(default)]
-    pub(crate) promote_targets: BTreeMap<String, PromoteTargetConfig>,
+    pub(crate) sync: SyncConfig,
     #[serde(default)]
-    pub(crate) repos_root: Option<PathBuf>,
+    pub(crate) promote_targets: BTreeMap<String, PromoteTargetConfig>,
     #[serde(default)]
     pub(crate) repos: BTreeMap<String, RepoConfig>,
     #[serde(skip)]
-    pub(crate) properties: BTreeMap<String, PropertyDef>,
+    pub(crate) properties: BTreeMap<String, PropertySpec>,
 }
 
 impl GraftConfig {
-    pub(crate) fn validate_repos(&self) -> Result<()> {
-        if let Some(root) = &self.repos_root {
-            validate_config_path("repos_root", root)?;
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.schema != default_config_schema() {
+            bail!(
+                "[E_UNSUPPORTED_CONFIG_SCHEMA] graft.toml schema {} is not supported",
+                self.schema
+            );
         }
+        self.validate_repos()?;
+        self.validate_property_scopes()
+    }
+
+    fn validate_repos(&self) -> Result<()> {
         for (target_id, target) in &self.promote_targets {
             validate_repo_id(target_id)?;
             validate_config_path(&format!("promote_targets.{target_id}.path"), &target.path)?;
-            if target.branch.as_deref().is_some_and(str::is_empty) {
-                bail!("promote target {target_id} branch must not be empty");
-            }
+            validate_promote_target_branch(target_id, target.branch.as_deref())?;
         }
         for (repo_id, repo) in &self.repos {
             validate_repo_id(repo_id)?;
             if repo.url.trim().is_empty() {
                 bail!("repo {repo_id} must set a non-empty url");
             }
-            if let Some(path) = &repo.path {
-                validate_config_path(&format!("repos.{repo_id}.path"), path)?;
-            }
+            validate_repo_default_branch(repo_id, repo.default_branch.as_deref())?;
         }
         Ok(())
     }
 
-    pub(crate) fn repos_root_path(&self, workspace: &Path) -> PathBuf {
-        resolve_config_path(
-            workspace,
-            self.repos_root
-                .as_deref()
-                .unwrap_or_else(|| Path::new(".graft/repos")),
-        )
+    fn validate_property_scopes(&self) -> Result<()> {
+        validate_property_scope_map(
+            self,
+            "admission.required_properties",
+            &self.admission.required_properties,
+        )?;
+        validate_property_scope_map(
+            self,
+            "promotion.required_properties",
+            &self.promotion.required_properties,
+        )?;
+        for (target_id, target) in &self.promote_targets {
+            validate_property_scope_map(
+                self,
+                &format!("promote_targets.{target_id}.required_properties"),
+                &target.required_properties,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn repos_root_path(&self, workspace: &Path) -> Result<PathBuf> {
+        resolve_config_path(workspace, Path::new(".graft/repos"))
     }
 
     pub(crate) fn promote_target_path(&self, workspace: &Path, target_id: &str) -> Result<PathBuf> {
@@ -63,54 +85,71 @@ impl GraftConfig {
             .promote_targets
             .get(target_id)
             .with_context(|| format!("unknown promote target {target_id}"))?;
-        Ok(resolve_config_path(workspace, &target.path))
+        resolve_config_path(workspace, &target.path)
     }
 
     pub(crate) fn repo_path(&self, workspace: &Path, repo_id: &str) -> Result<PathBuf> {
-        let repo = self
-            .repos
+        self.repos
             .get(repo_id)
             .with_context(|| format!("unknown repo id {repo_id}"))?;
-        Ok(match repo.path.as_deref() {
-            Some(path) => resolve_config_path(workspace, path),
-            None => self.repos_root_path(workspace).join(repo_id),
-        })
+        Ok(self.repos_root_path(workspace)?.join(repo_id))
     }
+}
+
+impl Default for GraftConfig {
+    fn default() -> Self {
+        Self {
+            schema: default_config_schema(),
+            admission: AdmissionConfig::default(),
+            promotion: PromotionConfig::default(),
+            sync: SyncConfig::default(),
+            promote_targets: BTreeMap::new(),
+            repos: BTreeMap::new(),
+            properties: BTreeMap::new(),
+        }
+    }
+}
+
+fn default_config_schema() -> u32 {
+    1
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RepoConfig {
     pub(crate) url: String,
-    pub(crate) path: Option<PathBuf>,
-    #[serde(default = "default_true")]
-    pub(crate) auto_clone: bool,
     pub(crate) default_branch: Option<String>,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct CreateConfig {
-    pub(crate) default_base: Option<String>,
-    pub(crate) default_mode: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AdmissionConfig {
     #[serde(default)]
-    pub(crate) base_properties: Vec<String>,
+    pub(crate) required_properties: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PromotionConfig {
     #[serde(default)]
-    pub(crate) required_properties: Vec<String>,
+    pub(crate) required_properties: BTreeMap<String, Vec<String>>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SyncConfig {
+    #[serde(default = "default_true")]
+    pub(crate) enabled: bool,
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -119,82 +158,7 @@ pub(crate) struct PromoteTargetConfig {
     pub(crate) path: PathBuf,
     pub(crate) branch: Option<String>,
     #[serde(default)]
-    pub(crate) required_properties: Vec<String>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct PropertyConfig {
-    #[serde(default)]
-    properties: Vec<RawPropertyDef>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawPropertyDef {
-    name: Option<String>,
-    query: Option<Query>,
-    evaluator: Option<Evaluator>,
-    judge: Option<Judge>,
-}
-
-impl PropertyConfig {
-    fn into_property_map(self, path: &Path) -> Result<BTreeMap<String, PropertyDef>> {
-        let mut seen = BTreeSet::new();
-        let mut out = BTreeMap::new();
-        for (index, raw) in self.properties.into_iter().enumerate() {
-            let label = format!("{} properties[{index}]", path.display());
-            let Some(name) = raw.name else {
-                bail!("[E_INCOMPLETE_PROPERTY] {label} must set name");
-            };
-            if name.trim().is_empty() {
-                bail!("[E_INCOMPLETE_PROPERTY] property name must not be empty");
-            }
-            if !seen.insert(name.clone()) {
-                bail!("[E_DUPLICATE_PROPERTY] duplicate property name {name}");
-            }
-            let Some(query) = raw.query else {
-                bail!("[E_INCOMPLETE_PROPERTY] property {name} must set query");
-            };
-            let Some(evaluator) = raw.evaluator else {
-                bail!("[E_INCOMPLETE_PROPERTY] property {name} must set evaluator");
-            };
-            let Some(judge) = raw.judge else {
-                bail!("[E_INCOMPLETE_PROPERTY] property {name} must set judge");
-            };
-            out.insert(
-                name.clone(),
-                PropertyDef {
-                    name,
-                    query,
-                    evaluator,
-                    judge,
-                },
-            );
-        }
-        Ok(out)
-    }
-}
-
-fn raw_property_to_def(name: String, raw: RawPropertyDef, label: &str) -> Result<PropertyDef> {
-    if name.trim().is_empty() {
-        bail!("[E_INCOMPLETE_PROPERTY] property name must not be empty");
-    }
-    let Some(query) = raw.query else {
-        bail!("[E_INCOMPLETE_PROPERTY] property {name} in {label} must set query");
-    };
-    let Some(evaluator) = raw.evaluator else {
-        bail!("[E_INCOMPLETE_PROPERTY] property {name} in {label} must set evaluator");
-    };
-    let Some(judge) = raw.judge else {
-        bail!("[E_INCOMPLETE_PROPERTY] property {name} in {label} must set judge");
-    };
-    Ok(PropertyDef {
-        name,
-        query,
-        evaluator,
-        judge,
-    })
+    pub(crate) required_properties: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -221,6 +185,8 @@ impl Default for PropertyLock {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RepoLockEntry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) url: Option<String>,
     pub(crate) treeish: String,
     pub(crate) resolved_oid: String,
     pub(crate) resolved_at: String,
@@ -242,6 +208,12 @@ pub(crate) struct PropertyLockChange {
     pub(crate) name: String,
     pub(crate) locked: String,
     pub(crate) current: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RequiresVisitState {
+    Visiting,
+    Done,
 }
 
 impl PropertyLockDrift {
@@ -272,77 +244,125 @@ impl PropertyLockDrift {
 }
 
 pub(crate) fn load_graft_config(store: &GraftStore) -> Result<GraftConfig> {
+    let mut config = load_graft_config_metadata(store)?;
+    config.properties = load_property_defs(store)?;
+    require_property_lock_current(store, &config.properties)?;
+    Ok(config)
+}
+
+pub(crate) fn load_graft_config_metadata(store: &GraftStore) -> Result<GraftConfig> {
     let path = store.paths().config();
     if !path.exists() {
         bail!("{} does not exist; run graft init first", path.display());
     }
     let text =
         std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-    let mut config: GraftConfig =
+    let config: GraftConfig =
         toml::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
-    config.validate_repos()?;
+    config.validate()?;
     let workspace = store.paths().workspace();
-    let _ = config.repos_root_path(workspace);
     for repo_id in config.repos.keys() {
         let _ = config.repo_path(workspace, repo_id)?;
     }
-    config.properties = load_property_defs(store)?;
-    ensure_property_lock_current(store, &config.properties)?;
     Ok(config)
 }
 
-pub(crate) fn load_optional_graft_config(store: &GraftStore) -> Result<GraftConfig> {
-    if store.paths().config().exists() {
-        load_graft_config(store)
-    } else {
-        Ok(GraftConfig::default())
+pub(crate) fn load_property_defs(store: &GraftStore) -> Result<BTreeMap<String, PropertySpec>> {
+    let legacy_path = store.paths().properties_config();
+    if legacy_path.exists() {
+        bail!(
+            "[E_LEGACY_PROPERTIES_UNSUPPORTED] {} is legacy property configuration; use only the v2 properties.roto file",
+            legacy_path.display()
+        );
     }
+    let roto_path = store.paths().properties_roto_config();
+    if !roto_path.exists() {
+        bail!(
+            "{} does not exist; run graft init first",
+            roto_path.display()
+        );
+    }
+    let properties = load_roto_property_specs(&roto_path)?;
+    validate_property_requires_graph(&properties)?;
+    Ok(properties)
 }
 
-pub(crate) fn load_property_defs(store: &GraftStore) -> Result<BTreeMap<String, PropertyDef>> {
-    let path = store.paths().properties_config();
-    if !path.exists() {
-        bail!("{} does not exist; run graft init first", path.display());
-    }
-    if path.is_dir() {
-        let mut out = BTreeMap::new();
-        for entry in std::fs::read_dir(&path).with_context(|| format!("read {}", path.display()))? {
-            let entry = entry?;
-            let file = entry.path();
-            if file.extension().and_then(|value| value.to_str()) != Some("toml") {
-                continue;
-            }
-            let name = file
-                .file_stem()
-                .and_then(|value| value.to_str())
-                .with_context(|| format!("invalid property filename {}", file.display()))?
-                .to_string();
-            let text = std::fs::read_to_string(&file)
-                .with_context(|| format!("read {}", file.display()))?;
-            let raw: RawPropertyDef =
-                toml::from_str(&text).with_context(|| format!("parse {}", file.display()))?;
-            if out.contains_key(&name) {
-                bail!("[E_DUPLICATE_PROPERTY] duplicate property name {name}");
-            }
-            out.insert(
-                name.clone(),
-                raw_property_to_def(name, raw, &file.display().to_string())?,
+pub(crate) fn validate_property_requires_graph(
+    defs: &BTreeMap<String, PropertySpec>,
+) -> Result<()> {
+    for (name, spec) in defs {
+        if spec.name.as_str() != name {
+            bail!(
+                "[E_PROPERTY_NAME_MISMATCH] property map key `{name}` contains spec named `{}`",
+                spec.name.as_str()
             );
         }
-        return Ok(out);
+        let mut seen_requires = std::collections::BTreeSet::new();
+        for required in &spec.plan.requires {
+            let required = required.as_str();
+            if !seen_requires.insert(required) {
+                bail!(
+                    "[E_PROPERTY_REQUIRES_DUPLICATE] property `{name}` lists required property `{required}` more than once"
+                );
+            }
+            if !defs.contains_key(required) {
+                bail!(
+                    "[E_PROPERTY_REQUIRES_MISSING] property `{name}` requires unknown property `{required}`"
+                );
+            }
+        }
     }
-    let text =
-        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-    let config: PropertyConfig =
-        toml::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
-    config.into_property_map(&path)
+
+    let mut states = BTreeMap::new();
+    let mut stack = Vec::new();
+    for name in defs.keys() {
+        visit_requires_graph(name, defs, &mut states, &mut stack)?;
+    }
+    Ok(())
+}
+
+fn visit_requires_graph(
+    name: &str,
+    defs: &BTreeMap<String, PropertySpec>,
+    states: &mut BTreeMap<String, RequiresVisitState>,
+    stack: &mut Vec<String>,
+) -> Result<()> {
+    match states.get(name).copied() {
+        Some(RequiresVisitState::Done) => return Ok(()),
+        Some(RequiresVisitState::Visiting) => {
+            let start = stack
+                .iter()
+                .position(|entry| entry == name)
+                .unwrap_or_default();
+            let mut cycle = stack[start..].to_vec();
+            cycle.push(name.to_string());
+            bail!(
+                "[E_PROPERTY_REQUIRES_CYCLE] property requires cycle: {}",
+                cycle.join(" -> ")
+            );
+        }
+        None => {}
+    }
+
+    states.insert(name.to_string(), RequiresVisitState::Visiting);
+    stack.push(name.to_string());
+    let spec = defs
+        .get(name)
+        .with_context(|| format!("missing property `{name}` while walking requires graph"))?;
+    for required in &spec.plan.requires {
+        visit_requires_graph(required.as_str(), defs, states, stack)?;
+    }
+    stack.pop();
+    states.insert(name.to_string(), RequiresVisitState::Done);
+    Ok(())
 }
 
 pub(crate) fn property_lock_path(store: &GraftStore) -> PathBuf {
     store.paths().properties_lock()
 }
 
-pub(crate) fn current_property_lock(defs: &BTreeMap<String, PropertyDef>) -> Result<PropertyLock> {
+pub(crate) fn current_property_lock(defs: &BTreeMap<String, PropertySpec>) -> Result<PropertyLock> {
+    validate_property_requires_graph(defs)?;
     let mut properties = BTreeMap::new();
     for (name, def) in defs {
         properties.insert(name.clone(), def.property_id()?.to_string());
@@ -379,8 +399,11 @@ fn write_graft_lock(store: &GraftStore, lock: &PropertyLock) -> Result<()> {
 
 pub(crate) fn write_property_lock(
     store: &GraftStore,
-    defs: &BTreeMap<String, PropertyDef>,
+    defs: &BTreeMap<String, PropertySpec>,
 ) -> Result<PropertyLock> {
+    for spec in defs.values() {
+        store.write_property_spec(spec)?;
+    }
     let mut lock = current_property_lock(defs)?;
     if let Some(existing) = read_property_lock(store)? {
         lock.repos = existing.repos;
@@ -392,14 +415,20 @@ pub(crate) fn write_property_lock(
 pub(crate) fn write_repo_lock_entry(
     store: &GraftStore,
     repo_id: &str,
+    url: &str,
     treeish: &str,
     resolved_oid: &str,
 ) -> Result<PropertyLock> {
-    let mut lock = read_property_lock(store)?.unwrap_or_default();
+    let Some(mut lock) = read_property_lock(store)? else {
+        bail!(
+            "[E_PROPERTY_LOCK_MISSING] graft.lock is missing; run `graft property lock` before locking repository refs"
+        );
+    };
     lock.version = graft_lock_version();
     lock.repos.insert(
         repo_id.to_string(),
         RepoLockEntry {
+            url: Some(url.to_string()),
             treeish: treeish.to_string(),
             resolved_oid: resolved_oid.to_string(),
             resolved_at: time::OffsetDateTime::now_utc().to_string(),
@@ -409,8 +438,51 @@ pub(crate) fn write_repo_lock_entry(
     Ok(lock)
 }
 
+pub(crate) fn require_repo_lock_current(
+    store: &GraftStore,
+    repo_id: &str,
+    repo_config: &RepoConfig,
+    requested_treeish: &str,
+) -> Result<RepoLockEntry> {
+    let Some(lock) = read_property_lock(store)? else {
+        bail!(
+            "[E_PROPERTY_LOCK_MISSING] graft.lock is missing; run `graft property lock` before resolving repository bases"
+        );
+    };
+    let Some(entry) = lock.repos.get(repo_id) else {
+        bail!(
+            "[E_REPO_LOCK_DRIFT] repo {repo_id} is missing from graft.lock; run `graft repo lock {repo_id}`"
+        );
+    };
+    let expected_treeish = repo_config.default_branch.as_deref().unwrap_or("HEAD");
+    if entry.url.as_deref() != Some(repo_config.url.as_str()) {
+        bail!(
+            "[E_REPO_LOCK_DRIFT] repo {repo_id} url in graft.lock does not match graft.toml; run `graft repo update {repo_id}`"
+        );
+    }
+    if entry.treeish != expected_treeish {
+        bail!(
+            "[E_REPO_LOCK_DRIFT] repo {repo_id} treeish in graft.lock is `{}` but graft.toml resolves to `{expected_treeish}`; run `graft repo update {repo_id}`",
+            entry.treeish
+        );
+    }
+    if entry.treeish != requested_treeish {
+        bail!(
+            "[E_REPO_LOCK_DRIFT] repo base `{repo_id}@{requested_treeish}` is not locked; graft.lock has `{repo_id}@{}`; use `repo:{repo_id}@{}` or run `graft repo update {repo_id}`",
+            entry.treeish,
+            entry.treeish
+        );
+    }
+    if entry.resolved_oid.trim().is_empty() {
+        bail!(
+            "[E_REPO_LOCK_DRIFT] repo {repo_id} lock entry has an empty resolved_oid; run `graft repo update {repo_id}`"
+        );
+    }
+    Ok(entry.clone())
+}
+
 pub(crate) fn property_lock_drift(
-    defs: &BTreeMap<String, PropertyDef>,
+    defs: &BTreeMap<String, PropertySpec>,
     lock: &PropertyLock,
 ) -> Result<PropertyLockDrift> {
     let current = current_property_lock(defs)?;
@@ -434,38 +506,77 @@ pub(crate) fn property_lock_drift(
     Ok(drift)
 }
 
-pub(crate) fn ensure_property_lock_current(
+pub(crate) fn require_property_lock_current(
     store: &GraftStore,
-    defs: &BTreeMap<String, PropertyDef>,
+    defs: &BTreeMap<String, PropertySpec>,
 ) -> Result<PropertyLock> {
     let Some(lock) = read_property_lock(store)? else {
-        return write_property_lock(store, defs);
+        bail!(
+            "[E_PROPERTY_LOCK_MISSING] graft.lock is missing; run `graft property lock` to derive property ids from properties.roto"
+        );
     };
     let drift = property_lock_drift(defs, &lock)?;
     if !drift.is_clean() {
-        return write_property_lock(store, defs);
+        bail!(
+            "[E_PROPERTY_LOCK_DRIFT] graft.lock is stale ({}); run `graft property lock` to refresh it",
+            drift.summary()
+        );
     }
     Ok(lock)
 }
 
-pub(crate) fn resolve_property(
-    config: &GraftConfig,
-    name: &str,
-) -> Result<graft_core::PropertyRef> {
-    let def = config.properties.get(name).with_context(|| {
-        format!("[E_UNKNOWN_PROPERTY] property {name} is not configured in properties/*.toml")
+pub(crate) fn resolve_property(config: &GraftConfig, name: &str) -> Result<PropertyRef> {
+    let spec = config.properties.get(name).with_context(|| {
+        format!("[E_UNKNOWN_PROPERTY] property {name} is not configured in properties.roto")
     })?;
-    def.property_ref().map_err(Into::into)
+    spec.property_ref().map_err(Into::into)
 }
 
 fn validate_repo_id(repo_id: &str) -> Result<()> {
     if repo_id.is_empty() {
         bail!("repo id must not be empty");
     }
-    if !repo_id.bytes().all(|byte| {
-        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'_'
-    }) {
-        bail!("invalid repo id {repo_id}; use lowercase letters, digits, '-' or '_'");
+    if repo_id == "workspace" {
+        bail!("repo id `workspace` is reserved for the workspace scope name");
+    }
+    if !repo_id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        bail!("invalid repo id {repo_id}; use ASCII letters, digits, '-' or '_'");
+    }
+    Ok(())
+}
+
+fn validate_property_scope_map(
+    _config: &GraftConfig,
+    label: &str,
+    properties: &BTreeMap<String, Vec<String>>,
+) -> Result<()> {
+    for scope in properties.keys() {
+        if scope == "workspace" {
+            continue;
+        }
+        bail!(
+            "[E_UNSUPPORTED_PROPERTY_SCOPE] {label} uses scope `{scope}`, but property requirements are whole-state only; use workspace = [...] and have the property inspect worktrees/<repo-id> when needed"
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_repo_default_branch(
+    repo_id: &str,
+    default_branch: Option<&str>,
+) -> Result<()> {
+    if default_branch.is_some_and(|value| value.trim().is_empty()) {
+        bail!("repo {repo_id} default_branch must not be empty");
+    }
+    Ok(())
+}
+
+fn validate_promote_target_branch(target_id: &str, branch: Option<&str>) -> Result<()> {
+    if branch.is_some_and(|value| value.trim().is_empty()) {
+        bail!("promote target {target_id} branch must not be empty");
     }
     Ok(())
 }
@@ -483,83 +594,393 @@ fn validate_config_path(label: &str, path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn resolve_config_path(workspace: &Path, path: &Path) -> PathBuf {
+fn resolve_config_path(workspace: &Path, path: &Path) -> Result<PathBuf> {
     if path.is_absolute() {
-        path.to_path_buf()
+        Ok(path.to_path_buf())
     } else if workspace.is_absolute() {
-        workspace.join(path)
+        Ok(workspace.join(path))
     } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
+        Ok(std::env::current_dir()
+            .context("[E_CWD_UNAVAILABLE] cannot resolve relative config path")?
             .join(workspace)
-            .join(path)
+            .join(path))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use graft_core::{CheckPlan, PropertyName, PropertyPlan, Severity};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn parse_config(text: &str) -> GraftConfig {
         let config: GraftConfig = toml::from_str(text).unwrap();
-        config.validate_repos().unwrap();
+        config.validate().unwrap();
         config
     }
 
+    fn test_workspace(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "graft-runtime-config-{name}-{}-{nanos}",
+            std::process::id()
+        ))
+    }
+
+    fn test_property_spec(name: &str, requires: &[&str]) -> PropertySpec {
+        PropertySpec {
+            name: PropertyName::new(name),
+            plan: PropertyPlan {
+                checks: vec![CheckPlan::Unavailable {
+                    reason: format!("{name} check"),
+                }],
+                requires: requires
+                    .iter()
+                    .map(|name| PropertyName::new(*name))
+                    .collect(),
+            },
+            description: format!("{name} property"),
+            severity: Severity::Blocking,
+            source_ref: None,
+        }
+    }
+
     #[test]
-    fn repos_config_defaults_auto_clone_and_repo_path() {
+    fn config_schema_defaults_to_v1_and_rejects_unknown_versions() {
+        assert_eq!(parse_config("").schema, 1);
+        assert_eq!(parse_config("schema = 1").schema, 1);
+
+        let config: GraftConfig = toml::from_str("schema = 2").unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("[E_UNSUPPORTED_CONFIG_SCHEMA]"), "{error}");
+    }
+
+    #[test]
+    fn repos_config_defaults_to_graft_managed_repo_path() {
         let config = parse_config(
             r#"
-repos_root = "vendor/repos"
-
 [repos.graft]
 url = "https://example.test/graft.git"
 default_branch = "main"
 "#,
         );
         let repo = config.repos.get("graft").unwrap();
-        assert!(repo.auto_clone);
         assert_eq!(repo.default_branch.as_deref(), Some("main"));
         assert_eq!(
             config
                 .repo_path(Path::new("/workspace/project"), "graft")
                 .unwrap(),
-            PathBuf::from("/workspace/project/vendor/repos/graft")
+            PathBuf::from("/workspace/project/.graft/repos/graft")
         );
     }
 
     #[test]
-    fn repos_config_accepts_explicit_path_and_auto_clone_override() {
+    fn repos_config_rejects_empty_default_branch() {
+        for (label, value) in [("empty", ""), ("blank", " \t")] {
+            let config: GraftConfig = toml::from_str(&format!(
+                r#"
+[repos.demo]
+url = "https://example.test/demo.git"
+default_branch = "{value}"
+"#
+            ))
+            .unwrap();
+
+            let message = config.validate().unwrap_err().to_string();
+
+            assert!(
+                message.contains("repo demo default_branch must not be empty"),
+                "{label}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn promote_target_path_resolves_relative_to_workspace_root() {
         let config = parse_config(
             r#"
-[repos.demo_repo]
-url = "file:///tmp/demo.git"
-path = "repos/demo"
-auto_clone = false
+[promote_targets.docs]
+path = "targets/docs"
 "#,
         );
-        let repo = config.repos.get("demo_repo").unwrap();
-        assert!(!repo.auto_clone);
+
         assert_eq!(
             config
-                .repo_path(Path::new("/workspace/project"), "demo_repo")
+                .promote_target_path(Path::new("/workspace/project"), "docs")
                 .unwrap(),
-            PathBuf::from("/workspace/project/repos/demo")
+            PathBuf::from("/workspace/project/targets/docs")
         );
+    }
+
+    #[test]
+    fn promote_targets_reject_empty_branch() {
+        for (label, value) in [("empty", ""), ("blank", " \t")] {
+            let config: GraftConfig = toml::from_str(&format!(
+                r#"
+[promote_targets.release]
+path = "targets/release"
+branch = "{value}"
+"#
+            ))
+            .unwrap();
+
+            let message = config.validate().unwrap_err().to_string();
+
+            assert!(
+                message.contains("promote target release branch must not be empty"),
+                "{label}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn sync_config_is_enabled_unless_explicitly_disabled() {
+        assert!(parse_config("").sync.enabled);
+
+        let config = parse_config(
+            r#"
+[sync]
+enabled = true
+"#,
+        );
+        assert!(config.sync.enabled);
+
+        let config = parse_config(
+            r#"
+[sync]
+enabled = false
+"#,
+        );
+        assert!(!config.sync.enabled);
+    }
+
+    #[test]
+    fn load_graft_config_requires_existing_property_lock() {
+        let dir = test_workspace("missing-lock-load");
+        let store = GraftStore::open(&dir);
+        store.init().unwrap();
+        assert!(!dir.join("graft.lock").exists());
+
+        let error = load_graft_config(&store).unwrap_err().to_string();
+
+        assert!(error.contains("[E_PROPERTY_LOCK_MISSING]"), "{error}");
+        assert!(
+            !dir.join("graft.lock").exists(),
+            "read-only config load must not recreate graft.lock"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn load_property_defs_discovers_v2_top_level_property_functions() {
+        let dir = test_workspace("v2-roto-load");
+        let store = GraftStore::open(&dir);
+        store.init().unwrap();
+        std::fs::write(
+            dir.join("properties.roto"),
+            r#"
+fn helper(app: Application) -> Check {
+    unavailable("helper only")
+}
+
+fn no_generated_artifacts(app: Application) -> Property {
+    property(
+        [app.changed_paths().any_match(["target/**", "*.tmp"]).failure()],
+        "no generated artifacts",
+        Severity.Blocking,
+        [],
+    )
+}
+
+fn cargo_tests_pass(app: Application) -> Property {
+    property(
+        [call(["cargo", "test", "--all-targets"], app.target()).exit_code_is(0).success()],
+        "cargo tests pass",
+        Severity.Warning,
+        ["no_generated_artifacts"],
+    )
+}
+"#,
+        )
+        .unwrap();
+
+        let properties = load_property_defs(&store).unwrap();
+
+        assert_eq!(
+            properties.keys().cloned().collect::<Vec<_>>(),
+            vec!["cargo_tests_pass", "no_generated_artifacts"]
+        );
+        let cargo = properties.get("cargo_tests_pass").unwrap();
+        assert_eq!(cargo.name.as_str(), "cargo_tests_pass");
+        assert_eq!(
+            cargo.plan.requires,
+            vec![PropertyName::new("no_generated_artifacts")]
+        );
+        assert_eq!(cargo.severity, graft_core::Severity::Warning);
+        assert!(
+            cargo
+                .property_id()
+                .unwrap()
+                .as_str()
+                .starts_with("property:")
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn property_requires_graph_rejects_missing_dependencies() {
+        let defs = BTreeMap::from([(
+            "cargo_tests_pass".to_string(),
+            test_property_spec("cargo_tests_pass", &["no_generated_artifacts"]),
+        )]);
+
+        let error = validate_property_requires_graph(&defs)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("[E_PROPERTY_REQUIRES_MISSING]"), "{error}");
+        assert!(error.contains("cargo_tests_pass"), "{error}");
+        assert!(error.contains("no_generated_artifacts"), "{error}");
+    }
+
+    #[test]
+    fn property_requires_graph_rejects_cycles() {
+        let defs = BTreeMap::from([
+            ("a".to_string(), test_property_spec("a", &["b"])),
+            ("b".to_string(), test_property_spec("b", &["c"])),
+            ("c".to_string(), test_property_spec("c", &["a"])),
+        ]);
+
+        let error = validate_property_requires_graph(&defs)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("[E_PROPERTY_REQUIRES_CYCLE]"), "{error}");
+        assert!(error.contains("a -> b -> c -> a"), "{error}");
+    }
+
+    #[test]
+    fn property_lock_for_v2_roto_uses_static_plan_identity() {
+        let dir = test_workspace("v2-roto-lock");
+        let store = GraftStore::open(&dir);
+        store.init().unwrap();
+        let first = r#"
+fn cargo_tests_pass(app: Application) -> Property {
+    property(
+        [call(["cargo", "test"], app.target()).exit_code_is(0).success()],
+        "first description",
+        Severity.Blocking,
+        [],
+    )
+}
+"#;
+        let second = r#"
+// comments and metadata do not affect v2 property identity
+fn cargo_tests_pass(app: Application) -> Property {
+    let check = call(["cargo", "test"], app.target()).exit_code_is(0).success();
+    property(
+        [check],
+        "second description",
+        Severity.Info,
+        [],
+    )
+}
+"#;
+
+        std::fs::write(dir.join("properties.roto"), first).unwrap();
+        let first_defs = load_property_defs(&store).unwrap();
+        let first_lock = current_property_lock(&first_defs).unwrap();
+        write_property_lock(&store, &first_defs).unwrap();
+
+        std::fs::write(dir.join("properties.roto"), second).unwrap();
+        let second_defs = load_property_defs(&store).unwrap();
+        let second_lock = current_property_lock(&second_defs).unwrap();
+
+        assert_eq!(first_lock.properties, second_lock.properties);
+        assert!(store.paths().object_properties().exists());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn repo_lock_entry_requires_existing_property_lock_and_preserves_properties() {
+        let dir = test_workspace("repo-lock-existing");
+        let store = GraftStore::open(&dir);
+        store.init().unwrap();
+        assert!(!dir.join("graft.lock").exists());
+
+        let missing = write_repo_lock_entry(
+            &store,
+            "demo",
+            "https://example.invalid/demo",
+            "main",
+            "abc123",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(missing.contains("[E_PROPERTY_LOCK_MISSING]"), "{missing}");
+
+        let defs = BTreeMap::new();
+        write_property_lock(&store, &defs).unwrap();
+        let lock = write_repo_lock_entry(
+            &store,
+            "demo",
+            "https://example.invalid/demo",
+            "main",
+            "abc123",
+        )
+        .unwrap();
+
+        assert!(lock.properties.is_empty());
+        assert_eq!(
+            lock.repos
+                .get("demo")
+                .and_then(|entry| entry.url.as_deref()),
+            Some("https://example.invalid/demo")
+        );
+        assert_eq!(
+            lock.repos
+                .get("demo")
+                .map(|entry| entry.resolved_oid.as_str()),
+            Some("abc123")
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn repos_config_rejects_local_path_controls() {
+        for (field, line) in [
+            ("path", "path = \"repos/demo\""),
+            ("auto_clone", "auto_clone = false"),
+        ] {
+            let text = format!(
+                r#"
+[repos.demo_repo]
+url = "file:///tmp/demo.git"
+{line}
+"#
+            );
+            let err = toml::from_str::<GraftConfig>(&text).unwrap_err();
+            let message = err.to_string();
+            assert!(message.contains("unknown field"), "{message}");
+            assert!(message.contains(field), "{message}");
+        }
     }
 
     #[test]
     fn repos_config_rejects_bad_repo_id() {
         let config: GraftConfig = toml::from_str(
             r#"
-[repos.Bad]
+[repos."bad.repo"]
 url = "https://example.test/bad.git"
 "#,
         )
         .unwrap();
         assert!(
             config
-                .validate_repos()
+                .validate()
                 .unwrap_err()
                 .to_string()
                 .contains("invalid repo id")
@@ -567,18 +988,38 @@ url = "https://example.test/bad.git"
     }
 
     #[test]
-    fn repos_config_rejects_path_traversal() {
+    fn property_scope_map_rejects_repo_keys_even_when_repo_exists() {
         let config: GraftConfig = toml::from_str(
             r#"
-[repos.demo]
-url = "https://example.test/demo.git"
-path = "../demo"
+[repos.C]
+url = "https://example.test/C.git"
+
+[admission.required_properties]
+C = ["cargo_tests_pass"]
+"#,
+        )
+        .unwrap();
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("[E_UNSUPPORTED_PROPERTY_SCOPE]"), "{error}");
+        assert_eq!(
+            config.repos.get("C").map(|repo| repo.url.as_str()),
+            Some("https://example.test/C.git")
+        );
+    }
+
+    #[test]
+    fn promote_targets_reject_path_traversal() {
+        let config: GraftConfig = toml::from_str(
+            r#"
+[promote_targets.release]
+path = "../release"
 "#,
         )
         .unwrap();
         assert!(
             config
-                .validate_repos()
+                .validate()
                 .unwrap_err()
                 .to_string()
                 .contains("must not contain '..'")
@@ -586,51 +1027,17 @@ path = "../demo"
     }
 
     #[test]
-    fn property_config_rejects_incomplete_property() {
-        let config: PropertyConfig = toml::from_str(
-            r#"
-[[properties]]
-name = "Broken"
-"#,
-        )
-        .unwrap();
-        let err = config
-            .into_property_map(Path::new("properties/*.toml"))
-            .unwrap_err();
-        assert!(err.to_string().contains("E_INCOMPLETE_PROPERTY"));
-    }
+    fn load_property_defs_rejects_legacy_properties_directory() {
+        let dir = test_workspace("legacy-properties-dir");
+        let store = GraftStore::open(&dir);
+        store.init().unwrap();
+        std::fs::remove_file(dir.join("properties.roto")).unwrap();
+        std::fs::create_dir(dir.join("properties")).unwrap();
+        std::fs::write(dir.join("properties").join("Old.toml"), "name = \"Old\"\n").unwrap();
 
-    #[test]
-    fn property_config_rejects_duplicate_name() {
-        let config: PropertyConfig = toml::from_str(
-            r#"
-[[properties]]
-name = "ValidPatch"
-[properties.query]
-kind = "change"
-[properties.evaluator]
-kind = "builtin"
-name = "valid_patch"
-[properties.evaluator.options]
-[properties.judge]
-kind = "exit_code_zero"
+        let err = load_property_defs(&store).unwrap_err().to_string();
 
-[[properties]]
-name = "ValidPatch"
-[properties.query]
-kind = "change"
-[properties.evaluator]
-kind = "builtin"
-name = "has_change"
-[properties.evaluator.options]
-[properties.judge]
-kind = "exit_code_zero"
-"#,
-        )
-        .unwrap();
-        let err = config
-            .into_property_map(Path::new("properties/*.toml"))
-            .unwrap_err();
-        assert!(err.to_string().contains("E_DUPLICATE_PROPERTY"));
+        assert!(err.contains("[E_LEGACY_PROPERTIES_UNSUPPORTED]"), "{err}");
+        std::fs::remove_dir_all(dir).ok();
     }
 }

@@ -38,13 +38,17 @@ jobs:
           toolchain: "1.95"
           components: llvm-tools
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@just
       - uses: taiki-e/install-action@cargo-llvm-cov
 
-      - name: Run tests with coverage
-        run: cargo llvm-cov test --lcov --output-path lcov.info -- --no-capture
+      - name: Run locked tests and doc tests
+        run: just test
 
-      - name: Run doc tests
-        run: cargo test --locked --doc --all-features
+      - name: Run CLI smoke tests
+        run: just smoke
+
+      - name: Generate coverage
+        run: just cov
 
       - name: Upload coverage
         uses: codecov/codecov-action@v5

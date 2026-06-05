@@ -1,0 +1,21 @@
+schema = 1
+
+# Whole-state admission/promotion bindings for examples/full/properties.roto.
+# Each name resolves to a top-level `fn <name>(app: Application) -> Property`.
+
+[admission.required_properties]
+workspace = [
+  "no_generated_artifacts",
+  "cargo_fmt_clean",
+  "cargo_tests_pass",
+]
+
+[promotion.required_properties]
+workspace = [
+  "safe_patch",
+  "cargo_clippy_clean",
+  "cargo_doc_tests_pass",
+]
+
+[sync]
+enabled = true

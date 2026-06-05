@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tests/search_evidence_smoke.sh
 #
-# `graft search --has-evidence <Property>` promises passing evidence. Failed
+# `graft search --has-evidence workspace:<property>` promises passing evidence. Failed
 # evidence must remain visible on the patch record without being reported as a
 # proof that the patch has the property.
 
@@ -9,54 +9,57 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-cargo build -p graft-cli -p graft-daemon >/dev/null 2>&1
-GRAFT_BIN="$PWD/target/debug/graft"
-GRAFTD_BIN="$PWD/target/debug/graftd"
+source tests/lib/smoke.sh
 
-WORKDIR="$(mktemp -d)"
-cleanup() {
-  find "$WORKDIR" -path '*/.graft/run/daemon.sock' -type s -exec "$GRAFTD_BIN" stop --socket {} \; >/dev/null 2>&1 || true
-  rm -rf "$WORKDIR"
-}
-trap cleanup EXIT
+setup_bins
+setup_workspace
+trap cleanup_workspace EXIT
 
 cd "$WORKDIR"
 "$GRAFT_BIN" init >/dev/null
-cat >> graft-properties.toml <<'TOML'
+write_properties_roto <<'ROTO'
+fn touches_file(app: Application) -> Property {
+    property(
+        [
+            app.changed_paths().any_match(["file.txt"]).success(),
+        ],
+        "change touches file.txt",
+        Severity.Blocking,
+        [],
+    )
+}
 
-[[properties]]
-name = "NeverPass"
+fn never_pass(app: Application) -> Property {
+    let run = call(["false"], app.target());
 
-[properties.query]
-kind = "target_snapshot"
-
-[properties.evaluator]
-kind = "command"
-command = "false"
-args = []
-env = {}
-setup = []
-pre = []
-teardown = []
-
-[properties.judge]
-kind = "exit_code_zero"
-TOML
-"$GRAFT_BIN" property lock >/dev/null
+    property(
+        [
+            run.exit_code_is(0).success(),
+        ],
+        "command verifier that intentionally fails",
+        Severity.Blocking,
+        [],
+    )
+}
+ROTO
+lock_properties
 
 printf 'x\n' > file.txt
-create=$("$GRAFT_BIN" create --from graft:empty --expect ValidPatch --message search-evidence)
+scratch_out=$("$GRAFT_BIN" scratch write --base graft:empty file.txt --content $'x\n')
+scratch=$(grep -oE 'scratch:[0-9a-f]+' <<<"$scratch_out" | tail -n1)
+[[ -n $scratch ]] || { echo "FAIL: no scratch id"; echo "$scratch_out"; exit 1; }
+create=$("$GRAFT_BIN" candidate from-scratch "$scratch" --expect workspace:touches_file --message search-evidence)
 candidate=$(grep -oE 'candidate:[0-9a-f]+' <<<"$create" | head -n1)
 [[ -n $candidate ]] || { echo "FAIL: no candidate id"; echo "$create"; exit 1; }
 
-"$GRAFT_BIN" validate "$candidate" --expect ValidPatch >/dev/null
-"$GRAFT_BIN" validate "$candidate" --expect NeverPass >/dev/null
-admit=$("$GRAFT_BIN" admit "$candidate" --require ValidPatch)
+"$GRAFT_BIN" validate "$candidate" --expect workspace:touches_file >/dev/null
+"$GRAFT_BIN" validate "$candidate" --expect workspace:never_pass >/dev/null
+admit=$("$GRAFT_BIN" admit "$candidate" --require workspace:touches_file)
 patch=$(grep -oE 'patch:[0-9a-f]+' <<<"$admit" | head -n1)
 [[ -n $patch ]] || { echo "FAIL: no patch id"; echo "$admit"; exit 1; }
 
-valid_search=$("$GRAFT_BIN" search --has-evidence ValidPatch --json)
-failed_search=$("$GRAFT_BIN" search --has-evidence NeverPass --json)
+valid_search=$("$GRAFT_BIN" search --has-evidence workspace:touches_file --json)
+failed_search=$("$GRAFT_BIN" search --has-evidence workspace:never_pass --json)
 
 python3 - "$valid_search" "$failed_search" "$patch" <<'PY'
 import json, sys

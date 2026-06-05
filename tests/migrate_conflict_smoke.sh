@@ -9,16 +9,11 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-cargo build -p graft-cli -p graft-daemon >/dev/null 2>&1
-GRAFT_BIN="$PWD/target/debug/graft"
-GRAFTD_BIN="$PWD/target/debug/graftd"
+source tests/lib/smoke.sh
 
-WORKDIR="$(mktemp -d)"
-cleanup() {
-  find "$WORKDIR" -path '*/.graft/run/daemon.sock' -type s -exec "$GRAFTD_BIN" stop --socket {} \; >/dev/null 2>&1 || true
-  rm -rf "$WORKDIR"
-}
-trap cleanup EXIT
+setup_bins
+setup_workspace
+trap cleanup_workspace EXIT
 
 cd "$WORKDIR"
 git init >/dev/null
@@ -31,12 +26,26 @@ git add src/lib.rs
 git commit -m base >/dev/null
 
 "$GRAFT_BIN" init >/dev/null
+seed_scratch_out=$("$GRAFT_BIN" scratch write --base graft:empty src/lib.rs --content $'old\n')
+seed_scratch=$(grep -oE 'scratch:[0-9a-f]+' <<<"$seed_scratch_out" | tail -n1)
+[[ -n $seed_scratch ]] || { echo "FAIL: no seed scratch captured"; echo "$seed_scratch_out"; exit 1; }
+seed_created=$("$GRAFT_BIN" candidate from-scratch "$seed_scratch" --message migrate-base-file)
+seed_candidate=$(grep -oE 'candidate:[0-9a-f]+' <<<"$seed_created" | head -n1)
+[[ -n $seed_candidate ]] || { echo "FAIL: no seed candidate captured"; echo "$seed_created"; exit 1; }
+"$GRAFT_BIN" validate "$seed_candidate" >/dev/null
+seed_admitted=$("$GRAFT_BIN" admit "$seed_candidate")
+base_patch=$(grep -oE 'patch:[0-9a-f]+' <<<"$seed_admitted" | head -n1)
+[[ -n $base_patch ]] || { echo "FAIL: no base patch captured"; echo "$seed_admitted"; exit 1; }
+
 printf 'new\n' > src/lib.rs
-created=$("$GRAFT_BIN" create --expect ValidPatch --message migrate-modified-file)
+scratch_out=$("$GRAFT_BIN" scratch write --base "$base_patch" src/lib.rs --content $'new\n')
+scratch=$(grep -oE 'scratch:[0-9a-f]+' <<<"$scratch_out" | tail -n1)
+[[ -n $scratch ]] || { echo "FAIL: no scratch captured"; echo "$scratch_out"; exit 1; }
+created=$("$GRAFT_BIN" candidate from-scratch "$scratch" --message migrate-modified-file)
 candidate=$(grep -oE 'candidate:[0-9a-f]+' <<<"$created" | head -n1)
 [[ -n $candidate ]] || { echo "FAIL: no candidate captured"; echo "$created"; exit 1; }
 "$GRAFT_BIN" validate "$candidate" >/dev/null
-admitted=$("$GRAFT_BIN" admit "$candidate" --require ValidPatch)
+admitted=$("$GRAFT_BIN" admit "$candidate")
 patch=$(grep -oE 'patch:[0-9a-f]+' <<<"$admitted" | head -n1)
 [[ -n $patch ]] || { echo "FAIL: no patch captured"; echo "$admitted"; exit 1; }
 

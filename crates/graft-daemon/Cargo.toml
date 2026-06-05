@@ -17,4 +17,6 @@ graft-core = { path = "../graft-core" }
 graft-runtime = { path = "../graft-runtime" }
 graft-scratch = { path = "../graft-scratch" }
 graft-store = { path = "../graft-store" }
+serde.workspace = true
 serde_json.workspace = true
+toml.workspace = true

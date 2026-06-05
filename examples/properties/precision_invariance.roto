@@ -1,0 +1,24 @@
+// Pattern: relational property — observe the same command on two trees.
+//
+// `same_output(run_a, run_b, selectors)` is one Probe over two Runs. With
+// `.success()` it asserts every selected slice is byte-identical between
+// runs; with `.failure()` it asserts at least one slice differs. Each
+// referenced Run is executed once and shared across selectors.
+
+fn precision_invariance(app: Application) -> Property {
+    let base_run = call(["bash", "./run.sh"], app.base());
+    let target_run = call(["bash", "./run.sh"], app.target());
+
+    property(
+        [
+            same_output(base_run, target_run, [
+                post_file("./alignment/expected.json"),
+                stdout,
+                stderr,
+            ]).success(),
+        ],
+        "running run.sh on base and target produces identical alignment outputs",
+        Severity.Blocking,
+        [],
+    )
+}

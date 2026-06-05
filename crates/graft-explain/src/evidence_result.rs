@@ -102,8 +102,8 @@ mod tests {
 
     #[test]
     fn unknown_variant_sees_validate_path_concepts() {
-        // The unknown variant is the one used for the "no .git -> ValidPatch
-        // unknown" diagnostic that drove this trait's design; its see_also
+        // The unknown variant is used for validation results that cannot be
+        // decided yet; its see_also
         // must include the relevant repair surface.
         let result = EvidenceResult::Unknown {
             reason: "base unmaterializable".into(),

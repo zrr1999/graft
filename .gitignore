@@ -5,6 +5,8 @@
 # Graft local fact/cache space
 /.graft
 /.spark
+.learnings/
+.pi/
 
 # Python tooling
 .venv/

@@ -3,11 +3,12 @@
 //! Three id namespaces are routed here:
 //!
 //! - **Diagnostic codes**: `V003`, `A007`, etc. Source: [`super::diagnostics`].
-//! - **Builtin properties**: `valid_patch`, `paths_none_match`, etc. Source:
+//! - **Builtin evaluators**: `changed_paths_any_match`, `changed_paths_all_match`, etc. Source:
 //!   [`super::properties`].
-//! - **Concept ids**: free-form names like `admit`, `materialize`, `properties`,
-//!   `valid-patch`. The catalog is supplied by the caller (typically the CLI,
-//!   so it can read clap-derived `about` strings as the single source of truth).
+//! - **Concept ids**: free-form names like `admit`, `materialize`,
+//!   `agent-workflow`, `properties`, `valid-patch`. The catalog is supplied by
+//!   the caller (typically the CLI, so it can read clap-derived `about` strings
+//!   as the single source of truth).
 //!
 //! Unknown ids return [`ExplainResult::Unknown`] with a small list of
 //! "did you mean" suggestions ranked by Levenshtein distance.
@@ -17,9 +18,7 @@
 //! `--json`.
 
 use crate::diagnostics::{ALL_DIAGNOSTICS, DiagnosticDoc, doc_for};
-use crate::properties::{
-    ALL_BUILTINS, BuiltinPropertyMetadata, metadata_for_check_or_property_name,
-};
+use crate::properties::{ALL_BUILTINS, BuiltinEvaluatorMetadata, metadata_for_evaluator};
 use crate::{DiagCode, Diagnostic};
 use serde::Serialize;
 
@@ -32,7 +31,8 @@ pub struct ConceptDoc {
     pub id: String,
     /// Single-line summary; for clap subcommands this is the `about` value.
     pub summary: String,
-    /// Optional single-line elaboration; `long_about` from clap when set.
+    /// Optional elaboration; `long_about` from clap or curated workflow copy.
+    /// Curated help topics may contain multiple plain-text lines.
     pub long_about: Option<String>,
     /// Related concept ids and/or diagnostic codes to nudge users toward.
     pub see_also: Vec<String>,
@@ -46,8 +46,8 @@ pub enum ExplainResult {
     Concept(ConceptDoc),
     /// `id` matched a `[Vnnn]`-style diagnostic code.
     Diagnostic(DiagnosticView),
-    /// `id` matched a builtin verifier property.
-    BuiltinProperty(BuiltinPropertyView),
+    /// `id` matched a builtin evaluator id.
+    BuiltinEvaluator(BuiltinEvaluatorView),
     /// `id` did not match any of the three namespaces.
     Unknown {
         id: String,
@@ -78,28 +78,115 @@ impl From<&'static DiagnosticDoc> for DiagnosticView {
     }
 }
 
-/// Serializable view over a [`BuiltinPropertyMetadata`].
+/// Serializable view over a [`BuiltinEvaluatorMetadata`].
 #[derive(Debug, Serialize)]
-pub struct BuiltinPropertyView {
+pub struct BuiltinEvaluatorView {
     pub id: &'static str,
     pub summary: &'static str,
+    pub input: &'static str,
+    pub predicate: &'static str,
     pub requires_base: bool,
     pub failure_modes: &'static [&'static str],
 }
 
-impl From<&'static BuiltinPropertyMetadata> for BuiltinPropertyView {
-    fn from(meta: &'static BuiltinPropertyMetadata) -> Self {
+impl From<&'static BuiltinEvaluatorMetadata> for BuiltinEvaluatorView {
+    fn from(meta: &'static BuiltinEvaluatorMetadata) -> Self {
         Self {
             id: meta.id,
             summary: meta.summary,
+            input: meta.input,
+            predicate: meta.predicate,
             requires_base: meta.requires_base,
             failure_modes: meta.failure_modes,
         }
     }
 }
 
+const AGENT_WORKFLOW_LONG_ABOUT: &str = concat!(
+    "Recommended workflow for agents and pi-graft tools:\n",
+    "1. Use `graft explain agent-workflow` or pi-graft `graft_help` when unsure; direct tool descriptions should stay short.\n",
+    "2. Bootstrap and diagnose with `graft workspace init`, `graft workspace ps`, and `graft workspace doctor` before writing changes.\n",
+    "3. Draft only in scratch: use `graft scratch read|write|edit|delete --base <base> ...` and continue with `--from scratch:<digest>`, or use `graft scratch capture --base <base>` to stash-like capture cwd changes into scratch; scratch is daemon-backed draft state, not a candidate, patch, sync object, or Git ref.\n",
+    "4. Turn draft into reviewable state with `graft patch from-scratch scratch:<digest> --expect <Property> --message <msg>`; the patch from-scratch command generates a private local candidate and does not admit or promote it.\n",
+    "5. Prove properties with `graft patch validate candidate:<digest> --expect <Property>` and inspect with `graft patch show`, `graft patch list --candidates`, or `graft patch search`.\n",
+    "6. Admit only after required evidence passes: `graft patch admit candidate:<digest> --require <Property>`; admit generates a public patch and moves candidate evidence refs to the patch.\n",
+    "7. Check output with `graft materialize <state-ref>` or `graft run <state-ref> -- <cmd>`; materialize writes isolated `.worktrees/<state>/` inspection output, not cwd or Git refs.\n",
+    "8. External promote is low-frequency and explicit: only run `graft promote <patch-id> --to <target> --yes` when an approved patch must update an outside Git branch, PR, or release target.\n",
+    "9. Low-frequency advanced write commands such as patch compose/migrate/revert, sync, repo add/sync/lock/update, bundle import, workspace gc --apply, and patch promote may use pi-graft `graft_cli_exec` argv; keep read/inspect commands on the local CLI path and keep high-frequency agents on typed scratch/patch ops plus validate/admit/show/materialize."
+);
+
+const SCRATCH_LONG_ABOUT: &str = concat!(
+    "Scratch is only for draft file graph operations. Use `--base graft:empty|tree:<id>|candidate:<id>|patch:<id>` for the first read/write/edit/delete and `--from scratch:<digest>` for each continuation.\n",
+    "Scratch never creates a candidate or patch, never syncs, and never updates Git refs. `graft scratch capture --base <ref>` is the explicit stash-like cwd bridge: it captures cwd into scratch and restores captured paths to the base. Encode rename as delete plus write, then leave scratch with `graft patch from-scratch`."
+);
+
+const CANDIDATE_LONG_ABOUT: &str = concat!(
+    "Candidate is the local-only proposal state. `graft patch from-scratch scratch:<digest>` generates a private candidate from a scratch draft, expected properties, provenance producer, and optional message.\n",
+    "A candidate is not public review history and is not synced; validate it to produce evidence, then admit it when required evidence passes."
+);
+
+const VALIDATE_LONG_ABOUT: &str = concat!(
+    "Validate runs configured verifiers for an explicit candidate, patch, or change and records evidence.\n",
+    "Validation proves properties but does not admit, materialize, promote, or otherwise move lifecycle state."
+);
+
+const ADMIT_LONG_ABOUT: &str = concat!(
+    "Admit is the candidate to patch boundary. It checks required properties against passed evidence, then generates a public patch and moves evidence refs from private candidate storage to public patch storage.\n",
+    "Admit does not capture cwd, does not materialize output, and does not update external Git targets; run scratch/candidate first and promote only as a separate explicit operation."
+);
+
+const MATERIALIZE_LONG_ABOUT: &str = concat!(
+    "Materialize is inspection output for a resolved state. Inputs such as tree:<digest>, candidate:<digest>, patch:<digest>, repo:<id>@<treeish>, and workspace Git treeishes first resolve to a StateId, then write an isolated `.worktrees/<state>/` directory under the workspace.\n",
+    "It is safe for checking files because it does not update cwd, evidence, branches, PRs, releases, or external refs; use promote separately only when external publication is intended."
+);
+
+const PROMOTE_LONG_ABOUT: &str = concat!(
+    "Promote is the explicit external side-effect boundary for a patch. It projects an admitted patch to a configured or command-line Git branch, PR, or release target and only applies when the user supplies the `--yes` gate.\n",
+    "Treat promote as a low-frequency advanced operation; agents should usually inspect with materialize and run promote manually through the CLI or pi-graft `graft_cli_exec` when publication is truly requested."
+);
+
+/// Stable topic cards intended for `graft_help` and `graft explain <topic>`.
+pub fn agent_help_concepts() -> Vec<ConceptDoc> {
+    vec![
+        ConceptDoc {
+            id: "agent-workflow".to_string(),
+            summary: "recommended Graft lifecycle for pi-graft agents and tool callers".to_string(),
+            long_about: Some(AGENT_WORKFLOW_LONG_ABOUT.to_string()),
+            see_also: vec![
+                "scratch".to_string(),
+                "candidate".to_string(),
+                "validate".to_string(),
+                "admit".to_string(),
+                "materialize".to_string(),
+                "promote".to_string(),
+            ],
+        },
+        ConceptDoc {
+            id: "workflow".to_string(),
+            summary: "alias for the recommended agent workflow help topic".to_string(),
+            long_about: Some(AGENT_WORKFLOW_LONG_ABOUT.to_string()),
+            see_also: vec!["agent-workflow".to_string()],
+        },
+    ]
+}
+
+/// Curated elaboration for high-value lifecycle concepts. The runtime layers
+/// this onto clap-derived command cards so `graft explain <command>` can carry
+/// walkthrough-level guidance without duplicating the command spelling.
+pub fn curated_concept_long_about(id: &str) -> Option<&'static str> {
+    match id {
+        "scratch" => Some(SCRATCH_LONG_ABOUT),
+        "candidate" => Some(CANDIDATE_LONG_ABOUT),
+        "validate" => Some(VALIDATE_LONG_ABOUT),
+        "admit" => Some(ADMIT_LONG_ABOUT),
+        "materialize" => Some(MATERIALIZE_LONG_ABOUT),
+        "promote" => Some(PROMOTE_LONG_ABOUT),
+        _ => None,
+    }
+}
+
 /// Resolve `id` against the supplied concept catalog and graft-explain's
-/// own diagnostic and builtin-property registries.
+/// own diagnostic and builtin-evaluator registries.
 pub fn lookup(id: &str, concepts: &[ConceptDoc]) -> ExplainResult {
     // 1. Exact concept match.
     if let Some(c) = concepts.iter().find(|c| c.id == id) {
@@ -115,9 +202,9 @@ pub fn lookup(id: &str, concepts: &[ConceptDoc]) -> ExplainResult {
     // If the id parses as a code but has no catalog entry, still treat it as
     // unknown so the user gets did-you-mean for adjacent codes.
 
-    // 3. Builtin property check id (lowercase spelling) or default property name.
-    if let Some(meta) = metadata_for_check_or_property_name(id) {
-        return ExplainResult::BuiltinProperty(meta.into());
+    // 3. Builtin evaluator id (lowercase spelling).
+    if let Some(meta) = metadata_for_evaluator(id) {
+        return ExplainResult::BuiltinEvaluator(meta.into());
     }
 
     // 4. Unknown — collect did-you-mean candidates from all three namespaces.
@@ -162,7 +249,7 @@ pub fn render_human(result: &ExplainResult) -> String {
             if let Some(long) = &c.long_about
                 && long != &c.summary
             {
-                out.push_str(&format!("  {long}\n"));
+                push_indented(&mut out, long);
             }
             if !c.see_also.is_empty() {
                 out.push_str(&format!("  see also: {}\n", c.see_also.join(", ")));
@@ -178,9 +265,11 @@ pub fn render_human(result: &ExplainResult) -> String {
                 out.push_str(&format!("  see also: {}\n", d.see_also.join(", ")));
             }
         }
-        ExplainResult::BuiltinProperty(b) => {
-            out.push_str(&format!("builtin property: {}\n", b.id));
+        ExplainResult::BuiltinEvaluator(b) => {
+            out.push_str(&format!("builtin evaluator: {}\n", b.id));
             out.push_str(&format!("  {}\n", b.summary));
+            out.push_str(&format!("  input: {}\n", b.input));
+            out.push_str(&format!("  predicate: {}\n", b.predicate));
             if b.requires_base {
                 out.push_str("  requires base: yes\n");
             }
@@ -198,6 +287,14 @@ pub fn render_human(result: &ExplainResult) -> String {
         }
     }
     out
+}
+
+fn push_indented(out: &mut String, text: &str) {
+    for line in text.lines() {
+        out.push_str("  ");
+        out.push_str(line);
+        out.push('\n');
+    }
 }
 
 // Tiny in-tree Levenshtein. Avoids pulling a new dependency for a 6-line
@@ -282,14 +379,14 @@ mod tests {
     }
 
     #[test]
-    fn builtin_property_id_resolves_to_metadata() {
-        let r = lookup("valid_patch", &concepts());
+    fn builtin_evaluator_id_resolves_to_metadata() {
+        let r = lookup("changed_paths_any_match", &concepts());
         match r {
-            ExplainResult::BuiltinProperty(b) => {
-                assert_eq!(b.id, "valid_patch");
-                assert!(b.requires_base);
+            ExplainResult::BuiltinEvaluator(b) => {
+                assert_eq!(b.id, "changed_paths_any_match");
+                assert!(!b.requires_base);
             }
-            other => panic!("expected builtin property, got {other:?}"),
+            other => panic!("expected builtin evaluator, got {other:?}"),
         }
     }
 
@@ -351,6 +448,59 @@ mod tests {
         assert!(txt.contains("unknown explain id"), "render: {txt:?}");
         assert!(
             txt.contains("did you mean") || txt.contains("no near matches"),
+            "render: {txt:?}"
+        );
+    }
+
+    #[test]
+    fn agent_workflow_topic_is_available_from_curated_catalog() {
+        let r = lookup("agent-workflow", &agent_help_concepts());
+        match r {
+            ExplainResult::Concept(c) => {
+                assert_eq!(c.id, "agent-workflow");
+                let long = c.long_about.expect("agent workflow long help");
+                assert!(long.contains("graft patch from-scratch"));
+                assert!(long.contains("admit generates a public patch"));
+                assert!(long.contains("repo add/sync/lock/update"));
+                assert!(long.contains("bundle import"));
+                assert!(long.contains("workspace gc --apply"));
+                assert!(long.contains("read/inspect commands on the local CLI path"));
+                assert!(long.contains("graft_cli_exec"));
+            }
+            other => panic!("expected agent workflow concept, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_workflow_help_avoids_retired_main_paths() {
+        let txt = render_human(&lookup("agent-workflow", &agent_help_concepts()));
+        for retired in [
+            "graft create",
+            "graft candidate from-scratch",
+            "graft validate candidate:",
+            "graft admit candidate:",
+            "graft materialize patch:",
+            "graft promote patch:",
+            "scratch open",
+            "scratch promote",
+            "registry import",
+            "graft gc --apply",
+            "admit --capture",
+        ] {
+            assert!(!txt.contains(retired), "retired path leaked: {retired}");
+        }
+    }
+
+    #[test]
+    fn human_render_indents_multiline_concept_help() {
+        let txt = render_human(&ExplainResult::Concept(ConceptDoc {
+            id: "demo".to_string(),
+            summary: "demo".to_string(),
+            long_about: Some("first line\nsecond line".to_string()),
+            see_also: Vec::new(),
+        }));
+        assert!(
+            txt.contains("  first line\n  second line\n"),
             "render: {txt:?}"
         );
     }

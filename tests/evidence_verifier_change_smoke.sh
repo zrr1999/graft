@@ -3,91 +3,67 @@
 #
 # Verifies evidence is bound to the current verifier definition. A passing
 # proof produced under an older command must not satisfy admission after
-# graft-properties.toml changes the verifier for the same property.
+# properties.roto changes the verifier for the same property.
 
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-cargo build -p graft-cli -p graft-daemon >/dev/null 2>&1
-GRAFT_BIN="$PWD/target/debug/graft"
-GRAFTD_BIN="$PWD/target/debug/graftd"
+source tests/lib/smoke.sh
 
-WORKDIR="$(mktemp -d)"
-cleanup() {
-  find "$WORKDIR" -path '*/.graft/run/daemon.sock' -type s -exec "$GRAFTD_BIN" stop --socket {} \; >/dev/null 2>&1 || true
-  rm -rf "$WORKDIR"
-}
-trap cleanup EXIT
+setup_bins
+setup_workspace
+trap cleanup_workspace EXIT
 
 cd "$WORKDIR"
 printf 'hello\n' > hello.txt
 "$GRAFT_BIN" init >/dev/null
-cat >> graft-properties.toml <<'EOF'
+write_properties_roto <<'ROTO'
+fn policy(app: Application) -> Property {
+    let run = call(["true"], app.target());
 
-[[properties]]
-name = "Policy"
+    property(
+        [
+            run.exit_code_is(0).success(),
+        ],
+        "policy command verifier",
+        Severity.Blocking,
+        [],
+    )
+}
+ROTO
+lock_properties
 
-[properties.query]
-kind = "target_snapshot"
-
-[properties.evaluator]
-kind = "command"
-command = "true"
-args = []
-env = {}
-setup = []
-pre = []
-teardown = []
-
-[properties.judge]
-kind = "exit_code_zero"
-EOF
-"$GRAFT_BIN" property lock >/dev/null
-
-created=$("$GRAFT_BIN" create --from graft:empty --expect Policy --message verifier-change)
+scratch_out=$("$GRAFT_BIN" scratch write --base graft:empty hello.txt --content $'hello\n')
+scratch=$(grep -oE 'scratch:[0-9a-f]+' <<<"$scratch_out" | tail -n1)
+[[ -n $scratch ]] || { echo "FAIL: no scratch captured"; echo "$scratch_out"; exit 1; }
+created=$("$GRAFT_BIN" candidate from-scratch "$scratch" --expect workspace:policy --message verifier-change)
 candidate=$(grep -oE 'candidate:[0-9a-f]+' <<<"$created" | head -n1)
 [[ -n $candidate ]] || { echo "FAIL: no candidate captured"; echo "$created"; exit 1; }
 
-"$GRAFT_BIN" validate "$candidate" --expect ValidPatch >/dev/null
-old_pass=$("$GRAFT_BIN" validate "$candidate" --expect Policy)
+old_pass=$("$GRAFT_BIN" validate "$candidate" --expect workspace:policy)
 if ! grep -q 'passed' <<<"$old_pass"; then
-  echo "FAIL: initial Policy verifier should pass"
+  echo "FAIL: initial policy verifier should pass"
   echo "$old_pass"; exit 1
 fi
 
 python3 - <<'PY'
 from pathlib import Path
 
-path = Path("graft-properties.toml")
+path = Path("properties.roto")
 text = path.read_text()
-path.write_text(text.replace('command = "true"', 'command = "false"', 1))
+path.write_text(text.replace('["true"]', '["false"]', 1))
 PY
-"$GRAFT_BIN" property lock >/dev/null
+lock_properties
 
-if "$GRAFT_BIN" admit "$candidate" --require Policy >admit-ok.out 2>admit-err.out; then
+if "$GRAFT_BIN" admit "$candidate" --require workspace:policy >admit-ok.out 2>admit-err.out; then
   echo "FAIL: admit reused evidence from an older verifier definition"
   cat admit-ok.out
   exit 1
 fi
-if ! grep -q '\[A001\] missing required evidence for `Policy`' admit-err.out; then
-  echo "FAIL: admit should require evidence for the current verifier definition"
+if ! grep -q '\[E_PROPERTY_DRIFT\]' admit-err.out; then
+  echo "FAIL: admit should reject the candidate because its locked policy id drifted"
   cat admit-err.out; exit 1
 fi
 
-current_failed=$("$GRAFT_BIN" validate "$candidate" --expect Policy)
-if ! grep -q 'failed:' <<<"$current_failed"; then
-  echo "FAIL: current Policy verifier should fail"
-  echo "$current_failed"; exit 1
-fi
-if "$GRAFT_BIN" admit "$candidate" --require Policy >admit-ok2.out 2>admit-err2.out; then
-  echo "FAIL: admit accepted current failed verifier evidence"
-  cat admit-ok2.out
-  exit 1
-fi
-if ! grep -q '\[A002\] evidence for `Policy` did not pass' admit-err2.out; then
-  echo "FAIL: admit should report failed current evidence after revalidation"
-  cat admit-err2.out; exit 1
-fi
-
-echo "OK: admission does not reuse stale verifier evidence after graft-properties.toml changes."
+echo "OK: admission does not reuse stale verifier evidence after properties.roto changes."

@@ -1,0 +1,83 @@
+fn no_generated_artifacts(app: Application) -> Property {
+    property(
+        [
+            app.changed_paths().any_match([
+                "target/**",
+                "dist/**",
+                "build/**",
+            ]).failure(),
+        ],
+        "patch does not contain generated build artifacts",
+        Severity.Blocking,
+        [],
+    )
+}
+
+fn cargo_tests_pass(app: Application) -> Property {
+    let run = call(["cargo", "test", "--all-targets"], app.target());
+
+    property(
+        [
+            run.exit_code_is(0).success(),
+        ],
+        "cargo test --all-targets passes on the target tree",
+        Severity.Blocking,
+        [],
+    )
+}
+
+fn safe_patch(app: Application) -> Property {
+    property(
+        [],
+        "patch passes both artifact policy and the test suite",
+        Severity.Blocking,
+        [
+            "no_generated_artifacts",
+            "cargo_tests_pass",
+        ],
+    )
+}
+
+fn precision_invariance(app: Application) -> Property {
+    let base_run = call(["bash", "./run.sh"], app.base());
+    let target_run = call(["bash", "./run.sh"], app.target());
+
+    property(
+        [
+            same_output(base_run, target_run, [
+                post_file("./alignment/expected.json"),
+                stdout,
+            ]).success(),
+        ],
+        "selected outputs are identical between base and target runs",
+        Severity.Blocking,
+        [],
+    )
+}
+
+fn training_alignment(app: Application) -> Property {
+    let target_run = call(["bash", "./check_diff.sh"], app.target());
+
+    let prev = app.previous_failure(History.First);
+    let checker = app.target().file("./check_diff.sh");
+    let bad_tree = prev.target().with_overlay([
+        replace_file("./check_diff.sh", checker),
+    ]);
+    let bad_run = call(["bash", "./check_diff.sh"], bad_tree);
+
+    property(
+        [
+            target_run.exit_code_is(0).success(),
+            any_of([
+                app.changed_paths().any_match([
+                    "check_diff.sh",
+                    "compare.py",
+                ]).failure(),
+                bad_run.exit_code_is(0).failure(),
+            ]),
+        ],
+        "validator is unchanged or still rejects a historical counterexample",
+        Severity.Blocking,
+        [],
+    )
+}

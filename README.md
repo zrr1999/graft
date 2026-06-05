@@ -11,23 +11,34 @@ Graft 是一个 Git-compatible、但 Git-independent 的 property-aware patch ru
 Graft 的生命周期回答是：
 
 ```text
-cwd/scratch -> candidate -> validate evidence -> admit patch -> sync/promote/materialize
+scratch operation -> candidate -> validate evidence -> admit patch -> materialize/run -> promote/sync
 ```
 
-一句话：Graft 管「变更为什么可信」，Git 只在显式 `graft promote` 时承载「可信变更如何进入外部版本历史」。
+一句话：Graft 管「变更为什么可信」，Git 只在显式 `graft patch promote` 时承载「可信变更如何进入外部版本历史」。
+
+## 帮助入口 / agent workflow
+
+仓库维护的推荐使用流程入口是：
+
+```bash
+graft explain agent-workflow
+```
+
+pi-graft 的 `graft_help` tool 应默认展示这个 topic；具体概念继续用 `graft explain scratch`、`graft explain candidate`、`graft explain admit`、`graft explain materialize` 等查询。高频 agent 主路径是 scratch 草稿（可用 `graft scratch capture --base <ref>` 把 cwd dirty state 收进 scratch 并恢复 cwd）→ `graft patch from-scratch` → `graft patch validate` → `graft patch admit` → `graft materialize` / `graft run` 检查输出；外部 `graft promote`、sync、compose/migrate/revert、`repo add/sync/lock/update`、`bundle import`、`workspace gc --apply` 等低频写命令可通过手动 CLI 或 pi-graft `graft_cli_exec` argv 显式执行，读/检查命令保留本地 CLI 路径。
 
 ## 当前状态
 
 这是一个正在迭代的 Rust 项目，当前实现已覆盖 v2 store-tier 主路径：
 
-- 纯 Graft workspace：cwd root 不允许 `.git/`，遇到 Git worktree 以 `[E_GIT_IN_WORKSPACE]` 失败。
+- workspace 是用户级对象：`$GRAFT_HOME` 默认 `~/.graft`，cwd 只是 attach/discovery key；cwd 可以是 Git worktree。
 - `.graft/store/{public,private,derived}` 分层：candidate local-only；admitted patch / relation / promotion / evidence_refs 位于 public；evidence body 位于 derived，不参与 sync。
-- `properties/<Alias>.toml` + `graft.lock`：property alias 与 content-addressed `property:<digest>` 解耦。
-- daemon 是唯一 writer：CLI 写命令自动通过 `.graft/run/daemon.sock` 发给 `graftd`；无 inline writer 路径。
-- cwd view 显式管理：`graft materialize` 写 cwd；`graft status/diff/discard` 管理 `.graft/state/cwd` 与 dirty gate。
+- `properties.roto` + `graft.lock`：顶层 property 函数与 content-addressed `property:<digest>` 解耦；锁定的是静态 plan identity。
+- daemon 是唯一 writer：CLI 写命令自动通过 `$GRAFT_HOME/run/daemon.sock` 发给全局 `graftd`；无 inline writer 路径。
+- `StateId` 是完整 workspace snapshot；multi-repo 内容在 state root 内表现为 `worktrees/<repo-id>/...`，property 始终在完整 `.base` / `.target` state 上运行。
+- materialize 不写 cwd：`graft materialize <state-ref>` 先把 `tree:*`、`candidate:*`、`patch:*`、`repo:<id>@<treeish>` 或 workspace Git treeish 解析成确定 state，再输出到 workspace `.worktrees/<state>/` 临时检查目录；`graft run <state-ref> -- <cmd>` 在临时 state root 执行命令并丢弃写入。
 - sync 使用固定 Git refs：`refs/graft/facts`、`refs/graft/blobs`、`refs/graft/manifests`；candidate 和 evidence body 不 sync。
-- `graft clone` 只重建 `.graft/`，不会默认 materialize cwd。
-- `graft promote` 是唯一会写外部 Git repo 的命令，并记录 `promotion:<digest>`。
+- `graft get` 只重建 `.graft/`，不会默认 materialize cwd。
+- `graft promote` 是唯一会写外部 Git repo / branch / PR / release 的命令，发布的是 admitted patch 的 `target_state`，并记录 `promotion:<digest>`。
 
 ## 安装 / 构建
 
@@ -50,39 +61,43 @@ PyPI 发行包名预留为 `graftkit`，命令名仍是 `graft`。
 
 ```bash
 mkdir demo && cd demo
-graft init
+graft workspace init
 ```
 
 创建 candidate：
 
 ```bash
-printf 'hello
-' > hello.txt
-graft create --from graft:empty --expect ValidPatch --message 'first candidate'
+scratch=$(graft scratch write --base graft:empty hello.txt --content $'hello\n' | grep -oE 'scratch:[0-9a-f]+' | tail -n1)
+candidate=$(graft patch from-scratch "$scratch" --message 'first candidate' | grep -oE 'candidate:[0-9a-f]+' | head -n1)
 ```
 
-验证并接纳：
+如果已经在 cwd 里有 dirty files，可以用 stash-like capture 进入同一条生命周期；capture 会忽略 `.graft/`、`.git/`、`.spark/`、`.worktrees/`、`worktrees/`、`target/`、`dist/` 和 workspace 配置/锁文件，成功写入 scratch 后把被捕获路径恢复到 base：
 
 ```bash
-graft validate candidate:<digest> --expect ValidPatch
-graft admit candidate:<digest> --require ValidPatch
+scratch=$(graft scratch capture --base graft:empty | grep -oE 'scratch:[0-9a-f]+' | head -n1)
+candidate=$(graft patch from-scratch "$scratch" --message 'captured cwd' | grep -oE 'candidate:[0-9a-f]+' | head -n1)
 ```
 
-查看与搜索 admitted patch：
+验证 core patch integrity 并接纳（默认没有 property gate）：
 
 ```bash
-graft show patch:<digest> --evidence --change
-graft search --property ValidPatch
-graft search --has-evidence ValidPatch
+graft patch validate "$candidate"
+patch=$(graft patch admit "$candidate" | grep -oE 'patch:[0-9a-f]+' | head -n1)
 ```
 
-把 patch 显式设为 cwd view：
+查看 admitted patch：
 
 ```bash
-graft materialize patch:<digest>
-graft status
-graft diff
-graft discard
+graft patch show "$patch" --evidence --change
+```
+
+把 patch target state 显式物化到 workspace 临时检查目录：
+
+```bash
+graft materialize "$patch"
+ls .worktrees/
+graft run "$patch" -- test -f hello.txt
+graft workspace status
 ```
 
 ## Workspace layout
@@ -98,11 +113,13 @@ graft discard
   run/{daemon.sock,daemon.pid,trials/,worktrees/,tmp/}
 
 graft.toml
-properties/*.toml
+properties.roto
 graft.lock
+.worktrees/        # materialize inspection output; not a state source
+worktrees/         # local managed-repo checkout/output area; cwd capture ignores it
 ```
 
-`graft.lock` 是 derived anchor：`[properties]` 固定 property content IDs，`[repos.<id>]` 固定外部 repo treeish 解析结果。它不属于 cwd snapshot。
+`graft.lock` 是 derived anchor：`[properties]` 固定 property content IDs，`[repos.<id>]` 固定外部 repo treeish 解析结果。它不属于 Graft cwd snapshot，但属于 workspace 元配置锁；在 Git workspace 中必须提交，确保 clone 后解析一致。
 
 ## ID 形式
 
@@ -123,11 +140,26 @@ manifest:<digest>
 
 ## Properties
 
-Property 定义位于 `properties/<Alias>.toml`，文件名就是 alias，文件内容是 verifier spec。例如：
+Property 定义位于单个 `properties.roto`。每个顶层 `fn name(app: Application) -> Property` 都是一个 property；函数名就是 property name，没有 PascalCase alias，也没有 `property_registry()`。`PropertyId` 由函数名、静态 checks 和 `requires` 依赖派生；description、severity、source location、注释和局部变量名不影响身份。例如：
 
-```toml
-kind = 'builtin'
-check = 'valid_patch'
+```roto
+fn empty_change(app: Application) -> Property {
+    property(
+        [app.changed_paths().any_match(["**"]).failure()],
+        "the change touches no paths",
+        Severity.Blocking,
+        [],
+    )
+}
+
+fn cargo_tests_pass(app: Application) -> Property {
+    property(
+        [call(["cargo", "test", "--all-targets"], app.target()).exit_code_is(0).success()],
+        "cargo tests pass",
+        Severity.Blocking,
+        ["empty_change"],
+    )
+}
 ```
 
 常用命令：
@@ -136,19 +168,19 @@ check = 'valid_patch'
 graft property lock
 graft property check
 graft property list
-graft property show ValidPatch
+graft property show cargo_tests_pass
 ```
 
 ## Daemon
 
-写命令默认自动启动 per-workspace daemon：
+写命令默认自动启动 `$GRAFT_HOME` 级全局 daemon：
 
 ```text
-.graft/run/daemon.sock
-.graft/run/daemon.pid
+$GRAFT_HOME/run/daemon.sock
+$GRAFT_HOME/run/daemon.pid
 ```
 
-`graftd` 串行执行 wire op；启动时会清理 `.graft/run/{trials,worktrees,tmp}`。可在 `.graft/config.toml` 调整 idle timeout：
+`graftd` 串行执行 wire op，CLI 请求携带 workspace 路由信息。可在 workspace `.graft/config.toml` 调整 idle timeout：
 
 ```toml
 [daemon]
@@ -158,8 +190,8 @@ idle_timeout_minutes = 30
 手动检查/停止：
 
 ```bash
-graftd status --socket .graft/run/daemon.sock
-graftd stop   --socket .graft/run/daemon.sock
+graftd status --socket "$GRAFT_HOME/run/daemon.sock"
+graftd stop   --socket "$GRAFT_HOME/run/daemon.sock"
 ```
 
 ## Sync / clone
@@ -175,21 +207,30 @@ refs/graft/manifests
 同步 public store：
 
 ```bash
+# enabled by default for normal workspaces; set false to opt out:
+# [sync]
+# enabled = true
 graft sync /path/to/storage.git
+graft sync                         # reuse the last explicit sync remote
 graft sync /path/to/storage.git --fetch-only
 graft sync /path/to/storage.git --push-only
-graft incoming
+graft patch incoming
 graft verify-pending
 ```
+
+`ws:default` never syncs. Other workspaces sync by default unless
+`[sync] enabled = false` is set in `graft.toml`.
+The first explicit `graft sync <remote>` records the workspace's default
+remote; later `graft sync` uses that recorded remote.
 
 `evidence_refs` 会 sync；`store/derived/evidence/` 不 sync，fresh clone 需要 `graft verify-pending` 本地重建。
 
 Clone 不 materialize cwd：
 
 ```bash
-graft clone /path/to/storage.git ./clone
+graft get /path/to/storage.git ./clone
 cd clone
-graft incoming
+graft patch incoming
 graft materialize patch:<digest>
 ```
 
@@ -198,13 +239,14 @@ graft materialize patch:<digest>
 `graft promote` 是唯一会写外部 Git repo 的路径。推荐在 `graft.toml` 配置 target：
 
 ```toml
-[promotion]
-required_properties = ['ValidPatch']
+[promotion.required_properties]
 
 [promote_targets.docs]
 path = '../external-git-repo'
 branch = 'graft-out'
-required_properties = ['ValidPatch']
+
+[promote_targets.docs.required_properties]
+workspace = ['only_touches_docs']
 ```
 
 执行：
@@ -215,24 +257,35 @@ graft promote patch:<digest> --to docs --yes
 
 ## Scratch
 
-`scratch` 是 daemon-backed 临时状态图：
+`scratch` 是 daemon-backed 临时草稿状态图。第一次读/写/编辑/删除直接用 `--base`，后续草稿变更用 `--from` 续写；`--repo <id>` 只用于指定 `--base` 的 repo 上下文，不写就是 workspace。candidate 生成不属于 `scratch` namespace，而是独立的 candidate lifecycle 入口：
 
 ```bash
-graft scratch open --base patch:<digest>
-graft scratch read scratch:<digest> path/to/file --mode hashlines
-graft scratch write scratch:<digest> new.txt --content $'hello
+graft scratch read --base patch:<digest> path/to/file --mode hashlines
+graft scratch read --repo C --base main graft.toml --mode text
+graft scratch write --base patch:<digest> new.txt --content $'hello
 '
-graft scratch edit scratch:<digest> file.txt --edits '[...]'
-graft scratch promote scratch:<digest> --expect ValidPatch --message 'from scratch'
+graft scratch edit --from scratch:<digest> file.txt --edits '[...]'
+graft scratch delete --from scratch:<digest> file.txt   # alias: rm
+graft scratch diff scratch:<before> scratch:<after>
+graft scratch pin scratch:<digest>
+graft scratch unpin lease_<digest>
+graft scratch drop scratch:<digest>
+
+graft patch from-scratch scratch:<digest> --expect workspace:only_touches_docs --message 'ready for validation'
 ```
+
+`graft patch from-scratch` 调用 daemon `candidate_from_scratch` protocol；CLI 与 pi-graft 插件共享这个 canonical op 来写 change、candidate 与空 evidence index。旧的 `graft candidate from-scratch` 仍作为隐藏兼容入口接受，但 README 使用当前 help 暴露的 `patch` namespace。Rename 用 `scratch delete --from <scratch> old/path` 加 `scratch write --from <scratch> new/path --content ...` 表达。
 
 ## 开发检查
 
+本地与 PR gate 使用同一组入口：
+
 ```bash
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-cargo test --doc --workspace
+just check      # cargo fmt --all -- --check + cargo clippy --locked --workspace --all-targets -- -D warnings
+just test       # cargo test --locked --workspace --all-targets + cargo test --locked --doc --workspace
+just smoke      # fail-fast 执行 tests/*.sh
+just prek       # uvx prek run --all-files
+just cov        # cargo llvm-cov test --locked --workspace --all-targets，生成 lcov.info
 ```
 
-Smoke tests 在 `tests/*.sh`。
+`just smoke` 会逐个执行 `tests/*.sh`，任一 smoke 失败即停止。CI 的 static/test workflows 调用同一组 `just` recipes（test workflow 额外用 `just cov` 生成覆盖率上传）；PR 还会运行标题与正文模板检查。

@@ -1,14 +1,57 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::fs;
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use graft_core::{
     CandidateId, ChangeSet, EvidenceRecord, GraftCandidate, PatchId, PatchRecord, PatchRelation,
-    PromotionRecord, PropertyRef, StateId, TreeEntry, TreeSnapshot,
+    PromotionRecord, PropertyDef, PropertyId, PropertyRef, PropertySpec, StateId, TreeEntry,
+    TreeSnapshot, evidence_id,
 };
 use rusqlite::Connection;
 
+pub mod discovery;
 pub mod lock;
+pub mod registry;
+pub use discovery::{
+    DEFAULT_WORKSPACE_ID, WorkspaceDiscovery, WorkspaceLocation, WorkspaceSource,
+    default_workspace_root, local_workspace_id_for_root,
+};
 pub use lock::WriteLock;
+pub use registry::{
+    Registry, RegistryStore, RepoPathsRecord, RouteRecord, WorkspaceKind, WorkspaceRecord,
+    graft_home_from_env,
+};
+
+/// Normalize a workspace-related path for registry keys and daemon engine keys.
+///
+/// Existing paths are fully canonicalized. For paths that do not exist yet,
+/// the nearest existing parent is canonicalized and the missing suffix is
+/// re-attached without lossy string conversion.
+pub fn normalize_workspace_path(path: &Path) -> PathBuf {
+    if let Ok(canonical) = path.canonicalize() {
+        return canonical;
+    }
+
+    let mut missing = Vec::new();
+    let mut cursor = path;
+    while let Some(parent) = cursor.parent() {
+        if let Some(name) = cursor.file_name() {
+            missing.push(name.to_os_string());
+        }
+        if let Ok(mut canonical_parent) = parent.canonicalize() {
+            for component in missing.iter().rev() {
+                canonical_parent.push(component);
+            }
+            return canonical_parent;
+        }
+        cursor = parent;
+    }
+
+    path.to_path_buf()
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -18,6 +61,12 @@ pub enum StoreError {
     Json(#[from] serde_json::Error),
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    #[error("toml deserialize error: {0}")]
+    TomlDeserialize(#[from] toml::de::Error),
+    #[error("toml serialize error: {0}")]
+    TomlSerialize(#[from] toml::ser::Error),
+    #[error("time format error: {0}")]
+    TimeFormat(#[from] time::error::Format),
     #[error("core error: {0}")]
     Core(#[from] graft_core::CoreError),
     #[error("invalid stored path escapes materialized tree: {0}")]
@@ -30,6 +79,34 @@ pub enum StoreError {
     VirtualPathIsDirectory(String),
     #[error("unsupported virtual base state: {0}")]
     UnsupportedVirtualBase(String),
+    #[error("invalid workspace: {0}")]
+    InvalidWorkspace(String),
+    #[error("[E_REGISTRY_SCHEMA] registry.toml schema {found} is not supported")]
+    InvalidRegistrySchema { found: u32 },
+    #[error(
+        "[E_NO_WORKSPACE] no Graft workspace is attached for cwd {cwd}; run `graft init`, `graft attach`, or set GRAFT_WORKSPACE"
+    )]
+    NoWorkspace { cwd: PathBuf },
+    #[error("invalid evidence index {path}: {message}")]
+    InvalidEvidenceIndex { path: PathBuf, message: String },
+    #[error("invalid store write path: {0}")]
+    InvalidStoreWritePath(PathBuf),
+    #[error("invalid store object path {path}: {message}")]
+    InvalidStoreObjectPath { path: PathBuf, message: String },
+    #[error("invalid snapshot path {path}: {message}")]
+    InvalidSnapshotPath { path: PathBuf, message: String },
+    #[error("store object id mismatch at {path}: expected {expected}, got {actual}")]
+    StoreObjectIdMismatch {
+        path: PathBuf,
+        expected: String,
+        actual: String,
+    },
+    #[error("failed to publish atomic write at {path}: {message}")]
+    AtomicWrite { path: PathBuf, message: String },
+    #[error("invalid materialize destination: {0}")]
+    InvalidMaterializeDestination(PathBuf),
+    #[error("failed to publish materialized tree at {path}: {message}")]
+    MaterializePublish { path: PathBuf, message: String },
     #[error(
         "another graft writer holds the lock at {} - only one graftd may write `.graft/` at a time",
         path.display()
@@ -41,6 +118,7 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum VirtualBaseRef {
+    Empty,
     Tree(String),
     Candidate(CandidateId),
     Patch(PatchId),
@@ -55,10 +133,11 @@ pub struct VirtualFile {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-struct EvidenceRefs {
-    owner: String,
-    evidence: Vec<String>,
-    updated_at: Option<String>,
+#[serde(deny_unknown_fields)]
+pub struct EvidenceRefsRecord {
+    pub owner: String,
+    pub evidence: Vec<String>,
+    pub updated_at: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -90,16 +169,16 @@ impl GraftPaths {
         self.workspace.join("properties")
     }
 
+    pub fn properties_roto_config(&self) -> PathBuf {
+        self.workspace.join("properties.roto")
+    }
+
     pub fn properties_lock(&self) -> PathBuf {
         self.workspace.join("graft.lock")
     }
 
     pub fn graft_config(&self) -> PathBuf {
         self.root.join("config.toml")
-    }
-
-    pub fn state_cwd(&self) -> PathBuf {
-        self.root.join("state").join("cwd")
     }
 
     pub fn cache_candidates(&self) -> PathBuf {
@@ -122,6 +201,14 @@ impl GraftPaths {
         self.root.join("run").join("worktrees")
     }
 
+    pub fn derived_worktrees(&self) -> PathBuf {
+        self.root.join("store").join("derived").join("worktrees")
+    }
+
+    pub fn workspace_worktrees(&self) -> PathBuf {
+        self.workspace.join(".worktrees")
+    }
+
     pub fn cache_tmp(&self) -> PathBuf {
         self.root.join("run").join("tmp")
     }
@@ -136,6 +223,10 @@ impl GraftPaths {
 
     pub fn object_changes(&self) -> PathBuf {
         self.root.join("store").join("public").join("change")
+    }
+
+    pub fn object_properties(&self) -> PathBuf {
+        self.root.join("store").join("public").join("property")
     }
 
     pub fn object_patches(&self) -> PathBuf {
@@ -237,9 +328,11 @@ impl GraftStore {
             fs::write(&config_path, DEFAULT_CONFIG)?;
         }
         let properties_config_path = self.paths.properties_config();
-        let properties_config_existed = properties_config_path.exists();
+        let properties_roto_path = self.paths.properties_roto_config();
+        let properties_config_existed =
+            properties_config_path.exists() || properties_roto_path.exists();
         if !properties_config_existed {
-            write_default_properties_config(&properties_config_path)?;
+            write_default_properties_roto_config(&properties_roto_path)?;
         }
         Ok(InitOutcome {
             layout_created: !layout_existed,
@@ -259,12 +352,14 @@ impl GraftStore {
         fs::create_dir_all(self.paths.object_blobs())?;
         fs::create_dir_all(self.paths.object_trees())?;
         fs::create_dir_all(self.paths.object_changes())?;
+        fs::create_dir_all(self.paths.object_properties())?;
         fs::create_dir_all(self.paths.object_patches())?;
         fs::create_dir_all(self.paths.object_evidence())?;
         fs::create_dir_all(self.paths.object_candidate_evidence_index())?;
         fs::create_dir_all(self.paths.object_patch_evidence_index())?;
         fs::create_dir_all(self.paths.cache_candidates())?;
         fs::create_dir_all(self.paths.cache_evidence())?;
+        fs::create_dir_all(self.paths.derived_worktrees())?;
         fs::create_dir_all(self.paths.cache_trials())?;
         fs::create_dir_all(self.paths.cache_relations())?;
         fs::create_dir_all(self.paths.cache_worktrees())?;
@@ -276,10 +371,6 @@ impl GraftStore {
         fs::create_dir_all(self.paths.refs().join("drafts"))?;
         fs::create_dir_all(self.paths.refs().join("registry"))?;
         fs::create_dir_all(self.paths.materialized_refs())?;
-        let state_cwd = self.paths.state_cwd();
-        if !state_cwd.exists() {
-            fs::write(state_cwd, "")?;
-        }
         self.init_index()
     }
 
@@ -289,6 +380,50 @@ impl GraftStore {
         let mut entries = Vec::new();
         collect_tree_entries(worktree, worktree, &self.paths.object_blobs(), &mut entries)?;
         Ok(TreeSnapshot::new(entries))
+    }
+
+    pub fn capture_target_snapshot(
+        &self,
+        base: &TreeSnapshot,
+        captured: &TreeSnapshot,
+    ) -> TreeSnapshot {
+        let mut entries = BTreeMap::new();
+        for entry in &base.entries {
+            if should_skip_snapshot_path(&entry.path) {
+                entries.insert(entry.path.clone(), entry.clone());
+            }
+        }
+        for entry in &captured.entries {
+            if !should_skip_snapshot_path(&entry.path) {
+                entries.insert(entry.path.clone(), entry.clone());
+            }
+        }
+        TreeSnapshot::new(entries.into_values().collect())
+    }
+
+    pub fn restore_worktree_paths(
+        &self,
+        snapshot: &TreeSnapshot,
+        worktree: impl AsRef<Path>,
+        paths: &[String],
+    ) -> Result<()> {
+        let worktree = worktree.as_ref();
+        for path in paths {
+            let destination = materialized_path(worktree, path)?;
+            match snapshot.entries.iter().find(|entry| entry.path == *path) {
+                Some(entry) => {
+                    if let Some(parent) = destination.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    remove_path_if_exists(&destination)?;
+                    fs::write(&destination, self.read_blob(&entry.hash)?)?;
+                }
+                None => {
+                    remove_path_if_exists(&destination)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn write_blob(&self, bytes: &[u8]) -> Result<String> {
@@ -335,10 +470,17 @@ impl GraftStore {
         paths.sort();
         let mut blobs = Vec::new();
         for path in paths {
-            let Some(hash) = path.file_name().and_then(|value| value.to_str()) else {
-                continue;
-            };
-            blobs.push((hash.to_string(), fs::read(path)?));
+            let expected = store_object_file_name(&path, "blob")?;
+            let bytes = fs::read(&path)?;
+            let actual = blake3::hash(&bytes).to_hex().to_string();
+            if actual != expected {
+                return Err(StoreError::StoreObjectIdMismatch {
+                    path,
+                    expected,
+                    actual,
+                });
+            }
+            blobs.push((expected, bytes));
         }
         Ok(blobs)
     }
@@ -372,6 +514,11 @@ impl GraftStore {
 
     pub fn virtual_tree(&self, base: &VirtualBaseRef) -> Result<TreeSnapshot> {
         match base {
+            VirtualBaseRef::Empty => {
+                let snapshot = TreeSnapshot::new(Vec::new());
+                self.write_tree_snapshot(&snapshot)?;
+                Ok(snapshot)
+            }
             VirtualBaseRef::Tree(id) => self.read_tree_snapshot(id),
             VirtualBaseRef::Candidate(id) => {
                 let candidate = self.read_candidate(id.as_str())?;
@@ -391,54 +538,30 @@ impl GraftStore {
         }
     }
 
-    pub fn read_cwd_state(&self) -> Result<Option<StateId>> {
-        let content = match fs::read_to_string(self.paths.state_cwd()) {
-            Ok(content) => content,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(StoreError::Io(error)),
-        };
-        let trimmed = content.trim();
-        if trimmed.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(serde_json::from_str(trimmed)?))
-        }
-    }
-
-    pub fn write_cwd_state(&self, state: &StateId) -> Result<()> {
-        if let Some(parent) = self.paths.state_cwd().parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(self.paths.state_cwd(), serde_json::to_string_pretty(state)?)?;
-        Ok(())
-    }
-
-    pub fn materialize_workspace_view(&self, snapshot: &TreeSnapshot) -> Result<()> {
-        clear_workspace_view(self.paths.workspace())?;
-        for entry in &snapshot.entries {
-            let path = materialized_path(self.paths.workspace(), &entry.path)?;
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(path, self.read_blob(&entry.hash)?)?;
-        }
-        Ok(())
-    }
-
     pub fn materialize_tree_snapshot(
         &self,
         snapshot: &TreeSnapshot,
         destination: impl AsRef<Path>,
     ) -> Result<()> {
         let destination = destination.as_ref();
-        if destination.exists() {
-            if destination.is_dir() {
-                fs::remove_dir_all(destination)?;
-            } else {
-                fs::remove_file(destination)?;
-            }
+        let parent = materialize_destination_parent(destination)?;
+        fs::create_dir_all(parent)?;
+        let stage = unique_materialize_sibling(parent, destination, "stage")?;
+        let backup = unique_materialize_sibling(parent, destination, "backup")?;
+
+        fs::create_dir(&stage)?;
+        if let Err(error) = self.write_materialized_snapshot(snapshot, &stage) {
+            remove_path_if_exists(&stage)?;
+            return Err(error);
         }
-        fs::create_dir_all(destination)?;
+        publish_materialized_tree(&stage, destination, &backup)
+    }
+
+    fn write_materialized_snapshot(
+        &self,
+        snapshot: &TreeSnapshot,
+        destination: &Path,
+    ) -> Result<()> {
         for entry in &snapshot.entries {
             let path = materialized_path(destination, &entry.path)?;
             if let Some(parent) = path.parent() {
@@ -462,7 +585,20 @@ impl GraftStore {
     }
 
     pub fn list_tree_objects(&self) -> Result<Vec<(String, TreeSnapshot)>> {
-        read_named_json_records(&self.paths.object_trees())
+        read_named_json_records::<TreeSnapshot>(&self.paths.object_trees())?
+            .into_iter()
+            .map(|record| {
+                let actual = record.value.id().map_err(StoreError::Core)?;
+                if actual != record.id {
+                    return Err(StoreError::StoreObjectIdMismatch {
+                        path: record.path,
+                        expected: record.id,
+                        actual,
+                    });
+                }
+                Ok((record.id, record.value))
+            })
+            .collect()
     }
 
     pub fn write_change(&self, change: &ChangeSet) -> Result<(graft_core::ChangeId, PathBuf)> {
@@ -478,7 +614,44 @@ impl GraftStore {
     }
 
     pub fn list_change_objects(&self) -> Result<Vec<(String, ChangeSet)>> {
-        read_named_json_records(&self.paths.object_changes())
+        read_named_json_records::<ChangeSet>(&self.paths.object_changes())?
+            .into_iter()
+            .map(|record| {
+                let actual = record.value.id().map_err(StoreError::Core)?.to_string();
+                if actual != record.id {
+                    return Err(StoreError::StoreObjectIdMismatch {
+                        path: record.path,
+                        expected: record.id,
+                        actual,
+                    });
+                }
+                Ok((record.id, record.value))
+            })
+            .collect()
+    }
+
+    pub fn write_property_def(&self, def: &PropertyDef) -> Result<(PropertyId, PathBuf)> {
+        fs::create_dir_all(self.paths.object_properties())?;
+        let id = def.property_id().map_err(StoreError::Core)?;
+        let path = self.paths.object_properties().join(format!("{id}.json"));
+        write_json(&path, def)?;
+        Ok((id, path))
+    }
+
+    pub fn read_property_def(&self, id: &str) -> Result<PropertyDef> {
+        read_json(&self.paths.object_properties().join(format!("{id}.json")))
+    }
+
+    pub fn write_property_spec(&self, spec: &PropertySpec) -> Result<(PropertyId, PathBuf)> {
+        fs::create_dir_all(self.paths.object_properties())?;
+        let id = spec.property_id().map_err(StoreError::Core)?;
+        let path = self.paths.object_properties().join(format!("{id}.json"));
+        write_json(&path, spec)?;
+        Ok((id, path))
+    }
+
+    pub fn read_property_spec(&self, id: &str) -> Result<PropertySpec> {
+        read_json(&self.paths.object_properties().join(format!("{id}.json")))
     }
 
     pub fn write_candidate(&self, candidate: &GraftCandidate) -> Result<PathBuf> {
@@ -551,7 +724,7 @@ impl GraftStore {
         evidence: &[String],
     ) -> Result<()> {
         fs::create_dir_all(self.paths.object_candidate_evidence_index())?;
-        let refs = EvidenceRefs {
+        let refs = EvidenceRefsRecord {
             owner: candidate.to_string(),
             evidence: evidence.to_vec(),
             updated_at: Some(time::OffsetDateTime::now_utc().to_string()),
@@ -595,10 +768,23 @@ impl GraftStore {
         patch: &str,
     ) -> Result<Vec<String>> {
         let index = self.candidate_evidence_index(candidate)?;
+        let mut copied = Vec::new();
+        for old_evidence_id in index {
+            let mut evidence = self.read_evidence(&old_evidence_id)?;
+            if let Some(subject) = promoted_evidence_subject(&evidence.subject, candidate, patch) {
+                evidence.subject = subject;
+                evidence.id = graft_core::EvidenceId::new("evidence:pending");
+                evidence.id = evidence_id(&evidence).map_err(StoreError::Core)?;
+                self.write_evidence(&evidence)?;
+                copied.push(evidence.id.to_string());
+            } else {
+                copied.push(old_evidence_id);
+            }
+        }
         fs::create_dir_all(self.paths.object_patch_evidence_index())?;
-        let refs = EvidenceRefs {
+        let refs = EvidenceRefsRecord {
             owner: patch.to_string(),
-            evidence: index.clone(),
+            evidence: copied.clone(),
             updated_at: Some(time::OffsetDateTime::now_utc().to_string()),
         };
         write_json(
@@ -608,7 +794,7 @@ impl GraftStore {
                 .join(format!("{patch}.json")),
             &refs,
         )?;
-        Ok(index)
+        Ok(copied)
     }
 
     pub fn evidence_records_for_ids(&self, ids: &[String]) -> Result<Vec<EvidenceRecord>> {
@@ -630,29 +816,58 @@ impl GraftStore {
     }
 
     pub fn cached_evidence_for_subject(&self, subject: &str) -> Result<Vec<EvidenceRecord>> {
-        let indexed = self.candidate_evidence_records(subject)?;
-        if indexed.is_empty() {
-            read_evidence_records(&self.paths.cache_evidence(), subject)
-        } else {
-            Ok(indexed)
-        }
+        self.candidate_evidence_records(subject)
     }
 
     pub fn registry_evidence_for_subject(&self, subject: &str) -> Result<Vec<EvidenceRecord>> {
-        let indexed = self.patch_evidence_records(subject)?;
-        if indexed.is_empty() {
-            read_evidence_records(&self.paths.registry_evidence(), subject)
-        } else {
-            Ok(indexed)
-        }
+        self.patch_evidence_records(subject)
     }
 
     pub fn list_registry_evidence(&self) -> Result<Vec<EvidenceRecord>> {
-        read_json_records(&self.paths.object_evidence())
+        let mut ids = BTreeSet::new();
+        for refs in self.list_patch_evidence_refs()? {
+            ids.extend(refs.evidence);
+        }
+        let ids = ids.into_iter().collect::<Vec<_>>();
+        self.evidence_records_for_ids(&ids)
     }
 
     pub fn write_registry_evidence(&self, evidence: &EvidenceRecord) -> Result<PathBuf> {
         self.write_evidence(evidence)
+    }
+
+    pub fn list_patch_evidence_refs(&self) -> Result<Vec<EvidenceRefsRecord>> {
+        let dir = self.paths.object_patch_evidence_index();
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        json_file_stems(&dir)?
+            .into_iter()
+            .map(|owner| read_evidence_refs_record(&dir, &owner))
+            .collect()
+    }
+
+    pub fn list_evidence_body_ids(&self) -> Result<Vec<String>> {
+        json_file_stems(&self.paths.object_evidence())
+    }
+
+    pub fn list_candidate_evidence_ref_owners(&self) -> Result<Vec<String>> {
+        json_file_stems(&self.paths.object_candidate_evidence_index())
+    }
+
+    pub fn list_patch_evidence_ref_owners(&self) -> Result<Vec<String>> {
+        json_file_stems(&self.paths.object_patch_evidence_index())
+    }
+
+    pub fn write_patch_evidence_refs(&self, refs: &EvidenceRefsRecord) -> Result<()> {
+        fs::create_dir_all(self.paths.object_patch_evidence_index())?;
+        write_json(
+            &self
+                .paths
+                .object_patch_evidence_index()
+                .join(format!("{}.json", refs.owner)),
+            refs,
+        )
     }
 
     pub fn write_patch(&self, patch: &PatchRecord) -> Result<PathBuf> {
@@ -799,102 +1014,148 @@ impl GraftStore {
     }
 }
 
-const DEFAULT_CONFIG: &str = r#"[create]
-default_base = "HEAD"
-default_mode = "cache-only"
+const DEFAULT_CONFIG: &str = r#"schema = 1
 
-[admission]
-base_properties = ["ValidPatch"]
+[admission.required_properties]
 
-[promotion]
-required_properties = ["ValidPatch"]
+[promotion.required_properties]
+
+[sync]
+enabled = true
 "#;
 
-const DEFAULT_PROPERTIES_CONFIG: &str = r#"[[properties]]
-name = "ValidPatch"
-
-[properties.query]
-kind = "change"
-
-[properties.evaluator]
-kind = "builtin"
-name = "valid_patch"
-
-[properties.evaluator.options]
-
-[properties.judge]
-kind = "bool_true"
-
-[[properties]]
-name = "NoModelWeightChange"
-
-[properties.query]
-kind = "files"
-include = ["*.pt", "*.pth", "*.onnx", "*.safetensors", "*.ckpt", "*.h5", "*pytorch_model.bin"]
-exclude = []
-
-[properties.evaluator]
-kind = "builtin"
-name = "paths_none_match"
-
-[properties.evaluator.options]
-
-[properties.judge]
-kind = "bool_true"
+const DEFAULT_PROPERTIES_ROTO_CONFIG: &str = r#"// Graft v2 property source.
+// Add top-level property functions with this shape:
+//
+// fn property_name(app: Application) -> Property {
+//     property([unavailable("not configured yet")], "description", Severity.Info, [])
+// }
 "#;
 
-fn write_default_properties_config(dir: &Path) -> Result<()> {
-    fs::create_dir_all(dir)?;
-    for chunk in DEFAULT_PROPERTIES_CONFIG.split("[[properties]]") {
-        let chunk = chunk.trim();
-        if chunk.is_empty() {
-            continue;
-        }
-        let mut name = None;
-        let mut lines = Vec::new();
-        for line in chunk.lines() {
-            if name.is_none()
-                && let Some(rest) = line.strip_prefix("name = ")
-            {
-                name = Some(rest.trim().trim_matches('"').to_string());
-                continue;
-            }
-            lines.push(line.replace("[properties.", "["));
-        }
-        let Some(name) = name else {
-            continue;
-        };
-        fs::write(
-            dir.join(format!("{name}.toml")),
-            format!("{}\n", lines.join("\n").trim()),
-        )?;
+fn write_default_properties_roto_config(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
     }
+    fs::write(path, DEFAULT_PROPERTIES_ROTO_CONFIG)?;
     Ok(())
+}
+
+fn promoted_evidence_subject(subject: &str, candidate: &str, patch: &str) -> Option<String> {
+    if subject == candidate {
+        return Some(patch.to_string());
+    }
+    subject
+        .strip_prefix(candidate)
+        .and_then(|suffix| suffix.strip_prefix('@'))
+        .map(|scope| format!("{patch}@{scope}"))
 }
 
 fn write_json(path: &Path, value: &impl serde::Serialize) -> Result<()> {
-    let bytes = serde_json::to_vec_pretty(value)?;
-    fs::write(path, [bytes, b"\n".to_vec()].concat())?;
-    Ok(())
+    let mut bytes = serde_json::to_vec_pretty(value)?;
+    bytes.push(b'\n');
+    atomic_write_file(path, &bytes)
+}
+
+fn atomic_write_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = store_write_parent(path)?;
+    fs::create_dir_all(parent)?;
+    let tmp_path = unique_store_write_sibling(parent, path)?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_path)
+        .map_err(|error| StoreError::AtomicWrite {
+            path: path.to_path_buf(),
+            message: format!("create temp {}: {error}", tmp_path.display()),
+        })?;
+
+    if let Err(error) = file.write_all(bytes).and_then(|_| file.sync_all()) {
+        let mut message = format!("write temp {}: {error}", tmp_path.display());
+        if let Err(cleanup_error) = remove_path_if_exists(&tmp_path) {
+            message.push_str(&format!(
+                "; failed to clean temp {}: {cleanup_error}",
+                tmp_path.display()
+            ));
+        }
+        return Err(StoreError::AtomicWrite {
+            path: path.to_path_buf(),
+            message,
+        });
+    }
+    drop(file);
+
+    fs::rename(&tmp_path, path).map_err(|error| {
+        let mut message = format!("rename temp {} into place: {error}", tmp_path.display());
+        if let Err(cleanup_error) = remove_path_if_exists(&tmp_path) {
+            message.push_str(&format!(
+                "; failed to clean temp {}: {cleanup_error}",
+                tmp_path.display()
+            ));
+        }
+        StoreError::AtomicWrite {
+            path: path.to_path_buf(),
+            message,
+        }
+    })
+}
+
+fn store_write_parent(path: &Path) -> Result<&Path> {
+    if path.file_name().is_none() {
+        return Err(StoreError::InvalidStoreWritePath(path.to_path_buf()));
+    }
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| StoreError::InvalidStoreWritePath(path.to_path_buf()))
+}
+
+fn unique_store_write_sibling(parent: &Path, path: &Path) -> Result<PathBuf> {
+    let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+        return Err(StoreError::InvalidStoreWritePath(path.to_path_buf()));
+    };
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| StoreError::AtomicWrite {
+            path: path.to_path_buf(),
+            message: format!("system clock before unix epoch: {error}"),
+        })?
+        .as_nanos();
+    Ok(parent.join(format!(
+        ".{name}.graft-json-{}-{nanos}.tmp",
+        std::process::id()
+    )))
 }
 
 fn read_evidence_index(dir: &Path, subject: &str) -> Result<Vec<String>> {
+    read_evidence_refs_record(dir, subject).map(|refs| refs.evidence)
+}
+
+fn read_evidence_refs_record(dir: &Path, subject: &str) -> Result<EvidenceRefsRecord> {
     let path = dir.join(format!("{subject}.json"));
     let value: serde_json::Value = match read_json(&path) {
         Ok(value) => value,
         Err(StoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(Vec::new());
+            return Ok(EvidenceRefsRecord {
+                owner: subject.to_string(),
+                evidence: Vec::new(),
+                updated_at: None,
+            });
         }
         Err(error) => return Err(error),
     };
-    if value.is_array() {
-        return Ok(serde_json::from_value(value)?);
-    }
     if value.is_object() {
-        let refs: EvidenceRefs = serde_json::from_value(value)?;
-        return Ok(refs.evidence);
+        let refs: EvidenceRefsRecord = serde_json::from_value(value)?;
+        if refs.owner != subject {
+            return Err(StoreError::InvalidEvidenceIndex {
+                path,
+                message: format!("owner `{}` does not match subject `{subject}`", refs.owner),
+            });
+        }
+        return Ok(refs);
     }
-    Ok(Vec::new())
+    Err(StoreError::InvalidEvidenceIndex {
+        path,
+        message: "expected evidence refs object with owner and evidence fields".to_string(),
+    })
 }
 
 fn append_unique_index(dir: &Path, subject: &str, evidence: &str) -> Result<()> {
@@ -904,7 +1165,7 @@ fn append_unique_index(dir: &Path, subject: &str, evidence: &str) -> Result<()> 
     if !ids.iter().any(|id| id == evidence) {
         ids.push(evidence.to_string());
     }
-    let refs = EvidenceRefs {
+    let refs = EvidenceRefsRecord {
         owner: subject.to_string(),
         evidence: ids,
         updated_at: Some(time::OffsetDateTime::now_utc().to_string()),
@@ -932,39 +1193,30 @@ fn read_json_records<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Vec<
     paths.into_iter().map(|path| read_json(&path)).collect()
 }
 
+struct NamedJsonRecord<T> {
+    id: String,
+    path: PathBuf,
+    value: T,
+}
+
 fn read_named_json_records<T: serde::de::DeserializeOwned>(
     path: &Path,
-) -> Result<Vec<(String, T)>> {
+) -> Result<Vec<NamedJsonRecord<T>>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
     let paths = json_paths(path)?;
     paths
         .into_iter()
-        .filter_map(|path| {
-            let id = path
-                .file_stem()
-                .and_then(|value| value.to_str())
-                .map(ToString::to_string)?;
-            Some((id, path))
+        .map(|path| {
+            let id = json_file_stem(&path)?.ok_or_else(|| StoreError::InvalidStoreObjectPath {
+                path: path.clone(),
+                message: "expected a .json store object".to_string(),
+            })?;
+            let value = read_json(&path)?;
+            Ok(NamedJsonRecord { id, path, value })
         })
-        .map(|(id, path)| read_json(&path).map(|record| (id, record)))
         .collect()
-}
-
-fn read_evidence_records(path: &Path, subject: &str) -> Result<Vec<EvidenceRecord>> {
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let mut records = Vec::new();
-    let paths = json_paths(path)?;
-    for path in paths {
-        let record: EvidenceRecord = read_json(&path)?;
-        if record.subject == subject {
-            records.push(record);
-        }
-    }
-    Ok(records)
 }
 
 fn read_relation_records(path: &Path, subject: &str) -> Result<Vec<PatchRelation>> {
@@ -980,6 +1232,53 @@ fn read_relation_records(path: &Path, subject: &str) -> Result<Vec<PatchRelation
         }
     }
     Ok(records)
+}
+
+fn json_file_stems(path: &Path) -> Result<Vec<String>> {
+    json_paths(path)?
+        .into_iter()
+        .map(|path| {
+            json_file_stem(&path)?.ok_or_else(|| StoreError::InvalidStoreObjectPath {
+                path,
+                message: "expected a .json store object".to_string(),
+            })
+        })
+        .collect()
+}
+
+fn json_file_stem(path: &Path) -> Result<Option<String>> {
+    if path.extension().and_then(|value| value.to_str()) != Some("json") {
+        return Ok(None);
+    }
+    let Some(stem) = path.file_stem() else {
+        return Err(StoreError::InvalidStoreObjectPath {
+            path: path.to_path_buf(),
+            message: "json store object has no file stem".to_string(),
+        });
+    };
+    let stem = stem
+        .to_str()
+        .ok_or_else(|| StoreError::InvalidStoreObjectPath {
+            path: path.to_path_buf(),
+            message: "json store object name must be valid UTF-8".to_string(),
+        })?;
+    Ok(Some(stem.to_string()))
+}
+
+fn store_object_file_name(path: &Path, role: &str) -> Result<String> {
+    let Some(name) = path.file_name() else {
+        return Err(StoreError::InvalidStoreObjectPath {
+            path: path.to_path_buf(),
+            message: format!("{role} store object has no file name"),
+        });
+    };
+    let name = name
+        .to_str()
+        .ok_or_else(|| StoreError::InvalidStoreObjectPath {
+            path: path.to_path_buf(),
+            message: format!("{role} store object name must be valid UTF-8"),
+        })?;
+    Ok(name.to_string())
 }
 
 fn json_paths(path: &Path) -> Result<Vec<PathBuf>> {
@@ -1009,18 +1308,19 @@ fn collect_tree_entries(
     for entry in children {
         let path = entry.path();
         let file_name = entry.file_name();
-        let file_name = file_name.to_string_lossy();
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
-            if should_skip_dir(file_name.as_ref()) {
+            let file_name = snapshot_entry_name(&path, &file_name)?;
+            if should_skip_dir(file_name) {
                 continue;
             }
             collect_tree_entries(root, &path, blob_dir, entries)?;
         } else if file_type.is_file() {
-            if should_skip_file(file_name.as_ref()) {
+            let file_name = snapshot_entry_name(&path, &file_name)?;
+            if should_skip_file(file_name) {
                 continue;
             }
-            let relative = normalize_relative_path(root, &path);
+            let relative = normalize_relative_path(root, &path)?;
             let bytes = fs::read(&path)?;
             let hash = blake3::hash(&bytes).to_hex().to_string();
             let blob_path = blob_dir.join(&hash);
@@ -1037,91 +1337,205 @@ fn collect_tree_entries(
     Ok(())
 }
 
+fn snapshot_entry_name<'a>(path: &Path, file_name: &'a OsStr) -> Result<&'a str> {
+    file_name
+        .to_str()
+        .ok_or_else(|| StoreError::InvalidSnapshotPath {
+            path: path.to_path_buf(),
+            message: "snapshot entry names must be valid UTF-8".to_string(),
+        })
+}
+
 fn should_skip_dir(name: &str) -> bool {
-    matches!(name, ".git" | ".graft" | ".spark" | "target" | "properties")
+    matches!(
+        name,
+        ".git"
+            | ".graft"
+            | ".spark"
+            | ".worktrees"
+            | "worktrees"
+            | "target"
+            | "dist"
+            | "properties"
+    )
 }
 
 fn should_skip_file(name: &str) -> bool {
-    matches!(name, "graft.toml" | "graft.lock")
+    matches!(name, "graft.toml" | "graft.lock" | "properties.roto")
 }
 
-fn clear_workspace_view(root: &Path) -> Result<()> {
-    if !root.exists() {
-        return Ok(());
-    }
-    let mut children = Vec::new();
-    for entry in fs::read_dir(root)? {
-        children.push(entry?);
-    }
-    children.sort_by_key(|entry| entry.path());
-    for entry in children {
-        let path = entry.path();
-        let file_name = entry.file_name();
-        let file_name = file_name.to_string_lossy();
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            if should_skip_dir(file_name.as_ref()) {
-                continue;
-            }
-            fs::remove_dir_all(path)?;
-        } else if file_type.is_file() {
-            if should_skip_file(file_name.as_ref()) {
-                continue;
-            }
-            fs::remove_file(path)?;
+fn should_skip_snapshot_path(path: &str) -> bool {
+    let mut parts = path.split('/').peekable();
+    while let Some(part) = parts.next() {
+        if should_skip_dir(part) {
+            return true;
         }
+        if parts.peek().is_none() && should_skip_file(part) {
+            return true;
+        }
+    }
+    false
+}
+
+fn materialize_destination_parent(destination: &Path) -> Result<&Path> {
+    if destination.file_name().is_none() {
+        return Err(StoreError::InvalidMaterializeDestination(
+            destination.to_path_buf(),
+        ));
+    }
+    destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| StoreError::InvalidMaterializeDestination(destination.to_path_buf()))
+}
+
+fn unique_materialize_sibling(parent: &Path, destination: &Path, role: &str) -> Result<PathBuf> {
+    let Some(name) = destination.file_name().and_then(|value| value.to_str()) else {
+        return Err(StoreError::InvalidMaterializeDestination(
+            destination.to_path_buf(),
+        ));
+    };
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| StoreError::MaterializePublish {
+            path: destination.to_path_buf(),
+            message: format!("system clock before unix epoch: {error}"),
+        })?
+        .as_nanos();
+    Ok(parent.join(format!(
+        ".{name}.graft-{role}-{}-{nanos}",
+        std::process::id()
+    )))
+}
+
+fn publish_materialized_tree(stage: &Path, destination: &Path, backup: &Path) -> Result<()> {
+    let had_destination = destination.exists();
+    if had_destination {
+        fs::rename(destination, backup).map_err(|error| StoreError::MaterializePublish {
+            path: destination.to_path_buf(),
+            message: format!("move previous destination to {}: {error}", backup.display()),
+        })?;
+    }
+
+    match fs::rename(stage, destination) {
+        Ok(()) => {
+            if had_destination {
+                remove_path_if_exists(backup).map_err(|error| StoreError::MaterializePublish {
+                    path: destination.to_path_buf(),
+                    message: format!("remove previous destination {}: {error}", backup.display()),
+                })?;
+            }
+            Ok(())
+        }
+        Err(error) => {
+            let mut message = format!("rename {} into place: {error}", stage.display());
+            if had_destination {
+                match fs::rename(backup, destination) {
+                    Ok(()) => {}
+                    Err(restore_error) => {
+                        message.push_str(&format!(
+                            "; failed to restore previous destination from {}: {restore_error}",
+                            backup.display()
+                        ));
+                    }
+                }
+            }
+            if let Err(cleanup_error) = remove_path_if_exists(stage) {
+                message.push_str(&format!(
+                    "; failed to clean staging directory {}: {cleanup_error}",
+                    stage.display()
+                ));
+            }
+            Err(StoreError::MaterializePublish {
+                path: destination.to_path_buf(),
+                message,
+            })
+        }
+    }
+}
+
+fn remove_path_if_exists(path: &Path) -> Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(StoreError::Io(error)),
+    };
+    if metadata.is_dir() {
+        fs::remove_dir_all(path)?;
+    } else {
+        fs::remove_file(path)?;
     }
     Ok(())
 }
 
 fn normalize_virtual_path(path: &str) -> Result<String> {
-    if path.is_empty() {
-        return Err(StoreError::InvalidPath(path.to_string()));
-    }
-    let mut parts = Vec::new();
-    for component in Path::new(path).components() {
-        match component {
-            Component::Normal(value) => parts.push(value.to_string_lossy().into_owned()),
-            Component::CurDir
-            | Component::ParentDir
-            | Component::RootDir
-            | Component::Prefix(_) => {
-                return Err(StoreError::InvalidPath(path.to_string()));
-            }
-        }
-    }
-    if parts.is_empty() {
-        return Err(StoreError::InvalidPath(path.to_string()));
-    }
-    Ok(parts.join("/"))
+    Ok(validated_virtual_path_parts(path)?.join("/"))
 }
 
 fn materialized_path(root: &Path, relative: &str) -> Result<PathBuf> {
     let mut path = root.to_path_buf();
-    let mut saw_component = false;
-    for component in Path::new(relative).components() {
-        match component {
-            Component::Normal(value) => {
-                path.push(value);
-                saw_component = true;
-            }
-            _ => return Err(StoreError::InvalidPath(relative.to_string())),
-        }
+    for component in validated_virtual_path_parts(relative)? {
+        path.push(component);
     }
-    if saw_component {
-        Ok(path)
-    } else {
-        Err(StoreError::InvalidPath(relative.to_string()))
-    }
+    Ok(path)
 }
 
-fn normalize_relative_path(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .components()
-        .map(|component| component.as_os_str().to_string_lossy().into_owned())
-        .collect::<Vec<String>>()
-        .join("/")
+fn validated_virtual_path_parts(path: &str) -> Result<Vec<&str>> {
+    if path.is_empty()
+        || path.contains('\n')
+        || path.contains('\t')
+        || path.contains('\\')
+        || Path::new(path).is_absolute()
+    {
+        return Err(StoreError::InvalidPath(path.to_string()));
+    }
+    let mut parts = Vec::new();
+    for component in path.split('/') {
+        if component.is_empty() || component == "." || component == ".." {
+            return Err(StoreError::InvalidPath(path.to_string()));
+        }
+        parts.push(component);
+    }
+    Ok(parts)
+}
+
+fn normalize_relative_path(root: &Path, path: &Path) -> Result<String> {
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| StoreError::InvalidSnapshotPath {
+            path: path.to_path_buf(),
+            message: "snapshot path is not under the snapshot root".to_string(),
+        })?;
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(value) => {
+                let value = value
+                    .to_str()
+                    .ok_or_else(|| StoreError::InvalidSnapshotPath {
+                        path: path.to_path_buf(),
+                        message: "snapshot path components must be valid UTF-8".to_string(),
+                    })?;
+                parts.push(value.to_string());
+            }
+            Component::CurDir
+            | Component::ParentDir
+            | Component::RootDir
+            | Component::Prefix(_) => {
+                return Err(StoreError::InvalidSnapshotPath {
+                    path: path.to_path_buf(),
+                    message: "snapshot path must be relative normal components".to_string(),
+                });
+            }
+        }
+    }
+    if parts.is_empty() {
+        return Err(StoreError::InvalidSnapshotPath {
+            path: path.to_path_buf(),
+            message: "snapshot path must not be empty".to_string(),
+        });
+    }
+    Ok(parts.join("/"))
 }
 
 #[cfg(test)]
@@ -1131,6 +1545,117 @@ mod tests {
         ChangeRef, PatchId, PatchRelation, PatchRelationKind, PromotionId, PromotionRecord,
         PropertyId, Provenance, RelationId, StateId,
     };
+
+    #[test]
+    fn workspace_path_normalization_preserves_missing_suffix_under_canonical_parent() {
+        let dir = std::env::temp_dir().join(format!(
+            "graft-store-workspace-normalize-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let parent = dir.join("existing");
+        fs::create_dir_all(&parent).unwrap();
+
+        let normalized = normalize_workspace_path(&parent.join("missing").join("workspace"));
+
+        assert_eq!(
+            normalized,
+            parent
+                .canonicalize()
+                .unwrap()
+                .join("missing")
+                .join("workspace")
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    struct FailingSerialize;
+
+    impl serde::Serialize for FailingSerialize {
+        fn serialize<S>(&self, _serializer: S) -> std::result::Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            Err(serde::ser::Error::custom(
+                "intentional serialization failure",
+            ))
+        }
+    }
+
+    #[test]
+    fn write_json_replaces_existing_file_without_temp_residue() {
+        let dir = std::env::temp_dir().join(format!(
+            "graft-store-atomic-json-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("record.json");
+        fs::write(&path, "{\"old\":true}\n").unwrap();
+
+        write_json(&path, &serde_json::json!({"new": true})).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "{\n  \"new\": true\n}\n"
+        );
+        assert!(fs::read_dir(&dir).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("graft-json")
+        }));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn store_write_parent_requires_explicit_parent() {
+        assert!(matches!(
+            store_write_parent(Path::new("record.json")),
+            Err(StoreError::InvalidStoreWritePath(_))
+        ));
+        assert_eq!(
+            store_write_parent(Path::new("./record.json")).unwrap(),
+            Path::new(".")
+        );
+        assert_eq!(
+            store_write_parent(Path::new("objects/record.json")).unwrap(),
+            Path::new("objects")
+        );
+    }
+
+    #[test]
+    fn write_json_preserves_existing_file_when_serialization_fails() {
+        let dir = std::env::temp_dir().join(format!(
+            "graft-store-atomic-json-serialize-fail-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("record.json");
+        fs::write(&path, "{\"old\":true}\n").unwrap();
+
+        let error = write_json(&path, &FailingSerialize)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("intentional serialization failure"),
+            "{error}"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{\"old\":true}\n");
+        assert!(fs::read_dir(&dir).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("graft-json")
+        }));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn init_creates_sqlite_index() {
@@ -1154,6 +1679,7 @@ mod tests {
         store.init_storage().unwrap();
 
         assert!(store.paths().index().exists());
+        assert!(store.paths().derived_worktrees().exists());
         assert!(!dir.join("graft.toml").exists());
 
         let _ = fs::remove_dir_all(&dir);
@@ -1171,8 +1697,17 @@ mod tests {
         let store = GraftStore::open(&dir);
         store.init().unwrap();
 
-        assert!(dir.join("graft.toml").exists());
-        assert!(dir.join("properties").join("ValidPatch.toml").exists());
+        let config = fs::read_to_string(dir.join("graft.toml")).unwrap();
+        assert!(config.contains("schema = 1"));
+        assert!(config.contains("[sync]"));
+        assert!(config.contains("enabled = true"));
+        assert!(!config.contains("[create]"));
+        assert!(!config.contains("default_base"));
+        assert!(!config.contains("default_mode"));
+        assert!(!dir.join("properties").exists());
+        let properties_roto = fs::read_to_string(dir.join("properties.roto")).unwrap();
+        assert!(properties_roto.contains("Graft v2 property source"));
+        assert!(properties_roto.contains("fn property_name(app: Application) -> Property"));
         assert!(!dir.join("graft.lock").exists());
 
         let _ = fs::remove_dir_all(&dir);
@@ -1195,6 +1730,250 @@ mod tests {
         let (id, _) = store.write_tree_snapshot(&snapshot).unwrap();
         assert!(id.starts_with("tree:"));
         assert_eq!(store.read_tree_snapshot(&id).unwrap(), snapshot);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_relative_path_rejects_paths_outside_root() {
+        let error =
+            normalize_relative_path(Path::new("root"), Path::new("other/file.txt")).unwrap_err();
+
+        assert!(matches!(
+            error,
+            StoreError::InvalidSnapshotPath { message, .. }
+                if message.contains("not under the snapshot root")
+        ));
+    }
+
+    #[test]
+    fn snapshot_relative_path_rejects_parent_components() {
+        let error = normalize_relative_path(Path::new("root"), Path::new("root/../escape.txt"))
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            StoreError::InvalidSnapshotPath { message, .. }
+                if message.contains("relative normal components")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_relative_path_rejects_non_utf8_components() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = Path::new("root");
+        let mut path = root.to_path_buf();
+        path.push(OsStr::from_bytes(b"bad-\xFF"));
+
+        let error = normalize_relative_path(root, &path).unwrap_err();
+
+        assert!(matches!(
+            error,
+            StoreError::InvalidSnapshotPath { message, .. }
+                if message.contains("valid UTF-8")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_entry_name_rejects_non_utf8_names_before_skip_rules() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let name = OsStr::from_bytes(b".graft-\xFF");
+        let error = snapshot_entry_name(Path::new("root/non-utf8-name"), name).unwrap_err();
+
+        assert!(matches!(
+            error,
+            StoreError::InvalidSnapshotPath { message, .. }
+                if message.contains("entry names must be valid UTF-8")
+        ));
+    }
+
+    #[test]
+    fn list_blob_objects_rejects_content_address_mismatch() {
+        let dir = std::env::temp_dir().join(format!(
+            "graft-store-blob-mismatch-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let store = GraftStore::open(&dir);
+        store.init_storage().unwrap();
+        fs::write(store.paths().object_blobs().join("deadbeef"), b"demo\n").unwrap();
+
+        let error = store.list_blob_objects().unwrap_err().to_string();
+
+        assert!(error.contains("store object id mismatch"), "{error}");
+        assert!(error.contains("expected deadbeef"), "{error}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_tree_objects_rejects_filename_that_disagrees_with_content_id() {
+        let dir = std::env::temp_dir().join(format!(
+            "graft-store-tree-mismatch-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let store = GraftStore::open(&dir);
+        store.init_storage().unwrap();
+        let snapshot = TreeSnapshot::new(Vec::new());
+        let actual = snapshot.id().unwrap();
+        write_json(
+            &store
+                .paths()
+                .object_trees()
+                .join("tree:not-the-content.json"),
+            &snapshot,
+        )
+        .unwrap();
+
+        let error = store.list_tree_objects().unwrap_err().to_string();
+
+        assert!(error.contains("store object id mismatch"), "{error}");
+        assert!(error.contains("expected tree:not-the-content"), "{error}");
+        assert!(error.contains(&actual), "{error}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn json_file_stem_rejects_non_utf8_object_names() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let path = PathBuf::from(OsString::from_vec(b"tree:\xFF.json".to_vec()));
+        let error = json_file_stem(&path).unwrap_err().to_string();
+
+        assert!(error.contains("invalid store object path"), "{error}");
+        assert!(error.contains("valid UTF-8"), "{error}");
+    }
+
+    #[test]
+    fn capture_worktree_snapshot_ignores_generated_and_internal_dirs() {
+        let dir = std::env::temp_dir().join(format!(
+            "graft-store-snapshot-worktrees-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join(".worktrees").join("patch:demo")).unwrap();
+        fs::create_dir_all(dir.join("worktrees").join("repo-a")).unwrap();
+        fs::create_dir_all(dir.join("dist")).unwrap();
+        fs::create_dir_all(dir.join("target")).unwrap();
+        fs::write(dir.join("tracked.txt"), "tracked\n").unwrap();
+        fs::write(
+            dir.join(".worktrees")
+                .join("patch:demo")
+                .join("generated.txt"),
+            "materialized\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("worktrees").join("repo-a").join("tracked.txt"),
+            "repo state\n",
+        )
+        .unwrap();
+        fs::write(dir.join("dist").join("bundle.js"), "dist\n").unwrap();
+        fs::write(dir.join("target").join("artifact"), "target\n").unwrap();
+
+        let store = GraftStore::open(&dir);
+        store.init_storage().unwrap();
+        let snapshot = store.capture_worktree_snapshot(&dir).unwrap();
+
+        assert_eq!(
+            snapshot
+                .entries
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tracked.txt"]
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn capture_target_snapshot_preserves_skipped_base_paths() {
+        let base = TreeSnapshot::new(vec![
+            TreeEntry {
+                path: "src/lib.rs".to_string(),
+                hash: "old".to_string(),
+                size: 3,
+            },
+            TreeEntry {
+                path: "worktrees/A/value.txt".to_string(),
+                hash: "repo".to_string(),
+                size: 4,
+            },
+            TreeEntry {
+                path: "graft.toml".to_string(),
+                hash: "config".to_string(),
+                size: 6,
+            },
+        ]);
+        let captured = TreeSnapshot::new(vec![TreeEntry {
+            path: "src/lib.rs".to_string(),
+            hash: "new".to_string(),
+            size: 3,
+        }]);
+        let dir = std::env::temp_dir().join(format!(
+            "graft-store-capture-target-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let store = GraftStore::open(&dir);
+
+        let target = store.capture_target_snapshot(&base, &captured);
+
+        assert_eq!(
+            target
+                .entries
+                .iter()
+                .map(|entry| (entry.path.as_str(), entry.hash.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("graft.toml", "config"),
+                ("src/lib.rs", "new"),
+                ("worktrees/A/value.txt", "repo"),
+            ]
+        );
+    }
+
+    #[test]
+    fn restore_worktree_paths_applies_snapshot_entries_and_removals() {
+        let dir = std::env::temp_dir().join(format!(
+            "graft-store-restore-paths-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(dir.join("src").join("lib.rs"), "dirty\n").unwrap();
+        fs::write(dir.join("added.txt"), "added\n").unwrap();
+        let store = GraftStore::open(&dir);
+        store.init_storage().unwrap();
+        let base_hash = store.write_blob(b"base\n").unwrap();
+        let snapshot = TreeSnapshot::new(vec![TreeEntry {
+            path: "src/lib.rs".to_string(),
+            hash: base_hash,
+            size: 5,
+        }]);
+
+        store
+            .restore_worktree_paths(
+                &snapshot,
+                &dir,
+                &["src/lib.rs".to_string(), "added.txt".to_string()],
+            )
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(dir.join("src").join("lib.rs")).unwrap(),
+            "base\n"
+        );
+        assert!(!dir.join("added.txt").exists());
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1229,7 +2008,100 @@ mod tests {
     }
 
     #[test]
-    fn virtual_read_reads_blob_by_snapshot_path() {
+    fn materialize_tree_snapshot_replaces_existing_destination_after_staging() {
+        let dir = std::env::temp_dir().join(format!(
+            "graft-store-materialize-replace-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let store = GraftStore::open(&dir);
+        store.init_storage().unwrap();
+        let hash = store.write_blob(b"new\n").unwrap();
+        let snapshot = TreeSnapshot::new(vec![TreeEntry {
+            path: "new.txt".to_string(),
+            hash,
+            size: 4,
+        }]);
+        let destination = dir.join("out");
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(destination.join("old.txt"), "old\n").unwrap();
+
+        store
+            .materialize_tree_snapshot(&snapshot, &destination)
+            .unwrap();
+
+        assert!(!destination.join("old.txt").exists());
+        assert_eq!(
+            fs::read_to_string(destination.join("new.txt")).unwrap(),
+            "new\n"
+        );
+        assert!(fs::read_dir(&dir).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("graft-backup")
+        }));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn materialize_destination_parent_requires_explicit_parent() {
+        assert!(matches!(
+            materialize_destination_parent(Path::new("out")),
+            Err(StoreError::InvalidMaterializeDestination(_))
+        ));
+        assert_eq!(
+            materialize_destination_parent(Path::new("./out")).unwrap(),
+            Path::new(".")
+        );
+        assert_eq!(
+            materialize_destination_parent(Path::new(".worktrees/out")).unwrap(),
+            Path::new(".worktrees")
+        );
+    }
+
+    #[test]
+    fn materialize_tree_snapshot_preserves_destination_when_staging_fails() {
+        let dir = std::env::temp_dir().join(format!(
+            "graft-store-materialize-fail-preserve-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let store = GraftStore::open(&dir);
+        store.init_storage().unwrap();
+        let hash = store.write_blob(b"new\n").unwrap();
+        let snapshot = TreeSnapshot::new(vec![TreeEntry {
+            path: "../escape".to_string(),
+            hash,
+            size: 4,
+        }]);
+        let destination = dir.join("out");
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(destination.join("old.txt"), "old\n").unwrap();
+
+        assert!(matches!(
+            store.materialize_tree_snapshot(&snapshot, &destination),
+            Err(StoreError::InvalidPath(_))
+        ));
+        assert_eq!(
+            fs::read_to_string(destination.join("old.txt")).unwrap(),
+            "old\n"
+        );
+        assert!(fs::read_dir(&dir).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("graft-stage")
+        }));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn virtual_read_reads_blob_by_exact_snapshot_path() {
         let dir = std::env::temp_dir().join(format!(
             "graft-store-virtual-read-test-{}",
             std::process::id()
@@ -1244,7 +2116,7 @@ mod tests {
             size: 5,
         }]);
 
-        let file = store.virtual_read(&snapshot, "src//lib.rs").unwrap();
+        let file = store.virtual_read(&snapshot, "src/lib.rs").unwrap();
 
         assert_eq!(file.path, "src/lib.rs");
         assert_eq!(file.hash, hash);
@@ -1282,6 +2154,27 @@ mod tests {
             store.virtual_read(&snapshot, "../escape"),
             Err(StoreError::InvalidPath(path)) if path == "../escape"
         ));
+        for path in [
+            "",
+            "/absolute",
+            ".",
+            "./src/lib.rs",
+            "src//lib.rs",
+            "src/",
+            "src/../lib.rs",
+            "src/./lib.rs",
+            "src\\lib.rs",
+            "line\nbreak",
+            "tab\tpath",
+        ] {
+            assert!(
+                matches!(
+                    store.virtual_read(&snapshot, path),
+                    Err(StoreError::InvalidPath(_))
+                ),
+                "path should be rejected: {path:?}"
+            );
+        }
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1353,7 +2246,7 @@ mod tests {
     }
 
     #[test]
-    fn materialization_rejects_paths_that_escape_destination() {
+    fn materialization_rejects_non_normal_snapshot_paths() {
         let dir = std::env::temp_dir().join(format!(
             "graft-store-materialize-path-test-{}",
             std::process::id()
@@ -1362,16 +2255,34 @@ mod tests {
         let store = GraftStore::open(&dir);
         store.init_storage().unwrap();
         let hash = store.write_blob(b"demo\n").unwrap();
-        let snapshot = TreeSnapshot::new(vec![TreeEntry {
-            path: "../escape".to_string(),
-            hash,
-            size: 5,
-        }]);
+        for path in [
+            "",
+            "/absolute",
+            ".",
+            "./file.txt",
+            "dir//file.txt",
+            "dir/",
+            "../escape",
+            "dir/../escape",
+            "dir/./file.txt",
+            "dir\\file.txt",
+            "line\nbreak",
+            "tab\tpath",
+        ] {
+            let snapshot = TreeSnapshot::new(vec![TreeEntry {
+                path: path.to_string(),
+                hash: hash.clone(),
+                size: 5,
+            }]);
 
-        assert!(matches!(
-            store.materialize_tree_snapshot(&snapshot, dir.join("out")),
-            Err(StoreError::InvalidPath(_))
-        ));
+            assert!(
+                matches!(
+                    store.materialize_tree_snapshot(&snapshot, dir.join("out")),
+                    Err(StoreError::InvalidPath(_))
+                ),
+                "path should be rejected: {path:?}"
+            );
+        }
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1409,7 +2320,7 @@ mod tests {
     }
 
     #[test]
-    fn copies_candidate_evidence_index_to_patch_without_rewriting_evidence() {
+    fn copies_candidate_evidence_index_to_patch_with_patch_subjects() {
         let dir = std::env::temp_dir().join(format!(
             "graft-store-evidence-index-test-{}",
             std::process::id()
@@ -1419,29 +2330,185 @@ mod tests {
         store.init_storage().unwrap();
 
         let property = PropertyId::new("property:indexcopy");
-        let evidence = EvidenceRecord::passed("candidate:demo", property, "test-verifier").unwrap();
-        let evidence_id = evidence.id.to_string();
+        let evidence =
+            EvidenceRecord::passed("candidate:demo@workspace", property, "test-verifier").unwrap();
+        let old_evidence_id = evidence.id.to_string();
         store.write_evidence(&evidence).unwrap();
         store
-            .append_candidate_evidence_index("candidate:demo", &evidence_id)
+            .append_candidate_evidence_index("candidate:demo", &old_evidence_id)
             .unwrap();
 
         let copied = store
             .copy_candidate_evidence_index_to_patch("candidate:demo", "patch:demo")
             .unwrap();
 
-        assert_eq!(copied, vec![evidence_id.clone()]);
+        assert_ne!(copied, vec![old_evidence_id]);
         assert_eq!(store.patch_evidence_index("patch:demo").unwrap(), copied);
+        let patch_evidence = store.patch_evidence_records("patch:demo").unwrap();
+        assert_eq!(patch_evidence[0].subject, "patch:demo@workspace");
         assert_eq!(
-            store.patch_evidence_records("patch:demo").unwrap(),
-            vec![evidence]
+            patch_evidence[0].property,
+            PropertyId::new("property:indexcopy")
         );
         assert_eq!(
             read_json_records::<EvidenceRecord>(&store.paths().object_evidence())
                 .unwrap()
                 .len(),
-            1
+            2
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn evidence_body_is_not_authoritative_without_owner_refs() {
+        let dir = std::env::temp_dir().join(format!(
+            "graft-store-evidence-ref-authority-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let store = GraftStore::open(&dir);
+        store.init_storage().unwrap();
+
+        let candidate_evidence = EvidenceRecord::passed(
+            "candidate:demo",
+            PropertyId::new("property:candidate"),
+            "test",
+        )
+        .unwrap();
+        let patch_evidence =
+            EvidenceRecord::passed("patch:demo", PropertyId::new("property:patch"), "test")
+                .unwrap();
+        let candidate_evidence_id = candidate_evidence.id.to_string();
+        let patch_evidence_id = patch_evidence.id.to_string();
+        store.write_evidence(&candidate_evidence).unwrap();
+        store.write_evidence(&patch_evidence).unwrap();
+
+        assert_eq!(
+            store.cached_evidence_for_subject("candidate:demo").unwrap(),
+            Vec::<EvidenceRecord>::new()
+        );
+        assert_eq!(
+            store.registry_evidence_for_subject("patch:demo").unwrap(),
+            Vec::<EvidenceRecord>::new()
+        );
+        assert_eq!(
+            store.list_registry_evidence().unwrap(),
+            Vec::<EvidenceRecord>::new()
+        );
+
+        store
+            .append_candidate_evidence_index("candidate:demo", &candidate_evidence_id)
+            .unwrap();
+        store
+            .append_patch_evidence_index("patch:demo", &patch_evidence_id)
+            .unwrap();
+
+        assert_eq!(
+            store.cached_evidence_for_subject("candidate:demo").unwrap(),
+            vec![candidate_evidence]
+        );
+        assert_eq!(
+            store.registry_evidence_for_subject("patch:demo").unwrap(),
+            vec![patch_evidence.clone()]
+        );
+        assert_eq!(
+            store.list_registry_evidence().unwrap(),
+            vec![patch_evidence]
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn evidence_index_rejects_legacy_array_format() {
+        let dir = std::env::temp_dir().join(format!(
+            "graft-store-evidence-index-legacy-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let store = GraftStore::open(&dir);
+        store.init_storage().unwrap();
+        fs::write(
+            store
+                .paths()
+                .object_patch_evidence_index()
+                .join("patch:legacy.json"),
+            r#"["ev:one","ev:two"]"#,
+        )
+        .unwrap();
+
+        let error = store
+            .patch_evidence_index("patch:legacy")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("invalid evidence index"), "{error}");
+        assert!(
+            error.contains("expected evidence refs object with owner and evidence fields"),
+            "{error}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn evidence_index_rejects_non_schema_json() {
+        let dir = std::env::temp_dir().join(format!(
+            "graft-store-evidence-index-scalar-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let store = GraftStore::open(&dir);
+        store.init_storage().unwrap();
+        fs::write(
+            store
+                .paths()
+                .object_patch_evidence_index()
+                .join("patch:scalar.json"),
+            r#""ev:fake""#,
+        )
+        .unwrap();
+
+        let error = store
+            .patch_evidence_index("patch:scalar")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("invalid evidence index"), "{error}");
+        assert!(
+            error.contains("expected evidence refs object with owner and evidence fields"),
+            "{error}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn evidence_index_rejects_owner_mismatch() {
+        let dir = std::env::temp_dir().join(format!(
+            "graft-store-evidence-index-owner-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let store = GraftStore::open(&dir);
+        store.init_storage().unwrap();
+        fs::write(
+            store
+                .paths()
+                .object_patch_evidence_index()
+                .join("patch:actual.json"),
+            r#"{"owner":"patch:other","evidence":["ev:one"],"updated_at":null}"#,
+        )
+        .unwrap();
+
+        let error = store
+            .patch_evidence_index("patch:actual")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("invalid evidence index"), "{error}");
+        assert!(error.contains("owner `patch:other`"), "{error}");
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -1,9 +1,11 @@
+pub mod wire;
+
 use std::collections::HashMap;
 use std::sync::Mutex;
 
 use graft_core::{
     CanonicalScratchOp, ChangeSet, FileViewHash, FileViewHashSeed, GraftCandidate, HashlineEdit,
-    PropertyRef, ScratchId, ScratchNode, StateId, TreeEntry, TreeSnapshot, candidate_id,
+    ScopedPropertyRef, ScratchId, ScratchNode, StateId, TreeEntry, TreeSnapshot, candidate_id,
     file_view_hash, scratch_id,
 };
 use graft_store::{GraftStore, StoreError, VirtualBaseRef, VirtualFile};
@@ -18,9 +20,9 @@ pub enum ScratchError {
     Core(#[from] graft_core::CoreError),
     #[error("scratch not found: {0}")]
     UnknownScratch(String),
-    #[error("scratch state was lost; reopen from base: {0}")]
+    #[error("scratch state was lost; retry with --base: {0}")]
     ScratchLost(String),
-    #[error("scratch has no changes to promote")]
+    #[error("scratch has no changes to turn into a candidate")]
     EmptyChange,
     #[error("path is not valid utf-8 text: {path}")]
     BinaryFile { path: String },
@@ -80,11 +82,29 @@ pub struct ScratchEdit {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ScratchPromotion {
+pub struct ScratchDelete {
+    pub parent: ScratchId,
+    pub scratch: ScratchId,
+    pub path: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScratchCapture {
+    pub scratch: ScratchId,
+    pub base_tree: String,
+    pub target_tree: String,
+    pub changed_paths: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CandidateFromScratch {
     pub scratch: ScratchId,
     pub candidate: graft_core::CandidateId,
     pub changed_paths: Vec<String>,
 }
+
+#[deprecated(note = "use CandidateFromScratch")]
+pub type ScratchPromotion = CandidateFromScratch;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScratchDiff {
@@ -126,6 +146,15 @@ impl ScratchEngine {
     pub fn open(&self, base: VirtualBaseRef) -> Result<ScratchId> {
         let base_tree = self.store.virtual_tree(&base)?;
         let base_state = base_state_for_ref(&self.store, &base)?;
+        self.open_resolved(base_state, base_tree)
+    }
+
+    pub fn open_materialized(&self, base_state: StateId, tree_id: &str) -> Result<ScratchId> {
+        let base_tree = self.store.read_tree_snapshot(tree_id)?;
+        self.open_resolved(base_state, base_tree)
+    }
+
+    fn open_resolved(&self, base_state: StateId, base_tree: TreeSnapshot) -> Result<ScratchId> {
         let tree_id = base_tree.id()?;
         let node = ScratchNode::root(base_state, tree_id);
         let id = scratch_id(&node)?;
@@ -248,6 +277,77 @@ impl ScratchEngine {
         })
     }
 
+    pub fn delete(&self, scratch: &ScratchId, path: &str) -> Result<ScratchDelete> {
+        let parent = self.state(scratch)?;
+        let (tree, removed) = remove_entry(&parent.tree, path)?;
+        let tree_id = tree.id()?;
+        self.store.write_tree_snapshot(&tree)?;
+        let node = ScratchNode::child(
+            scratch.clone(),
+            parent.node.base_state.clone(),
+            CanonicalScratchOp::Delete {
+                path: removed.path.clone(),
+            },
+            tree_id,
+        );
+        let id = scratch_id(&node)?;
+        self.states.lock().expect("scratch state poisoned").insert(
+            id.clone(),
+            ScratchState {
+                node,
+                base_tree: parent.base_tree,
+                tree,
+            },
+        );
+        Ok(ScratchDelete {
+            parent: scratch.clone(),
+            scratch: id,
+            path: removed.path,
+        })
+    }
+
+    pub fn capture_tree(
+        &self,
+        base_state: StateId,
+        base_tree_id: &str,
+        target_tree_id: &str,
+    ) -> Result<ScratchCapture> {
+        let base_tree = self.store.read_tree_snapshot(base_tree_id)?;
+        let target_tree = self.store.read_tree_snapshot(target_tree_id)?;
+        let change = ChangeSet::from_snapshots(
+            base_state.clone(),
+            Some(&base_tree),
+            StateId::GraftTree(target_tree_id.to_string()),
+            &target_tree,
+        );
+        let changed_paths = change
+            .files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>();
+        if changed_paths.is_empty() {
+            return Err(ScratchError::EmptyChange);
+        }
+
+        let node = ScratchNode::root(base_state, target_tree_id.to_string());
+        let id = scratch_id(&node)?;
+        self.states.lock().expect("scratch state poisoned").insert(
+            id.clone(),
+            ScratchState {
+                node,
+                base_tree,
+                tree: target_tree,
+            },
+        );
+
+        Ok(ScratchCapture {
+            scratch: id,
+            base_tree: base_tree_id.to_string(),
+            target_tree: target_tree_id.to_string(),
+            changed_paths,
+        })
+    }
+
     pub fn diff(&self, from: &ScratchId, to: &ScratchId) -> Result<ScratchDiff> {
         let from_state = self.state(from)?;
         let to_state = self.state(to)?;
@@ -307,13 +407,13 @@ impl ScratchEngine {
             .ok_or_else(|| ScratchError::UnknownScratch(scratch.to_string()))
     }
 
-    pub fn promote(
+    pub fn candidate_from_scratch(
         &self,
         scratch: &ScratchId,
-        expected: Vec<PropertyRef>,
+        expected: Vec<ScopedPropertyRef>,
         producer: impl Into<String>,
         message: Option<String>,
-    ) -> Result<ScratchPromotion> {
+    ) -> Result<CandidateFromScratch> {
         let state = self.state(scratch)?;
         let target_tree_id = state.tree.id()?;
         self.store.write_tree_snapshot(&state.tree)?;
@@ -328,9 +428,6 @@ impl ScratchEngine {
             .iter()
             .map(|file| file.path.clone())
             .collect::<Vec<_>>();
-        if changed_paths.is_empty() {
-            return Err(ScratchError::EmptyChange);
-        }
         let (change_id, _) = self.store.write_change(&change)?;
         let mut candidate = GraftCandidate {
             id: graft_core::CandidateId::new("candidate:pending"),
@@ -344,11 +441,26 @@ impl ScratchEngine {
         self.store.write_candidate(&candidate)?;
         self.store
             .write_candidate_evidence_index(candidate.id.as_str(), &[])?;
-        Ok(ScratchPromotion {
+        Ok(CandidateFromScratch {
             scratch: scratch.clone(),
             candidate: candidate.id,
             changed_paths,
         })
+    }
+
+    #[deprecated(note = "use candidate_from_scratch")]
+    pub fn promote(
+        &self,
+        scratch: &ScratchId,
+        expected: Vec<ScopedPropertyRef>,
+        producer: impl Into<String>,
+        message: Option<String>,
+    ) -> Result<CandidateFromScratch> {
+        self.candidate_from_scratch(scratch, expected, producer, message)
+    }
+
+    pub fn store(&self) -> &GraftStore {
+        &self.store
     }
 
     fn state(&self, scratch: &ScratchId) -> Result<ScratchState> {
@@ -385,6 +497,11 @@ pub fn line_hash(line_number: usize, line: &str) -> String {
 
 fn base_state_for_ref(store: &GraftStore, base: &VirtualBaseRef) -> Result<StateId> {
     match base {
+        VirtualBaseRef::Empty => {
+            let empty = TreeSnapshot::new(Vec::new());
+            let (tree_id, _) = store.write_tree_snapshot(&empty)?;
+            Ok(StateId::GraftTree(tree_id))
+        }
         VirtualBaseRef::Tree(id) => Ok(StateId::GraftTree(id.clone())),
         VirtualBaseRef::Candidate(id) => Ok(store.read_candidate(id.as_str())?.target_state),
         VirtualBaseRef::Patch(id) => Ok(store.read_patch(id.as_str())?.target_state),
@@ -420,6 +537,36 @@ fn upsert_entry(snapshot: &TreeSnapshot, entry: TreeEntry) -> TreeSnapshot {
         .collect::<Vec<_>>();
     entries.push(entry);
     TreeSnapshot::new(entries)
+}
+
+fn remove_entry(snapshot: &TreeSnapshot, path: &str) -> Result<(TreeSnapshot, TreeEntry)> {
+    let path = normalize_path(path)?;
+    let mut removed = None;
+    let mut entries = Vec::with_capacity(snapshot.entries.len().saturating_sub(1));
+    for entry in &snapshot.entries {
+        if entry.path == path {
+            removed = Some(entry.clone());
+        } else {
+            entries.push(entry.clone());
+        }
+    }
+
+    if let Some(removed) = removed {
+        return Ok((TreeSnapshot::new(entries), removed));
+    }
+
+    let prefix = format!("{path}/");
+    if snapshot
+        .entries
+        .iter()
+        .any(|entry| entry.path.starts_with(&prefix))
+    {
+        return Err(ScratchError::Store(StoreError::VirtualPathIsDirectory(
+            path,
+        )));
+    }
+
+    Err(ScratchError::Store(StoreError::VirtualPathNotFound(path)))
 }
 
 fn logical_lines(text: &str) -> Vec<String> {
@@ -669,7 +816,10 @@ fn text_matches(haystack: &str, needle: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use graft_core::{PropertyId, TreeEntry, TreeSnapshot};
+    use graft_core::{
+        FileChangeKind, PropertyId, PropertyRef, PropertyScope, ScopedPropertyRef, TreeEntry,
+        TreeSnapshot,
+    };
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("graft-scratch-{name}-{}", std::process::id()));
@@ -802,6 +952,55 @@ mod tests {
     }
 
     #[test]
+    fn delete_creates_new_scratch_and_diff_reports_deleted_path() {
+        let (dir, engine, tree_id) = seeded_engine("delete");
+        let root = engine.open(VirtualBaseRef::Tree(tree_id)).unwrap();
+        let delete = engine.delete(&root, "src/lib.rs").unwrap();
+
+        assert_eq!(delete.parent, root);
+        assert_ne!(delete.parent, delete.scratch);
+        assert_eq!(delete.path, "src/lib.rs");
+        let deleted_state = engine.state(&delete.scratch).unwrap();
+        assert!(matches!(
+            deleted_state.node.op,
+            Some(CanonicalScratchOp::Delete { path }) if path == "src/lib.rs"
+        ));
+        assert!(
+            deleted_state
+                .tree
+                .entries
+                .iter()
+                .all(|entry| entry.path != "src/lib.rs")
+        );
+        assert!(matches!(
+            engine
+                .read(&delete.scratch, "src/lib.rs", ReadMode::Text)
+                .unwrap_err(),
+            ScratchError::Store(graft_store::StoreError::VirtualPathNotFound(path))
+                if path == "src/lib.rs"
+        ));
+        let diff = engine.diff(&root, &delete.scratch).unwrap();
+        assert_eq!(diff.changed_paths, vec!["src/lib.rs".to_string()]);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn delete_missing_path_fails_loudly() {
+        let (dir, engine, tree_id) = seeded_engine("delete_missing");
+        let root = engine.open(VirtualBaseRef::Tree(tree_id)).unwrap();
+        let err = engine.delete(&root, "missing.rs").unwrap_err();
+
+        assert!(matches!(
+            err,
+            ScratchError::Store(graft_store::StoreError::VirtualPathNotFound(path))
+                if path == "missing.rs"
+        ));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn edit_replace_line_checks_hash_and_returns_new_scratch() {
         let (dir, engine, tree_id) = seeded_engine("edit");
         let root = engine.open(VirtualBaseRef::Tree(tree_id)).unwrap();
@@ -870,7 +1069,7 @@ mod tests {
     }
 
     #[test]
-    fn promote_write_back_to_original_empty_diff_returns_empty_change() {
+    fn candidate_from_scratch_allows_empty_diff() {
         let (dir, engine, tree_id) = seeded_engine("empty_change");
         let root = engine.open(VirtualBaseRef::Tree(tree_id)).unwrap();
         let write = engine
@@ -880,8 +1079,89 @@ mod tests {
                 b"pub fn hello() {\n    println!(\"hello\");\n}\n",
             )
             .unwrap();
+        let result = engine
+            .candidate_from_scratch(&write.scratch, Vec::new(), "test", None)
+            .unwrap();
+
+        assert!(result.changed_paths.is_empty());
+        assert!(result.candidate.as_str().starts_with("candidate:"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn capture_tree_creates_root_scratch_for_snapshot_diff() {
+        let dir = temp_dir("capture_tree");
+        let store = GraftStore::open(&dir);
+        store.init().unwrap();
+        let readme_hash = store.write_blob(b"# demo\n").unwrap();
+        let old_lib_hash = store.write_blob(b"old\n").unwrap();
+        let new_lib_hash = store.write_blob(b"new\n").unwrap();
+        let main_hash = store.write_blob(b"fn main() {}\n").unwrap();
+        let base = TreeSnapshot::new(vec![
+            TreeEntry {
+                path: "README.md".to_string(),
+                hash: readme_hash,
+                size: 7,
+            },
+            TreeEntry {
+                path: "src/lib.rs".to_string(),
+                hash: old_lib_hash,
+                size: 4,
+            },
+        ]);
+        let target = TreeSnapshot::new(vec![
+            TreeEntry {
+                path: "src/lib.rs".to_string(),
+                hash: new_lib_hash,
+                size: 4,
+            },
+            TreeEntry {
+                path: "src/main.rs".to_string(),
+                hash: main_hash,
+                size: 13,
+            },
+        ]);
+        let (base_tree, _) = store.write_tree_snapshot(&base).unwrap();
+        let (target_tree, _) = store.write_tree_snapshot(&target).unwrap();
+        let engine = ScratchEngine::new(store);
+
+        let capture = engine
+            .capture_tree(
+                StateId::GraftTree(base_tree.clone()),
+                &base_tree,
+                &target_tree,
+            )
+            .unwrap();
+
+        assert!(capture.scratch.as_str().starts_with("scratch:"));
+        assert_eq!(capture.base_tree, base_tree);
+        assert_eq!(capture.target_tree, target_tree);
+        assert_eq!(
+            capture.changed_paths,
+            vec![
+                "README.md".to_string(),
+                "src/lib.rs".to_string(),
+                "src/main.rs".to_string(),
+            ]
+        );
+        assert_eq!(
+            engine
+                .read(&capture.scratch, "src/lib.rs", ReadMode::Text)
+                .unwrap()
+                .content,
+            "new\n"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn capture_tree_rejects_empty_diff() {
+        let (dir, engine, tree_id) = seeded_engine("capture_empty");
+
         let err = engine
-            .promote(&write.scratch, Vec::new(), "test", None)
+            .capture_tree(StateId::GraftTree(tree_id.clone()), &tree_id, &tree_id)
             .unwrap_err();
 
         assert!(matches!(err, ScratchError::EmptyChange));
@@ -904,31 +1184,96 @@ mod tests {
     }
 
     #[test]
-    fn promote_writes_candidate_and_change() {
-        let (dir, engine, tree_id) = seeded_engine("promote");
+    fn candidate_from_scratch_writes_candidate_change_and_empty_evidence_index() {
+        let dir = temp_dir("candidate_from_scratch");
+        let store = GraftStore::open(&dir);
+        store.init().unwrap();
+        let lib_hash = store.write_blob(b"pub fn hello() {}\n").unwrap();
+        let readme_hash = store.write_blob(b"# demo\n").unwrap();
+        let snapshot = TreeSnapshot::new(vec![
+            TreeEntry {
+                path: "README.md".to_string(),
+                hash: readme_hash,
+                size: 7,
+            },
+            TreeEntry {
+                path: "src/lib.rs".to_string(),
+                hash: lib_hash,
+                size: 18,
+            },
+        ]);
+        let (tree_id, _) = store.write_tree_snapshot(&snapshot).unwrap();
+        let engine = ScratchEngine::new(store);
         let root = engine.open(VirtualBaseRef::Tree(tree_id)).unwrap();
-        let write = engine
-            .write(&root, "src/main.rs", b"fn main() {}\n")
+        let modified = engine
+            .write(
+                &root,
+                "src/lib.rs",
+                b"pub fn hello() { println!(\"hi\"); }\n",
+            )
             .unwrap();
-        let promotion = engine
-            .promote(
-                &write.scratch,
-                vec![PropertyRef::new(
-                    PropertyId::new("property:valid-patch"),
-                    "ValidPatch",
+        let added = engine
+            .write(&modified.scratch, "src/main.rs", b"fn main() {}\n")
+            .unwrap();
+        let deleted = engine.delete(&added.scratch, "README.md").unwrap();
+        let result = engine
+            .candidate_from_scratch(
+                &deleted.scratch,
+                vec![ScopedPropertyRef::new(
+                    PropertyScope::Workspace,
+                    PropertyRef::new(PropertyId::new("property:review-policy"), "ReviewPolicy"),
                 )],
                 "test",
                 Some("demo".to_string()),
             )
             .unwrap();
 
-        assert_eq!(promotion.scratch, write.scratch);
-        assert!(promotion.candidate.as_str().starts_with("candidate:"));
+        assert_eq!(result.scratch, deleted.scratch);
+        assert!(result.candidate.as_str().starts_with("candidate:"));
+        assert_eq!(
+            result.changed_paths,
+            vec![
+                "README.md".to_string(),
+                "src/lib.rs".to_string(),
+                "src/main.rs".to_string(),
+            ]
+        );
+
+        let candidate = engine
+            .store
+            .read_candidate(result.candidate.as_str())
+            .unwrap();
+        let change_id = match candidate.change {
+            graft_core::ChangeRef::Stored(id) => id,
+            graft_core::ChangeRef::InlineSummary(_) => {
+                panic!("candidate_from_scratch must store change")
+            }
+        };
+        let change = engine.store.read_change(change_id.as_str()).unwrap();
         assert!(
-            promotion
-                .changed_paths
+            change
+                .files
                 .iter()
-                .any(|path| path == "src/main.rs")
+                .any(|file| { file.path == "README.md" && file.kind == FileChangeKind::Deleted })
+        );
+        assert!(
+            change
+                .files
+                .iter()
+                .any(|file| { file.path == "src/lib.rs" && file.kind == FileChangeKind::Modified })
+        );
+        assert!(
+            change
+                .files
+                .iter()
+                .any(|file| { file.path == "src/main.rs" && file.kind == FileChangeKind::Added })
+        );
+        assert_eq!(
+            engine
+                .store
+                .candidate_evidence_index(result.candidate.as_str())
+                .unwrap(),
+            Vec::<String>::new()
         );
 
         let _ = std::fs::remove_dir_all(dir);

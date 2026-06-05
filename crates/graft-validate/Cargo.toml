@@ -10,3 +10,6 @@ license.workspace = true
 [dependencies]
 graft-core = { path = "../graft-core" }
 thiserror.workspace = true
+
+[dev-dependencies]
+roto = "0.11.0"

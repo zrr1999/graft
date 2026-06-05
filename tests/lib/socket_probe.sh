@@ -1,6 +1,6 @@
 # shellcheck shell=bash
 
-skip_if_local_socket_bind_unavailable() {
+require_local_socket_bind_available() {
   local socket_path="$1"
   local probe_out
   local probe_status
@@ -31,8 +31,8 @@ try:
     sock.listen(1)
 except OSError as err:
     if err.errno in unsupported:
-        print(f"SKIP: local socket bind not permitted in this environment: {err}")
-        sys.exit(77)
+        print(f"ERROR: local socket bind not permitted in this environment: {err}")
+        sys.exit(1)
     raise
 finally:
     if sock is not None:
@@ -46,10 +46,6 @@ PY
   probe_status=$?
   set -e
 
-  if [[ $probe_status -eq 77 ]]; then
-    echo "$probe_out"
-    exit 0
-  fi
   if [[ $probe_status -ne 0 ]]; then
     echo "$probe_out"
     exit "$probe_status"

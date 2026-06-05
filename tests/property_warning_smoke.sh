@@ -2,27 +2,34 @@
 # tests/property_warning_smoke.sh
 #
 # Verifies that `graft search`/`graft candidates`/`graft cache search` emit a
-# warning to stderr when --property names something that is neither declared
-# in graft-properties.toml nor a builtin verifier id, but stay silent when --property
-# matches either of those. Backs the @builtin-property-metadata task.
+# warning to stderr when --property names something that is not declared in
+# properties.roto. Builtin evaluator ids are not property aliases.
 
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-cargo build -p graft-cli -p graft-daemon >/dev/null 2>&1
-GRAFT_BIN="$PWD/target/debug/graft"
-GRAFTD_BIN="$PWD/target/debug/graftd"
+source tests/lib/smoke.sh
 
-WORKDIR="$(mktemp -d)"
-cleanup() {
-  find "$WORKDIR" -path '*/.graft/run/daemon.sock' -type s -exec "$GRAFTD_BIN" stop --socket {} \; >/dev/null 2>&1 || true
-  rm -rf "$WORKDIR"
-}
-trap cleanup EXIT
+setup_bins
+setup_workspace
+trap cleanup_workspace EXIT
 
 cd "$WORKDIR"
 "$GRAFT_BIN" init >/dev/null
+write_properties_roto <<'ROTO'
+fn empty_change(app: Application) -> Property {
+    property(
+        [
+            app.changed_paths().any_match(["**"]).failure(),
+        ],
+        "the change touches no paths",
+        Severity.Blocking,
+        [],
+    )
+}
+ROTO
+lock_properties
 
 expect_warn() {
   local desc="$1"; shift
@@ -57,14 +64,14 @@ expect_warn "search/unknown"        search --property TestsPass
 expect_warn "candidates/unknown"        candidates --property TestsPass
 expect_warn "cache-search/unknown"  cache search --property TestsPass
 
-# Declared property (in graft-properties.toml shipped with `graft init`): no warning.
-expect_silent "search/declared"        search --property ValidPatch
-expect_silent "candidates/declared"        candidates --property ValidPatch
-expect_silent "cache-search/declared"  cache search --property ValidPatch
+# Declared property: no warning.
+expect_silent "search/declared"        search --property empty_change
+expect_silent "candidates/declared"        candidates --property empty_change
+expect_silent "cache-search/declared"  cache search --property empty_change
 
-# Builtin id (lowercase check name): no warning.
-expect_silent "search/builtin-id"        search --property valid_patch
-expect_silent "candidates/builtin-id"        candidates --property valid_patch
-expect_silent "cache-search/builtin-id"  cache search --property valid_patch
+# Builtin evaluator id is not a property alias: warn.
+expect_warn "search/builtin-evaluator-id"        search --property changed_paths_any_match
+expect_warn "candidates/builtin-evaluator-id"        candidates --property changed_paths_any_match
+expect_warn "cache-search/builtin-evaluator-id"  cache search --property changed_paths_any_match
 
-echo "OK: property warnings fire only for unknown names; declared and builtin ids stay silent."
+echo "OK: property warnings fire for unknown names and builtin evaluator ids; declared properties stay silent."

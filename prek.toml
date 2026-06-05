@@ -55,7 +55,7 @@ hooks = [
   {
     id = "cargo-clippy",
     name = "cargo-clippy",
-    entry = "cargo clippy --all-targets -- -D warnings",
+    entry = "cargo clippy --locked --workspace --all-targets -- -D warnings",
     language = "system",
     types = ["rust"],
     pass_filenames = false

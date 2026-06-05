@@ -1,0 +1,19 @@
+// Pattern: path policy with positive (whitelist) match.
+//
+// Every changed path must match one of the listed glob patterns. Useful as
+// a fast gate for docs-only patches that should bypass heavier verifiers.
+
+fn only_touches_docs(app: Application) -> Property {
+    property(
+        [
+            app.changed_paths().all_match([
+                "README.md",
+                "docs/**",
+                "**/*.md",
+            ]).success(),
+        ],
+        "patch only touches documentation files",
+        Severity.Blocking,
+        [],
+    )
+}

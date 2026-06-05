@@ -1,23 +1,18 @@
 #!/usr/bin/env bash
 # tests/repo_clone_smoke.sh
 #
-# Verifies project-level [repos] config, graft repo add/sync, and
-# repo:<repo_id>@<treeish> base resolution for candidate creation.
+# Verifies project-level [repos] config, graft repo add/sync/lock/update,
+# plus the current scratch -> candidate lifecycle used for candidate creation.
 
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-cargo build -p graft-cli -p graft-daemon >/dev/null 2>&1
-GRAFT_BIN="$PWD/target/debug/graft"
-GRAFTD_BIN="$PWD/target/debug/graftd"
+source tests/lib/smoke.sh
 
-WORKDIR="$(mktemp -d)"
-cleanup() {
-  find "$WORKDIR" -path '*/.graft/run/daemon.sock' -type s -exec "$GRAFTD_BIN" stop --socket {} \; >/dev/null 2>&1 || true
-  rm -rf "$WORKDIR"
-}
-trap cleanup EXIT
+setup_bins
+setup_workspace
+trap cleanup_workspace EXIT
 SOURCE="$WORKDIR/source"
 PROJECT="$WORKDIR/project"
 mkdir -p "$SOURCE" "$PROJECT"
@@ -33,88 +28,100 @@ base_tree=$(git -C "$SOURCE" rev-parse 'HEAD^{tree}')
 
 cd "$PROJECT"
 "$GRAFT_BIN" init >/dev/null
-"$GRAFT_BIN" repo add demo "$SOURCE" --default-branch main >/dev/null
+repo_add_help=$("$GRAFT_BIN" repo add --help)
+if grep -q -- '--path' <<<"$repo_add_help"; then
+  echo "FAIL: repo add still exposes --path"
+  echo "$repo_add_help"; exit 1
+fi
 
-list_before=$("$GRAFT_BIN" repo list)
-if ! grep -q $'demo\tmissing' <<<"$list_before"; then
-  echo "FAIL: repo list did not report missing demo repo"
-  echo "$list_before"; exit 1
+add=$("$GRAFT_BIN" repo add demo "$SOURCE")
+if ! grep -q "$base_tree" <<<"$add"; then
+  echo "FAIL: repo add did not auto-lock the source base tree"
+  echo "$add"; exit 1
+fi
+if ! grep -q 'default_branch = "main"' graft.toml; then
+  echo "FAIL: repo add did not record the remote default branch"
+  cat graft.toml; exit 1
+fi
+if ! grep -Fq "url = \"$SOURCE\"" graft.lock; then
+  echo "FAIL: repo add did not record the repo url in graft.lock"
+  cat graft.lock; exit 1
+fi
+if [[ -e demo ]]; then
+  echo "FAIL: repo add created a top-level demo checkout"
+  ls -la; exit 1
+fi
+
+list_after_add=$("$GRAFT_BIN" repo list)
+if ! grep -q $'demo\tpresent' <<<"$list_after_add"; then
+  echo "FAIL: repo list did not report present demo repo after auto-lock"
+  echo "$list_after_add"; exit 1
+fi
+if ! grep -q '.graft/repos/demo' <<<"$list_after_add"; then
+  echo "FAIL: repo list did not use the default Graft repo cache"
+  echo "$list_after_add"; exit 1
 fi
 
 sync=$("$GRAFT_BIN" repo sync demo)
-if ! grep -q $'demo\tcloned' <<<"$sync"; then
-  echo "FAIL: repo sync did not clone demo repo"
+if ! grep -q $'demo\tsynced' <<<"$sync"; then
+  echo "FAIL: repo sync did not fetch the existing managed repo cache"
   echo "$sync"; exit 1
 fi
 
+lock=$("$GRAFT_BIN" repo lock demo)
+if ! grep -q "$base_tree" <<<"$lock"; then
+  echo "FAIL: explicit repo lock did not preserve the source base tree"
+  echo "$lock"; exit 1
+fi
+
+repo_read=$("$GRAFT_BIN" scratch read --repo demo --base main README.md --mode text)
+if ! grep -q 'demo' <<<"$repo_read"; then
+  echo "FAIL: scratch read --repo demo --base main did not read the locked repo tree"
+  echo "$repo_read"; exit 1
+fi
+
+repo_write=$("$GRAFT_BIN" scratch write --repo demo --base main README.md --content $'demo changed\n')
+repo_scratch=$(grep -oE 'scratch:[0-9a-f]+' <<<"$repo_write" | tail -n1)
+[[ -n $repo_scratch ]] || { echo "FAIL: scratch write --repo demo did not return scratch id"; echo "$repo_write"; exit 1; }
+repo_candidate_out=$("$GRAFT_BIN" candidate from-scratch "$repo_scratch" --message repo-base-context)
+repo_candidate=$(grep -oE 'candidate:[0-9a-f]+' <<<"$repo_candidate_out" | head -n1)
+[[ -n $repo_candidate ]] || { echo "FAIL: scratch --repo base-context did not become a candidate"; echo "$repo_candidate_out"; exit 1; }
+repo_validate=$("$GRAFT_BIN" validate "$repo_candidate")
+grep -q 'validation completed' <<<"$repo_validate" || { echo "FAIL: scratch --repo base-context candidate did not validate"; echo "$repo_validate"; exit 1; }
+
 mkdir -p src
 printf 'changed\n' > src/new.txt
-create=$("$GRAFT_BIN" create --from repo:demo@main --expect ValidPatch --message repo-base)
+scratch_out=$("$GRAFT_BIN" scratch write --base graft:empty src/new.txt --content $'changed\n')
+scratch=$(grep -oE 'scratch:[0-9a-f]+' <<<"$scratch_out" | tail -n1)
+[[ -n $scratch ]] || { echo "FAIL: no scratch id captured"; echo "$scratch_out"; exit 1; }
+create=$("$GRAFT_BIN" candidate from-scratch "$scratch" --message repo-smoke-candidate)
 candidate=$(grep -oE 'candidate:[0-9a-f]+' <<<"$create" | head -n1)
 [[ -n $candidate ]] || { echo "FAIL: no candidate id captured"; echo "$create"; exit 1; }
-if ! grep -q 'repo:demo@main#' <<<"$create"; then
-  echo "FAIL: create output did not show repo-aware base"
-  echo "$create"; exit 1
-fi
-if grep -q '.graft/repos' <<<"$create"; then
-  echo "FAIL: .graft repos cache leaked into captured change summary"
-  echo "$create"; exit 1
-fi
 
-python3 - "$PROJECT" "$candidate" "$base_tree" <<'PY'
-import json, pathlib, sys
-project, candidate, expected_tree = sys.argv[1:]
-root = pathlib.Path(project)
-record = json.loads((root / ".graft/store/private/candidate" / f"{candidate}.json").read_text())
-base = record["base_state"]
-assert base["kind"] == "repo_tree", base
-value = base["value"]
-assert value["repo_id"] == "demo", value
-assert value["treeish"] == "main", value
-assert value["resolved_tree_oid"] == expected_tree, value
-PY
-
-validate=$("$GRAFT_BIN" validate "$candidate" --expect ValidPatch --json)
+validate=$("$GRAFT_BIN" validate "$candidate" --json)
 python3 - "$validate" <<'PY'
 import json, sys
 record = json.loads(sys.argv[1])
-valid_patch = record["evidence"]
-assert valid_patch, record
-assert valid_patch[-1]["result"] == "passed", valid_patch
-assert valid_patch[-1]["property"].startswith("property:"), valid_patch
+assert record["evidence"] == [], record
 PY
 
-admit=$("$GRAFT_BIN" admit "$candidate" --require ValidPatch)
+admit=$("$GRAFT_BIN" admit "$candidate")
 patch=$(grep -oE 'patch:[0-9a-f]+' <<<"$admit" | head -n1)
-[[ -n $patch ]] || { echo "FAIL: repo-based ValidPatch evidence did not admit"; echo "$admit"; exit 1; }
+[[ -n $patch ]] || { echo "FAIL: scratch-based candidate did not admit"; echo "$admit"; exit 1; }
 
 printf 'updated\n' > "$SOURCE/README.md"
 git -C "$SOURCE" add README.md
 git -C "$SOURCE" commit -m update >/dev/null
 new_tree=$(git -C "$SOURCE" rev-parse 'HEAD^{tree}')
 
-sync_again=$("$GRAFT_BIN" repo sync demo)
-if ! grep -q $'demo\tsynced' <<<"$sync_again"; then
-  echo "FAIL: repo sync did not fetch existing demo repo"
-  echo "$sync_again"; exit 1
+update=$("$GRAFT_BIN" repo update demo)
+if ! grep -q "$new_tree" <<<"$update"; then
+  echo "FAIL: repo update did not record the moved source tree"
+  echo "$update"; exit 1
+fi
+if grep -q "$base_tree" <<<"$update"; then
+  echo "FAIL: repo update still reported the old tree"
+  echo "$update"; exit 1
 fi
 
-create_after_move=$("$GRAFT_BIN" create --from repo:demo@main --expect ValidPatch --message repo-base-after-move)
-candidate_after_move=$(grep -oE 'candidate:[0-9a-f]+' <<<"$create_after_move" | head -n1)
-[[ -n $candidate_after_move ]] || { echo "FAIL: no candidate id after branch move"; echo "$create_after_move"; exit 1; }
-
-python3 - "$PROJECT" "$candidate" "$candidate_after_move" "$base_tree" "$new_tree" <<'PY'
-import json, pathlib, sys
-project, old_candidate, new_candidate, old_tree, expected_new_tree = sys.argv[1:]
-root = pathlib.Path(project)
-def base_tree(candidate):
-    record = json.loads((root / ".graft/store/private/candidate" / f"{candidate}.json").read_text())
-    return record["base_state"]["value"]["resolved_tree_oid"]
-old_recorded = base_tree(old_candidate)
-new_recorded = base_tree(new_candidate)
-assert old_recorded == old_tree, (old_recorded, old_tree)
-assert new_recorded == expected_new_tree, (new_recorded, expected_new_tree)
-assert old_recorded != new_recorded, (old_recorded, new_recorded)
-PY
-
-echo "OK: repo add, sync, repo-aware ValidPatch evidence, admit, and branch movement tracking work."
+echo "OK: repo add auto-locks, sync, lock/update, scratch --repo base-context resolution, candidate integrity, and admit work."

@@ -1,0 +1,22 @@
+// Historical Roto 0.11 ICE context: user-defined Roto helper functions
+// returning custom host plan types can still be unsafe. v2 property
+// composition should use `requires`, not calls between property functions.
+
+fn no_generated_artifacts_check(app: Application) -> Check {
+    app.changed_paths().any_match([
+        "target/**",
+        "dist/**",
+        "build/**",
+    ]).failure()
+}
+
+fn no_generated_artifacts(app: Application) -> Property {
+    property(
+        [
+            no_generated_artifacts_check(app),
+        ],
+        "patch does not contain generated build artifacts",
+        Severity.Blocking,
+        [],
+    )
+}

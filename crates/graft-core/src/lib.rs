@@ -43,8 +43,11 @@ id_type!(RelationId);
 id_type!(PromotionId);
 id_type!(ScratchId);
 id_type!(FileViewHash);
+id_type!(TreeId);
+id_type!(FileRef);
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RepoBaseState {
     pub repo_id: String,
     pub treeish: String,
@@ -74,17 +77,24 @@ impl RepoBaseState {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+#[serde(
+    tag = "kind",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum StateId {
     GitTree(String),
     RepoTree(RepoBaseState),
     GraftTree(String),
 }
 
-/// User-facing parsed form of a `--from <X>` / `base: <X>` reference.
+/// User-facing parsed form of a base reference.
 ///
-/// Both the CLI (`graft create --from ...`) and `graftd` (`scratch_open` base)
-/// accept the same string forms, so they share one parser here. Each variant
+/// Runtime base-like CLI arguments and `graftd` scratch `base` params share one
+/// parser here. Scratch accepts the immediately materializable subset
+/// (`graft:empty`, `tree:`, `candidate:`, `patch:`); higher-level runtime paths
+/// may also resolve Git and configured repo refs. Each variant
 /// only carries the data the parser is sure about; resolving it to a concrete
 /// [`StateId`] (which may require a Git repo, a clone, or a registry lookup)
 /// is the consumer's responsibility.
@@ -212,13 +222,19 @@ impl BaseRefSpec {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+#[serde(
+    tag = "kind",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum ChangeRef {
     Stored(ChangeId),
     InlineSummary(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TreeEntry {
     pub path: String,
     pub hash: String,
@@ -226,6 +242,7 @@ pub struct TreeEntry {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TreeSnapshot {
     pub entries: Vec<TreeEntry>,
 }
@@ -242,6 +259,7 @@ impl TreeSnapshot {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScratchNode {
     pub version: u32,
     pub base_state: StateId,
@@ -280,7 +298,7 @@ impl ScratchNode {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CanonicalScratchOp {
     Edit {
         path: String,
@@ -297,7 +315,7 @@ pub enum CanonicalScratchOp {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HashlineEdit {
     ReplaceLine {
         line: u64,
@@ -346,6 +364,7 @@ pub enum FileChangeKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FileChange {
     pub path: String,
     pub kind: FileChangeKind,
@@ -356,6 +375,7 @@ pub struct FileChange {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChangeSet {
     pub base_state: StateId,
     pub target_state: StateId,
@@ -562,6 +582,7 @@ fn file_change_kind(
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChangeSummary {
     pub files: usize,
     pub added: usize,
@@ -573,6 +594,7 @@ pub struct ChangeSummary {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PropertyRef {
     pub id: PropertyId,
     pub name: String,
@@ -588,7 +610,7 @@ impl PropertyRef {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Query {
     ChangeMeta,
     TargetSnapshot,
@@ -605,7 +627,7 @@ pub enum Query {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Evaluator {
     Builtin {
         name: String,
@@ -632,10 +654,11 @@ pub enum Evaluator {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Judge {
     ExitOk,
     BoolTrue,
+    BoolFalse,
     Pairwise,
     Command {
         command: String,
@@ -654,6 +677,7 @@ pub enum Judge {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PropertyDef {
     pub name: String,
     pub query: Query,
@@ -683,8 +707,218 @@ struct PropertyDefSeed<'a> {
     judge: &'a Judge,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PropertyName(String);
+
+impl PropertyName {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for PropertyName {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<String> for PropertyName {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+impl std::fmt::Display for PropertyName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum Severity {
+    Blocking,
+    Warning,
+    Info,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PropertySourceRef {
+    pub path: String,
+    pub function: PropertyName,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PropertySpec {
+    pub name: PropertyName,
+    pub plan: PropertyPlan,
+    pub description: String,
+    pub severity: Severity,
+    pub source_ref: Option<PropertySourceRef>,
+}
+
+impl PropertySpec {
+    pub fn property_id(&self) -> Result<PropertyId> {
+        let seed = PropertySpecSeed {
+            name: &self.name,
+            checks: &self.plan.checks,
+            requires: &self.plan.requires,
+        };
+        Ok(PropertyId::new(stable_typed_id("property", &seed)?))
+    }
+
+    pub fn property_ref(&self) -> Result<PropertyRef> {
+        Ok(PropertyRef::new(self.property_id()?, self.name.as_str()))
+    }
+}
+
+#[derive(Serialize)]
+struct PropertySpecSeed<'a> {
+    name: &'a PropertyName,
+    checks: &'a [CheckPlan],
+    requires: &'a [PropertyName],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PropertyPlan {
+    pub checks: Vec<CheckPlan>,
+    pub requires: Vec<PropertyName>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CheckPlan {
+    Expect {
+        probe: ProbePlan,
+        polarity: ProbePolarity,
+    },
+    AllOf {
+        checks: Vec<CheckPlan>,
+    },
+    AnyOf {
+        checks: Vec<CheckPlan>,
+    },
+    Unavailable {
+        reason: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProbePolarity {
+    Success,
+    Failure,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProbeResult {
+    Success,
+    Failure,
+    Error,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProbePlan {
+    PathMatch {
+        paths: PathSetPlan,
+        patterns: Vec<String>,
+    },
+    PathAllMatch {
+        paths: PathSetPlan,
+        patterns: Vec<String>,
+    },
+    RunExitCodeIs {
+        run: RunPlan,
+        code: i32,
+    },
+    SameOutput {
+        left: RunPlan,
+        right: RunPlan,
+        selectors: Vec<RunSelectorPlan>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PathSetPlan {
+    ChangedPaths,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunPlan {
+    pub argv: Vec<String>,
+    pub tree: TreePlan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TreePlan {
+    Application {
+        application: ApplicationPlan,
+        endpoint: ApplicationEndpoint,
+    },
+    WithOverlay {
+        base: Box<TreePlan>,
+        overlays: Vec<OverlayPlan>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ApplicationPlan {
+    Current,
+    PreviousFailure { selector: HistorySelector },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum ApplicationEndpoint {
+    Base,
+    Target,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum HistorySelector {
+    First,
+    Last,
+    Get { index: u64 },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum OverlayPlan {
+    ReplaceFile { path: String, file: FileRefPlan },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum FileRefPlan {
+    TreeFile { tree: Box<TreePlan>, path: String },
+    Resolved { file: FileRef },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RunSelectorPlan {
+    Stdout,
+    Stderr,
+    PostFile { path: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum EvidenceResult {
     Passed,
     Failed { reason: String },
@@ -699,6 +933,7 @@ impl EvidenceResult {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Provenance {
     pub producer: String,
     pub message: Option<String>,
@@ -715,17 +950,59 @@ impl Provenance {
     }
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum PropertyScope {
+    Workspace,
+}
+
+impl PropertyScope {
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Workspace => "workspace",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopedPropertyRef {
+    pub scope: PropertyScope,
+    pub property: PropertyRef,
+}
+
+impl ScopedPropertyRef {
+    pub fn new(scope: PropertyScope, property: PropertyRef) -> Self {
+        Self { scope, property }
+    }
+
+    pub fn label(&self) -> String {
+        format!("{}:{}", self.scope.label(), self.property.name)
+    }
+
+    pub fn evidence_subject(&self, subject: &str) -> String {
+        format!("{subject}@{}", self.scope.label())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GraftCandidate {
     pub id: CandidateId,
     pub base_state: StateId,
     pub target_state: StateId,
     pub change: ChangeRef,
-    pub expected: Vec<PropertyRef>,
+    pub expected: Vec<ScopedPropertyRef>,
     pub provenance: Provenance,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PatchRecord {
     pub id: PatchId,
     pub base_state: StateId,
@@ -737,6 +1014,7 @@ pub struct PatchRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvidenceRecord {
     pub id: EvidenceId,
     pub subject: String,
@@ -823,6 +1101,7 @@ impl EvidenceRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PromotionRecord {
     pub id: PromotionId,
     pub patch_id: PatchId,
@@ -843,6 +1122,7 @@ pub enum PatchRelationKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PatchRelation {
     pub id: RelationId,
     pub kind: PatchRelationKind,
@@ -938,7 +1218,7 @@ struct CandidateSeed<'a> {
     base_state: &'a StateId,
     target_state: &'a StateId,
     change: &'a ChangeRef,
-    expected: &'a [PropertyRef],
+    expected: &'a [ScopedPropertyRef],
     provenance: &'a Provenance,
 }
 
@@ -1024,6 +1304,153 @@ mod tests {
                 .as_str()
                 .starts_with("property:")
         );
+    }
+
+    fn current_target_tree() -> TreePlan {
+        TreePlan::Application {
+            application: ApplicationPlan::Current,
+            endpoint: ApplicationEndpoint::Target,
+        }
+    }
+
+    fn test_property_spec() -> PropertySpec {
+        let run = RunPlan {
+            argv: vec!["cargo".into(), "test".into(), "--all-targets".into()],
+            tree: current_target_tree(),
+        };
+        PropertySpec {
+            name: PropertyName::new("cargo_tests_pass"),
+            plan: PropertyPlan {
+                checks: vec![CheckPlan::Expect {
+                    probe: ProbePlan::RunExitCodeIs { run, code: 0 },
+                    polarity: ProbePolarity::Success,
+                }],
+                requires: vec![PropertyName::new("no_generated_artifacts")],
+            },
+            description: "cargo tests pass".to_string(),
+            severity: Severity::Blocking,
+            source_ref: Some(PropertySourceRef {
+                path: "properties.roto".to_string(),
+                function: PropertyName::new("cargo_tests_pass"),
+            }),
+        }
+    }
+
+    #[test]
+    fn v2_property_id_ignores_display_metadata() {
+        let original = test_property_spec();
+        let mut changed_metadata = original.clone();
+        changed_metadata.description = "renamed display text".to_string();
+        changed_metadata.severity = Severity::Warning;
+        changed_metadata.source_ref = None;
+
+        assert_eq!(
+            original.property_id().unwrap(),
+            changed_metadata.property_id().unwrap()
+        );
+    }
+
+    #[test]
+    fn v2_property_id_tracks_name_checks_and_requires() {
+        let original = test_property_spec();
+
+        let mut renamed = original.clone();
+        renamed.name = PropertyName::new("tests_pass");
+
+        let mut changed_requires = original.clone();
+        changed_requires.plan.requires = vec![PropertyName::new("cargo_fmt_clean")];
+
+        let mut changed_check = original.clone();
+        changed_check.plan.checks = vec![CheckPlan::Expect {
+            probe: ProbePlan::RunExitCodeIs {
+                run: RunPlan {
+                    argv: vec!["cargo".into(), "test".into(), "--doc".into()],
+                    tree: current_target_tree(),
+                },
+                code: 0,
+            },
+            polarity: ProbePolarity::Success,
+        }];
+
+        assert_ne!(
+            original.property_id().unwrap(),
+            renamed.property_id().unwrap()
+        );
+        assert_ne!(
+            original.property_id().unwrap(),
+            changed_requires.property_id().unwrap()
+        );
+        assert_ne!(
+            original.property_id().unwrap(),
+            changed_check.property_id().unwrap()
+        );
+    }
+
+    #[test]
+    fn v2_plan_represents_history_overlay_and_same_output() {
+        let target = current_target_tree();
+        let previous_target = TreePlan::Application {
+            application: ApplicationPlan::PreviousFailure {
+                selector: HistorySelector::First,
+            },
+            endpoint: ApplicationEndpoint::Target,
+        };
+        let checker = FileRefPlan::TreeFile {
+            tree: Box::new(target.clone()),
+            path: "./check_diff.sh".to_string(),
+        };
+        let bad_tree = TreePlan::WithOverlay {
+            base: Box::new(previous_target),
+            overlays: vec![OverlayPlan::ReplaceFile {
+                path: "./check_diff.sh".to_string(),
+                file: checker,
+            }],
+        };
+        let bad_run = RunPlan {
+            argv: vec!["bash".into(), "./check_diff.sh".into()],
+            tree: bad_tree,
+        };
+        let base_run = RunPlan {
+            argv: vec!["bash".into(), "./run.sh".into()],
+            tree: TreePlan::Application {
+                application: ApplicationPlan::Current,
+                endpoint: ApplicationEndpoint::Base,
+            },
+        };
+        let target_run = RunPlan {
+            argv: vec!["bash".into(), "./run.sh".into()],
+            tree: target,
+        };
+
+        let checks = vec![
+            CheckPlan::Expect {
+                probe: ProbePlan::RunExitCodeIs {
+                    run: bad_run,
+                    code: 0,
+                },
+                polarity: ProbePolarity::Failure,
+            },
+            CheckPlan::Expect {
+                probe: ProbePlan::SameOutput {
+                    left: base_run,
+                    right: target_run,
+                    selectors: vec![
+                        RunSelectorPlan::PostFile {
+                            path: "./alignment/expected.json".to_string(),
+                        },
+                        RunSelectorPlan::Stdout,
+                        RunSelectorPlan::Stderr,
+                    ],
+                },
+                polarity: ProbePolarity::Success,
+            },
+        ];
+
+        let json = serde_json::to_string(&checks).unwrap();
+        assert!(json.contains("previous_failure"));
+        assert!(json.contains("replace_file"));
+        assert!(json.contains("same_output"));
+        assert!(json.contains("post_file"));
     }
 
     #[test]
@@ -1131,6 +1558,30 @@ mod tests {
             serde_json::from_str::<StateId>(graft).unwrap(),
             StateId::GraftTree("tree:abc".to_string())
         );
+    }
+
+    #[test]
+    fn state_id_json_rejects_unknown_fields() {
+        let error = serde_json::from_str::<StateId>(
+            r#"{"kind":"git_tree","value":"abc123","surprise":true}"#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("expected \"kind\" or \"value\""), "{error}");
+        assert!(error.contains("surprise"), "{error}");
+    }
+
+    #[test]
+    fn change_ref_json_rejects_unknown_fields() {
+        let error = serde_json::from_str::<ChangeRef>(
+            r#"{"kind":"inline_summary","value":"demo","surprise":true}"#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("expected \"kind\" or \"value\""), "{error}");
+        assert!(error.contains("surprise"), "{error}");
     }
 
     #[test]
@@ -1301,6 +1752,42 @@ mod tests {
 
         assert_eq!(left.result_tree_digest, right.result_tree_digest);
         assert_ne!(scratch_id(&left).unwrap(), scratch_id(&right).unwrap());
+    }
+
+    #[test]
+    fn scratch_op_json_rejects_unknown_fields() {
+        let error = serde_json::from_str::<CanonicalScratchOp>(
+            r#"{"kind":"write","path":"a.txt","content_hash":"hash-a","size":1,"surprise":true}"#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("unknown field"), "{error}");
+        assert!(error.contains("surprise"), "{error}");
+    }
+
+    #[test]
+    fn hashline_edit_json_rejects_unknown_fields() {
+        let error = serde_json::from_str::<Vec<HashlineEdit>>(
+            r#"[{"kind":"replace_line","line":1,"hash":"MQ","old":"a","new":"b","surprise":true}]"#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("unknown field"), "{error}");
+        assert!(error.contains("surprise"), "{error}");
+    }
+
+    #[test]
+    fn evidence_result_json_rejects_unknown_variant_fields() {
+        let error = serde_json::from_str::<EvidenceResult>(
+            r#"{"failed":{"reason":"tests failed","surprise":true}}"#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("unknown field"), "{error}");
+        assert!(error.contains("surprise"), "{error}");
     }
 
     #[test]

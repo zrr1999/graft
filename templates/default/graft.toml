@@ -1,0 +1,17 @@
+schema = 1
+
+# Workspace-scoped properties enforced before a candidate can become an admitted patch.
+# Names must resolve to `fn <name>(app: Application) -> Property` definitions
+# in `properties.roto`. An empty map means admission relies only on core
+# integrity (`base + change == target`).
+[admission.required_properties]
+
+# Workspace-scoped properties enforced before an admitted patch can be projected onto a
+# promotion target (e.g. a Git ref or local file). An empty map means any
+# admitted patch can be promoted.
+[promotion.required_properties]
+
+# Whether this workspace participates in remote sync. Enabled by default;
+# set this to false for machine-local-only workspaces.
+[sync]
+enabled = true

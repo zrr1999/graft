@@ -56,13 +56,23 @@ pub fn next_actions(ctx: &CandidateContext) -> Vec<NextAction> {
     let mut out = Vec::new();
 
     if ctx.total_evidence() == 0 {
-        // Stage 1: drafted, no evidence yet.
-        out.push(NextAction::new(
-            "validate",
-            format!("graft validate {}", ctx.id),
-            NextActionKind::Recommended,
-            "candidate has no evidence yet; produce some by running validators",
-        ));
+        // Stage 1: drafted, no evidence yet. With no expected property, core
+        // patch integrity is the only default gate, so admission is available.
+        if ctx.expected_properties.is_empty() {
+            out.push(NextAction::new(
+                "admit",
+                format!("graft admit {}", ctx.id),
+                NextActionKind::Recommended,
+                "no property evidence is required; Graft checks patch integrity at admission",
+            ));
+        } else {
+            out.push(NextAction::new(
+                "validate",
+                format!("graft validate {}", ctx.id),
+                NextActionKind::Recommended,
+                "candidate has no evidence yet; produce some by running validators",
+            ));
+        }
         out.push(NextAction::new(
             "show.change",
             format!("graft show {} --change", ctx.id),
@@ -90,7 +100,7 @@ pub fn next_actions(ctx: &CandidateContext) -> Vec<NextAction> {
     }
 
     if ctx.unknown > 0 && ctx.passed == 0 {
-        // Stage 3: only unknowns (e.g. ValidPatch unknown without .git).
+        // Stage 3: only unknowns.
         out.push(NextAction::new(
             "resolve-unknown",
             format!("graft validate {}", ctx.id),
@@ -144,15 +154,15 @@ pub fn next_actions_patch(ctx: &PatchContext) -> Vec<NextAction> {
         // Stage 5: admitted but not yet materialized.
         out.push(NextAction::new(
             "materialize.dry-run",
-            format!("graft materialize {} --dry-run --as-commit", ctx.id),
+            format!("graft materialize {} --dry-run", ctx.id),
             NextActionKind::Recommended,
-            "preview how this patch would land as a detached Git commit",
+            "preview the isolated state inspection output",
         ));
         out.push(NextAction::new(
-            "materialize.commit",
-            format!("graft materialize {} --as-commit", ctx.id),
+            "materialize.inspect",
+            format!("graft materialize {}", ctx.id),
             NextActionKind::Optional,
-            "write a real detached commit object; branches stay unchanged",
+            "write the isolated state inspection output under .worktrees/",
         ));
         if let Some(prop) = ctx.properties.first() {
             out.push(NextAction::new(
@@ -229,14 +239,26 @@ mod tests {
     }
 
     #[test]
-    fn drafted_candidate_recommends_validate() {
+    fn drafted_candidate_without_expected_properties_recommends_admit() {
         let ctx = empty_candidate();
+        let actions = next_actions(&ctx);
+        assert_eq!(actions[0].id, "admit");
+        assert_eq!(actions[0].kind, NextActionKind::Recommended);
+        assert!(actions[0].label.contains("graft admit candidate:demo"));
+        // Must include an Optional for --change review.
+        assert!(actions.iter().any(|a| a.kind == NextActionKind::Optional));
+    }
+
+    #[test]
+    fn drafted_candidate_with_expected_properties_recommends_validate() {
+        let ctx = CandidateContext {
+            expected_properties: vec!["ReviewPolicy".into()],
+            ..empty_candidate()
+        };
         let actions = next_actions(&ctx);
         assert_eq!(actions[0].id, "validate");
         assert_eq!(actions[0].kind, NextActionKind::Recommended);
         assert!(actions[0].label.contains("graft validate candidate:demo"));
-        // Must include an Optional for --change review.
-        assert!(actions.iter().any(|a| a.kind == NextActionKind::Optional));
     }
 
     #[test]
@@ -274,13 +296,13 @@ mod tests {
     fn passed_evidence_recommends_admit_with_optional_validate_more() {
         let ctx = CandidateContext {
             passed: 1,
-            expected_properties: vec!["ValidPatch".into()],
+            expected_properties: vec!["ReviewPolicy".into()],
             ..empty_candidate()
         };
         let actions = next_actions(&ctx);
         assert_eq!(actions[0].id, "admit");
         assert_eq!(actions[0].kind, NextActionKind::Recommended);
-        assert!(actions[0].label.contains("--require ValidPatch"));
+        assert!(actions[0].label.contains("--require ReviewPolicy"));
         assert!(actions.iter().any(|a| a.id == "validate-additional"));
     }
 
@@ -288,7 +310,7 @@ mod tests {
     fn admit_recommendation_drops_require_when_property_is_ambiguous() {
         let ctx = CandidateContext {
             passed: 2,
-            expected_properties: vec!["ValidPatch".into(), "TestsPass".into()],
+            expected_properties: vec!["ReviewPolicy".into(), "TestsPass".into()],
             ..empty_candidate()
         };
         let actions = next_actions(&ctx);
@@ -300,7 +322,7 @@ mod tests {
     fn admitted_patch_recommends_dry_run_materialize() {
         let ctx = PatchContext {
             id: "patch:demo".into(),
-            properties: vec!["ValidPatch".into()],
+            properties: vec!["ReviewPolicy".into()],
             materialized: false,
             promoted: false,
         };
@@ -317,7 +339,7 @@ mod tests {
     fn materialized_patch_recommends_promote_dry_run_with_dangerous_apply() {
         let ctx = PatchContext {
             id: "patch:demo".into(),
-            properties: vec!["ValidPatch".into()],
+            properties: vec!["ReviewPolicy".into()],
             materialized: true,
             promoted: false,
         };
@@ -334,7 +356,7 @@ mod tests {
     fn promoted_patch_is_terminal() {
         let ctx = PatchContext {
             id: "patch:demo".into(),
-            properties: vec!["ValidPatch".into()],
+            properties: vec!["ReviewPolicy".into()],
             materialized: true,
             promoted: true,
         };

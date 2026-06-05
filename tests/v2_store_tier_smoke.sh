@@ -2,46 +2,55 @@
 # tests/v2_store_tier_smoke.sh
 #
 # End-to-end v2 smoke for no-git workspaces, candidate->patch lifecycle,
-# cwd view gates, refs/graft sync/clone, evidence rebuild, promote, and gc.
+# isolated materialize output, refs/graft sync/clone, evidence rebuild, promote, and gc.
 
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-cargo build -p graft-cli -p graft-daemon >/dev/null 2>&1
+source tests/lib/smoke.sh
 
-GRAFT="$PWD/target/debug/graft"
-GRAFTD="$PWD/target/debug/graftd"
+setup_bins
+setup_workspace
+trap cleanup_workspace EXIT
 
-WORKDIR="$(mktemp -d)"
-cleanup() {
-  find "$WORKDIR" -path '*/.graft/run/daemon.sock' -type s -exec "$GRAFTD" stop --socket {} \; >/dev/null 2>&1 || true
-  rm -rf "$WORKDIR"
-}
-trap cleanup EXIT
-
-# 1) cwd root must not be a Git worktree.
+# 1) cwd may be a Git worktree; workspace identity is registry/discovery, not .git.
 GIT_WS="$WORKDIR/git-ws"
 mkdir -p "$GIT_WS"
 git -C "$GIT_WS" init -b main >/dev/null
-if "$GRAFT" --cwd "$GIT_WS" init >git-ok.out 2>git-err.out; then
-  echo "FAIL: graft init succeeded inside a Git worktree"
-  cat git-ok.out
+"$GRAFT" --cwd "$GIT_WS" init >"$WORKDIR/git-ok.out" 2>"$WORKDIR/git-err.out" || {
+  echo "FAIL: graft init failed inside a Git worktree"
+  cat "$WORKDIR/git-err.out"
   exit 1
-fi
-grep -q '\[E_GIT_IN_WORKSPACE\]' git-err.out || { echo "FAIL: no E_GIT_IN_WORKSPACE"; cat git-err.out; exit 1; }
+}
 
 # 2) Candidate -> validate -> admit moves private objects to public patch/evidence_refs.
 WS="$WORKDIR/ws"
 mkdir -p "$WS"
 cd "$WS"
 "$GRAFT" init >/dev/null
+write_properties_roto <<'ROTO'
+fn touches_hello(app: Application) -> Property {
+    property(
+        [
+            app.changed_paths().any_match(["hello.txt"]).success(),
+        ],
+        "change touches hello.txt",
+        Severity.Blocking,
+        [],
+    )
+}
+ROTO
+lock_properties
 printf 'hello\n' > hello.txt
-create=$("$GRAFT" create --from graft:empty --expect ValidPatch --message v2-smoke)
+scratch_out=$("$GRAFT" scratch write --base graft:empty hello.txt --content $'hello\n')
+scratch=$(grep -oE 'scratch:[0-9a-f]+' <<<"$scratch_out" | tail -n1)
+[[ -n $scratch ]] || { echo "FAIL: no scratch id"; echo "$scratch_out"; exit 1; }
+create=$("$GRAFT" candidate from-scratch "$scratch" --expect workspace:touches_hello --message v2-smoke)
 candidate=$(grep -oE 'candidate:[0-9a-f]+' <<<"$create" | head -n1)
 [[ -n $candidate ]] || { echo "FAIL: no candidate id"; echo "$create"; exit 1; }
-"$GRAFT" validate "$candidate" --expect ValidPatch >/dev/null
-admit=$("$GRAFT" admit "$candidate" --require ValidPatch)
+"$GRAFT" validate "$candidate" --expect workspace:touches_hello >/dev/null
+admit=$("$GRAFT" admit "$candidate" --require workspace:touches_hello)
 patch=$(grep -oE 'patch:[0-9a-f]+' <<<"$admit" | head -n1)
 [[ -n $patch ]] || { echo "FAIL: no patch id"; echo "$admit"; exit 1; }
 [[ ! -e ".graft/store/private/candidate/$candidate.json" ]] || { echo "FAIL: private candidate remained after admit"; exit 1; }
@@ -50,15 +59,19 @@ patch=$(grep -oE 'patch:[0-9a-f]+' <<<"$admit" | head -n1)
 [[ -e ".graft/store/public/evidence_refs/$patch.json" ]] || { echo "FAIL: public evidence_refs missing"; exit 1; }
 find .graft/store/derived/evidence -type f | grep -q . || { echo "FAIL: derived evidence body missing before sync"; exit 1; }
 
-# 3) cwd view dirty gate and discard.
-"$GRAFT" materialize "$patch" --discard >/dev/null
-status=$("$GRAFT" status)
-grep -q 'cwd clean' <<<"$status" || { echo "FAIL: materialized cwd is not clean"; echo "$status"; exit 1; }
-printf 'changed\n' > hello.txt
-diff=$("$GRAFT" diff)
-grep -q 'cwd dirty' <<<"$diff" || { echo "FAIL: diff did not report dirty cwd"; echo "$diff"; exit 1; }
-"$GRAFT" discard >/dev/null
-grep -q 'hello' hello.txt || { echo "FAIL: discard did not restore materialized view"; exit 1; }
+# 3) materialize writes an isolated state inspection tree and leaves cwd untouched.
+materialize_out=$("$GRAFT" materialize "$patch" --discard)
+materialized_path=$(extract_materialize_path <<<"$materialize_out")
+[[ -n $materialized_path ]] || { echo "FAIL: materialize did not report output path"; echo "$materialize_out"; exit 1; }
+[[ "$materialized_path" != *"$patch"* ]] || { echo "FAIL: materialize output path used patch id"; echo "$materialized_path"; exit 1; }
+[[ -e "$materialized_path/hello.txt" ]] || { echo "FAIL: materialized worktree missing"; echo "$materialize_out"; exit 1; }
+grep -q 'hello' "$materialized_path/hello.txt" || { echo "FAIL: materialized worktree content wrong"; exit 1; }
+grep -q 'hello' hello.txt || { echo "FAIL: cwd was unexpectedly modified by materialize"; exit 1; }
+if [[ -d .graft/store/public/relation ]] && find .graft/store/public/relation -type f | grep -q .; then
+  echo "FAIL: materialize wrote a registry relation"
+  find .graft/store/public/relation -type f
+  exit 1
+fi
 
 # 4) Promote to a configured external Git target and record promotion object.
 TARGET="$WORKDIR/target-git"
@@ -72,20 +85,47 @@ cat >> graft.toml <<TOML
 [promote_targets.out]
 path = "$TARGET"
 branch = "graft-out"
-required_properties = ["ValidPatch"]
+
+[promote_targets.out.required_properties]
+workspace = ["touches_hello"]
 TOML
+lock_properties
 "$GRAFT" promote "$patch" --to out --yes >/dev/null
 git -C "$TARGET" rev-parse --verify refs/heads/graft-out >/dev/null
 find .graft/store/public/promotion -type f | grep -q . || { echo "FAIL: promotion record missing"; exit 1; }
 
-# 5) Sync uses refs/graft/* and omits derived evidence bodies; clone can rebuild them.
+# 5) Sync is enabled by default for local workspaces, explicit opt-out fails,
+# uses refs/graft/*, and omits derived evidence bodies; clone can rebuild them.
 REMOTE="$WORKDIR/remote.git"
+sed -i.bak 's/enabled = true/enabled = false/' graft.toml
+rm -f graft.toml.bak
+set +e
+disabled_sync=$("$GRAFT" sync "$REMOTE" --push-only 2>&1)
+sync_status=$?
+set -e
+if [[ $sync_status -eq 0 ]]; then
+  echo "FAIL: sync succeeded while [sync] was explicitly disabled"
+  echo "$disabled_sync"
+  exit 1
+fi
+grep -q 'E_SYNC_DISABLED' <<<"$disabled_sync" || {
+  echo "FAIL: disabled sync did not report E_SYNC_DISABLED"
+  echo "$disabled_sync"
+  exit 1
+}
+[[ ! -e "$REMOTE" ]] || { echo "FAIL: disabled sync created remote data"; exit 1; }
+sed -i.bak 's/enabled = false/enabled = true/' graft.toml
+rm -f graft.toml.bak
 "$GRAFT" sync "$REMOTE" --push-only >/dev/null
+grep -q "$REMOTE" .graft/state/remotes/default || { echo "FAIL: default sync remote was not recorded"; exit 1; }
+"$GRAFT" sync --fetch-only >/dev/null
 git --git-dir "$REMOTE" show-ref --verify refs/graft/facts >/dev/null
 git --git-dir "$REMOTE" show-ref --verify refs/graft/blobs >/dev/null
 git --git-dir "$REMOTE" show-ref --verify refs/graft/manifests >/dev/null
 CLONE="$WORKDIR/clone"
 "$GRAFT" clone "$REMOTE" "$CLONE" >/dev/null
+cp properties.roto "$CLONE/properties.roto"
+"$GRAFT" --cwd "$CLONE" property lock >/dev/null
 [[ -e "$CLONE/.graft/store/public/patch/$patch.json" ]] || { echo "FAIL: cloned public patch missing"; exit 1; }
 if find "$CLONE/.graft/store/derived/evidence" -type f | grep -q .; then
   echo "FAIL: clone fetched derived evidence bodies"
@@ -99,7 +139,7 @@ find "$CLONE/.graft/store/derived/evidence" -type f | grep -q . || { echo "FAIL:
 
 # 6) GC derived-only dry-run/apply.
 gc_dry=$("$GRAFT" --cwd "$CLONE" gc --derived-only)
-grep -q 'derived-only would delete' <<<"$gc_dry" || { echo "FAIL: gc dry-run did not describe derived evidence"; echo "$gc_dry"; exit 1; }
+grep -q 'evidence_bodies_to_delete: 1' <<<"$gc_dry" || { echo "FAIL: gc dry-run did not describe derived evidence"; echo "$gc_dry"; exit 1; }
 "$GRAFT" --cwd "$CLONE" gc --derived-only --apply >/dev/null
 if find "$CLONE/.graft/store/derived/evidence" -type f | grep -q .; then
   echo "FAIL: gc --derived-only --apply left evidence bodies"

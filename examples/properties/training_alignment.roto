@@ -1,0 +1,45 @@
+// Pattern: falsifiable command oracle with a historical witness.
+//
+// The patch may modify the validator script itself. To keep the validator
+// trustworthy we require either:
+//   (a) the validator files are unchanged, or
+//   (b) the new validator still rejects a known-bad sample drawn from
+//       a historical Application that previously failed this property.
+//
+// `app.previous_failure(History.First)` is a symbolic historical Application
+// reference whose target is at or before `app.base()` (never future-visible). The
+// view is read-only — calling `.previous_failure(...)` on a returned
+// Application is rejected at evaluation time. If no matching witness exists,
+// the run that depends on it evaluates to Error.
+//
+// `tree.file(path)` is also symbolic. If the file is missing at validation
+// time, the overlay/run that needs it evaluates to Error; there is no runtime
+// Option match in the static PropertyPlan.
+
+fn training_alignment(app: Application) -> Property {
+    let worktree = app.target().add_worktree();
+    let target_run = call(["bash", "./check_diff.sh"], app.target());
+
+    let prev = app.previous_failure(History.First);
+    let checker = app.target().file("./check_diff.sh");
+    let bad_tree = prev.target().with_overlay([
+        replace_file("./check_diff.sh", checker),
+    ]);
+    let bad_run = call(["bash", "./check_diff.sh"], bad_tree);
+
+    property(
+        [
+            target_run.exit_code_is(0).success(),
+            any_of([
+                app.changed_paths().any_match([
+                    "check_diff.sh",
+                    "compare.py",
+                ]).failure(),
+                bad_run.exit_code_is(0).failure(),
+            ]),
+        ],
+        "training validator stays falsifiable: either unchanged or still rejects a known counterexample",
+        Severity.Blocking,
+        [],
+    )
+}
