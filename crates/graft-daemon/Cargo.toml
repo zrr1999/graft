@@ -7,10 +7,6 @@ description.workspace = true
 repository.workspace = true
 license.workspace = true
 
-[[bin]]
-name = "graftd"
-path = "src/main.rs"
-
 [dependencies]
 graft-client = { path = "../graft-client" }
 graft-core = { path = "../graft-core" }

@@ -107,8 +107,8 @@ const AGENT_WORKFLOW_LONG_ABOUT: &str = concat!(
     "1. Use `graft explain agent-workflow` or pi-graft `graft_help` when unsure; direct tool descriptions should stay short.\n",
     "2. Bootstrap and diagnose with `graft workspace init`, `graft workspace ps`, and `graft workspace doctor` before writing changes.\n",
     "3. Draft only in scratch: use `graft scratch read|write|edit|delete --base <base> ...` and continue with `--from scratch:<digest>`, or use `graft scratch capture --base <base>` to stash-like capture cwd changes into scratch; scratch is daemon-backed draft state, not a candidate, patch, sync object, or Git ref.\n",
-    "4. Turn draft into reviewable state with `graft patch from-scratch scratch:<digest> --expect <Property> --message <msg>`; the patch from-scratch command generates a private local candidate and does not admit or promote it.\n",
-    "5. Prove properties with `graft patch validate candidate:<digest> --expect <Property>` and inspect with `graft patch show`, `graft patch list --candidates`, or `graft patch search`.\n",
+    "4. Turn draft into reviewable state with `graft patch from-scratch scratch:<digest> --expect <Property> --message <msg>`; the patch from-scratch command generates a private local candidate and immediately validates any `--expect` properties, but does not admit or promote it.\n",
+    "5. Re-run or add evidence with `graft patch validate candidate:<digest> --expect <Property>` and inspect with `graft patch show`, `graft patch list --candidates`, or `graft patch search`.\n",
     "6. Admit only after required evidence passes: `graft patch admit candidate:<digest> --require <Property>`; admit generates a public patch and moves candidate evidence refs to the patch.\n",
     "7. Check output with `graft materialize <state-ref>` or `graft run <state-ref> -- <cmd>`; materialize writes isolated `.worktrees/<state>/` inspection output, not cwd or Git refs.\n",
     "8. External promote is low-frequency and explicit: only run `graft promote <patch-id> --to <target> --yes` when an approved patch must update an outside Git branch, PR, or release target.\n",
@@ -121,8 +121,8 @@ const SCRATCH_LONG_ABOUT: &str = concat!(
 );
 
 const CANDIDATE_LONG_ABOUT: &str = concat!(
-    "Candidate is the local-only proposal state. `graft patch from-scratch scratch:<digest>` generates a private candidate from a scratch draft, expected properties, provenance producer, and optional message.\n",
-    "A candidate is not public review history and is not synced; validate it to produce evidence, then admit it when required evidence passes."
+    "Candidate is the local-only proposal state. `graft patch from-scratch scratch:<digest>` generates a private candidate from a scratch draft, expected properties, provenance producer, and optional message; any `--expect` properties are validated immediately.\n",
+    "A candidate is not public review history and is not synced; re-run validate to refresh or add evidence, then admit it when required evidence passes."
 );
 
 const VALIDATE_LONG_ABOUT: &str = concat!(
@@ -136,7 +136,7 @@ const ADMIT_LONG_ABOUT: &str = concat!(
 );
 
 const MATERIALIZE_LONG_ABOUT: &str = concat!(
-    "Materialize is inspection output for a resolved state. Inputs such as tree:<digest>, candidate:<digest>, patch:<digest>, repo:<id>@<treeish>, and workspace Git treeishes first resolve to a StateId, then write an isolated `.worktrees/<state>/` directory under the workspace.\n",
+    "Materialize is inspection output for a resolved state. Inputs such as tree:<digest>, candidate:<digest>, patch:<digest>, and repo:<id>@<treeish> first resolve to a StateId, then write an isolated `.worktrees/<state>/` directory under the workspace.\n",
     "It is safe for checking files because it does not update cwd, evidence, branches, PRs, releases, or external refs; use promote separately only when external publication is intended."
 );
 

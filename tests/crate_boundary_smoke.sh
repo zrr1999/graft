@@ -58,11 +58,11 @@ def require_exact_internal_deps(package, expected, reason):
         )
 
 
-# CLI stays a thin frontend: parse process argv and immediately delegate into runtime.
+# CLI owns the installable user-facing binaries (`graft` and `graftd`) and delegates implementation.
 require_exact_deps(
     "graft-cli",
-    {"anyhow", "graft-runtime"},
-    "CLI should not accrete daemon/store/scratch implementation dependencies",
+    {"anyhow", "graft-daemon", "graft-runtime"},
+    "CLI package should contain only frontend binaries and delegate implementation to runtime/daemon crates",
 )
 
 # Daemon owns wire handling and workspace mutation services, but never imports the CLI frontend.

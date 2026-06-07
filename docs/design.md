@@ -1252,10 +1252,10 @@ Promotion 是显式 side-effect 边界：除了 `graft patch promote --yes`，Gr
 ```text
 cwd/
   graft.toml              # 项目定义，进 snapshot
-  graft.lock              # Git-managed 派生锚（properties + repos），不进 Graft snapshot
+  graft.lock              # workspace 元配置锁（properties + repos），进 snapshot
   properties.roto          # property source，进 snapshot
   src/                    # workspace files，进 snapshot
-  worktrees/              # state content: managed repo directories, e.g. worktrees/A/
+  worktrees/              # local managed-repo checkout/output area; 默认不进 snapshot
   README.md
   ...
 ```
@@ -1263,10 +1263,10 @@ cwd/
 约束：
 
 - 这里的 `cwd/` 只描述 `graft workspace init` 创建的 **local workspace root**。一般命令的 cwd 可以是任意目录；它通过 §12 的 lookup / routes 解析到 workspace。
-- cwd 根目录允许存在 `.git/`。cwd 是否是 Git 仓库只影响 attach 时能否自动登记 repo，不影响 workspace 是否存在。
+- local workspace root 拒绝 `.git/`；Git checkout 只能作为外部 repo/promote target，而不是 Graft workspace 本体。
 - snapshot 包含什么：
-  - 包含：`graft.toml`、`properties.roto`、所有普通工作区文件，以及 state 内的 `worktrees/<repo-id>/` repo 内容。
-  - 不包含：`graft.lock`（派生锚，不作为 candidate 内容；但在 Git workspace 中必须由 Git 跟踪）、`.graft/`（本地状态）、`.worktrees/`（临时 materialize 输出）、`.git/`（外部 VCS）、`.gitignore` 类工具忽略的常见生成物。
+  - 包含：`graft.toml`、`graft.lock`、`properties.roto`、所有普通工作区文件。
+  - 不包含：`.graft/`（本地事实空间）、`.worktrees/`（临时 materialize 输出）、`worktrees/`（local managed-repo checkout/output area）。发现 `.git/` 时拒绝 capture，而不是静默忽略。
   - 排除规则的具体语法在 §3.4。
 
 local workspace root 是工作区，不是默认视图。Graft 不维护"当前 cwd 是 selected snapshot 的物化"这种隐式不变量；显式 materialize 总是写隔离 worktree，详见 §5 与 §12。
@@ -1378,7 +1378,7 @@ daemon 内存中持有 lease 的 active scratch
 
 `graft.toml` 是 workspace 元配置；`graft.lock` 是派生缓存兼解析锚。二者都属于 workspace 的受管文件：任何变更都通过 patch admit，并且必须在同一个 patch 中原子同步。
 
-`graft.lock` 在 Git workspace 中必须入 git、可跨 clone，**不包含本地路径**。本地路径归 `$GRAFT_HOME/registry.toml [[repo_paths]]`（§12）。
+`graft.lock` 是 Graft-tracked workspace 元配置锁、可跨 clone，**不包含本地路径**。本地路径归 `$GRAFT_HOME/registry.toml [[repo_paths]]`（§12）。
 
 #### 形态
 
@@ -1532,10 +1532,12 @@ Invariant 3.3.2  (LockSchemaUniformity)
 
 ```
 内置排除（不可关闭）：
-  .graft/                         # graft 自身
-  .git/                           # 外部 VCS；可存在但不进入 snapshot
-  graft.lock                      # 派生锚；不进 Graft snapshot，但仍是 Git-managed meta file
+  .graft/                         # graft 自身事实空间
+  .worktrees/                     # materialize 的本地检查输出
   worktrees/                      # local managed-repo checkout/output area; not implicit source
+
+内置拒绝：
+  .git/                           # Git checkout 不是 Graft workspace 本体
 
 用户可配（graft.toml [snapshot.ignore]）：
   patterns = ["target/**", "node_modules/**", "*.log"]
@@ -1822,7 +1824,7 @@ Invariant 5.2.2  (NoImplicitCwdWrites)
 graft patch materialize <state-ref> [--dry-run]
 ```
 
-`<state-ref>` 可以是 `graft:empty`、`tree:...`、`application:...`、`candidate:...`、`patch:...`、`repo:<id>@<treeish>` 或 workspace Git treeish。内部先解析成确定 `StateId`，再物化完整 workspace state。显式写外部目标只能通过 `graft patch promote`。
+`<state-ref>` 可以是 `graft:empty`、`tree:...`、`application:...`、`candidate:...`、`patch:...` 或 `repo:<id>@<treeish>`。内部先解析成确定 `StateId`，再物化完整 workspace state。显式写外部目标只能通过 `graft patch promote`。
 
 #### 流程
 
@@ -2513,7 +2515,7 @@ graft patch from-scratch <scratch-id> --expect <property>... --message <msg>
 graft workspace gc [--apply] [--derived-only]
 graft bundle export <path>
 graft bundle import <path>
-graftd status                               # uses $GRAFT_HOME/run/daemon.sock
+graftd status                               # installed by graft-cli; uses $GRAFT_HOME/run/daemon.sock
 graftd stop
 ```
 
@@ -2531,7 +2533,7 @@ just cov        # cargo llvm-cov test --locked --workspace --all-targets, writes
 
 ## 12. Workspace discovery, registry, attach
 
-P8 的核心翻转：workspace 是 user-level 对象，cwd 只是 attach key。Graft 永远不因为 cwd 是 Git repo 而拒绝；cwd 的 `.git/` 只在 attach / promote target 里作为可选外部 Git 信息使用。
+P8 的核心翻转：workspace 是 user-level 对象，cwd 只是 attach key。Graft workspace 本体保持 Git-independent：local workspace root 发现 `.git/` 时应拒绝；外部 Git checkout 只通过 repo/promote 边界登记或写入。
 
 ### 12.1 `$GRAFT_HOME`
 
@@ -2785,8 +2787,8 @@ Dirty policy:
 
 Removed / obsolete:
 
-- cwd-root Git prohibition is removed; `.git/` is ignored for snapshot and allowed for attach/promote.
-- the old Git-in-workspace error code is removed.
+- cwd-root Git prohibition remains for Graft workspace roots: `.git/` is rejected instead of ignored during snapshot/capture.
+- Git integration is explicit at repo/promote boundaries, not by treating the workspace root as a Git worktree.
 - per-workspace daemon socket flags are removed from normal CLI help.
 - `graft patch materialize <state-ref>` no longer overwrites cwd; the old `--discard` flag is accepted only as hidden compatibility no-op.
 - `state/cwd` no longer defines a default view.

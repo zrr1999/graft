@@ -5,7 +5,7 @@ _SMOKE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$_SMOKE_LIB_DIR/socket_probe.sh"
 
 setup_bins() {
-  cargo build -p graft-cli -p graft-daemon
+  cargo build -p graft-cli
 
   GRAFT_BIN="$PWD/target/debug/graft"
   GRAFTD_BIN="$PWD/target/debug/graftd"

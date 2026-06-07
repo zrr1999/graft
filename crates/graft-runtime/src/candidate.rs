@@ -22,7 +22,7 @@ pub(crate) struct CandidateFromScratchArgs {
     scratch: String,
     #[arg(
         long = "expect",
-        help = "Whole-state property the candidate must later satisfy, for example workspace:tests_pass (repeatable)"
+        help = "Whole-state property to validate immediately and require later, for example workspace:tests_pass (repeatable)"
     )]
     expected: Vec<String>,
     #[arg(
@@ -36,6 +36,12 @@ pub(crate) struct CandidateFromScratchArgs {
         help = "Short human description recorded in candidate provenance"
     )]
     message: Option<String>,
+}
+
+impl CandidateFromScratchArgs {
+    pub(crate) fn validates_on_create(&self) -> bool {
+        !self.expected.is_empty()
+    }
 }
 
 pub(crate) fn run_candidate_command(

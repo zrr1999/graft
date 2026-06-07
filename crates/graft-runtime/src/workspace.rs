@@ -134,6 +134,12 @@ pub(crate) fn run_init_command(store: &GraftStore, register_only: bool) -> Resul
 }
 
 pub(crate) fn init_workspace_files(store: &GraftStore) -> Result<(InitOutcome, bool)> {
+    if store.paths().workspace().join(".git").exists() {
+        bail!(
+            "[E_GIT_WORKSPACE_UNSUPPORTED] {} contains .git; Graft workspace roots must be Git-independent. Use a non-Git workspace and add external Git repositories with `graft repo add` or `graft promote`.",
+            store.paths().workspace().display()
+        );
+    }
     let outcome = store.init()?;
     let defs = load_property_defs(store)?;
     let lock_created = read_property_lock(store)?.is_none();

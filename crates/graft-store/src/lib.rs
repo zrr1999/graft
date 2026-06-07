@@ -1311,15 +1311,19 @@ fn collect_tree_entries(
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
             let file_name = snapshot_entry_name(&path, &file_name)?;
+            if file_name == ".git" {
+                return Err(StoreError::InvalidSnapshotPath {
+                    path,
+                    message:
+                        ".git directories are external VCS state and cannot be captured by Graft"
+                            .to_string(),
+                });
+            }
             if should_skip_dir(file_name) {
                 continue;
             }
             collect_tree_entries(root, &path, blob_dir, entries)?;
         } else if file_type.is_file() {
-            let file_name = snapshot_entry_name(&path, &file_name)?;
-            if should_skip_file(file_name) {
-                continue;
-            }
             let relative = normalize_relative_path(root, &path)?;
             let bytes = fs::read(&path)?;
             let hash = blake3::hash(&bytes).to_hex().to_string();
@@ -1347,34 +1351,11 @@ fn snapshot_entry_name<'a>(path: &Path, file_name: &'a OsStr) -> Result<&'a str>
 }
 
 fn should_skip_dir(name: &str) -> bool {
-    matches!(
-        name,
-        ".git"
-            | ".graft"
-            | ".spark"
-            | ".worktrees"
-            | "worktrees"
-            | "target"
-            | "dist"
-            | "properties"
-    )
-}
-
-fn should_skip_file(name: &str) -> bool {
-    matches!(name, "graft.toml" | "graft.lock" | "properties.roto")
+    matches!(name, ".graft" | ".worktrees" | "worktrees")
 }
 
 fn should_skip_snapshot_path(path: &str) -> bool {
-    let mut parts = path.split('/').peekable();
-    while let Some(part) = parts.next() {
-        if should_skip_dir(part) {
-            return true;
-        }
-        if parts.peek().is_none() && should_skip_file(part) {
-            return true;
-        }
-    }
-    false
+    path.split('/').any(should_skip_dir)
 }
 
 fn materialize_destination_parent(destination: &Path) -> Result<&Path> {
@@ -1853,7 +1834,7 @@ mod tests {
     }
 
     #[test]
-    fn capture_worktree_snapshot_ignores_generated_and_internal_dirs() {
+    fn capture_worktree_snapshot_tracks_workspace_meta_and_only_skips_graft_worktrees() {
         let dir = std::env::temp_dir().join(format!(
             "graft-store-snapshot-worktrees-test-{}",
             std::process::id()
@@ -1863,6 +1844,10 @@ mod tests {
         fs::create_dir_all(dir.join("worktrees").join("repo-a")).unwrap();
         fs::create_dir_all(dir.join("dist")).unwrap();
         fs::create_dir_all(dir.join("target")).unwrap();
+        fs::create_dir_all(dir.join("properties")).unwrap();
+        fs::write(dir.join("graft.toml"), "schema = 1\n").unwrap();
+        fs::write(dir.join("graft.lock"), "version = 1\n").unwrap();
+        fs::write(dir.join("properties.roto"), "fn prop() {}\n").unwrap();
         fs::write(dir.join("tracked.txt"), "tracked\n").unwrap();
         fs::write(
             dir.join(".worktrees")
@@ -1878,6 +1863,7 @@ mod tests {
         .unwrap();
         fs::write(dir.join("dist").join("bundle.js"), "dist\n").unwrap();
         fs::write(dir.join("target").join("artifact"), "target\n").unwrap();
+        fs::write(dir.join("properties").join("custom.roto"), "property\n").unwrap();
 
         let store = GraftStore::open(&dir);
         store.init_storage().unwrap();
@@ -1889,8 +1875,39 @@ mod tests {
                 .iter()
                 .map(|entry| entry.path.as_str())
                 .collect::<Vec<_>>(),
-            vec!["tracked.txt"]
+            vec![
+                "dist/bundle.js",
+                "graft.lock",
+                "graft.toml",
+                "properties.roto",
+                "properties/custom.roto",
+                "target/artifact",
+                "tracked.txt"
+            ]
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn capture_worktree_snapshot_rejects_git_dir() {
+        let dir = std::env::temp_dir().join(format!(
+            "graft-store-snapshot-git-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join(".git")).unwrap();
+        fs::write(dir.join("tracked.txt"), "tracked\n").unwrap();
+
+        let store = GraftStore::open(&dir);
+        store.init_storage().unwrap();
+        let error = store
+            .capture_worktree_snapshot(&dir)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("invalid snapshot path"), "{error}");
+        assert!(error.contains(".git directories"), "{error}");
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1934,11 +1951,7 @@ mod tests {
                 .iter()
                 .map(|entry| (entry.path.as_str(), entry.hash.as_str()))
                 .collect::<Vec<_>>(),
-            vec![
-                ("graft.toml", "config"),
-                ("src/lib.rs", "new"),
-                ("worktrees/A/value.txt", "repo"),
-            ]
+            vec![("src/lib.rs", "new"), ("worktrees/A/value.txt", "repo")]
         );
     }
 

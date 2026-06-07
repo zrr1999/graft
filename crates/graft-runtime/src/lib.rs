@@ -253,9 +253,9 @@ enum Command {
     /// Show object-to-object changes between materializable refs
     #[command(hide = true)]
     Diff {
-        /// Source state ref: graft:empty, tree:<id>, candidate:<id>, patch:<id>, repo:<id>@<treeish>, or workspace Git treeish
+        /// Source state ref: graft:empty, tree:<id>, candidate:<id>, patch:<id>, or repo:<id>@<treeish>
         from: String,
-        /// Target state ref: graft:empty, tree:<id>, candidate:<id>, patch:<id>, repo:<id>@<treeish>, or workspace Git treeish
+        /// Target state ref: graft:empty, tree:<id>, candidate:<id>, patch:<id>, or repo:<id>@<treeish>
         to: String,
     },
     /// Obsolete: cwd is not a managed view and cannot be restored by Graft
@@ -331,7 +331,7 @@ enum Command {
     },
     /// Run a command inside a temporary materialized state; writes are discarded
     Run {
-        /// State ref: graft:empty, tree:<id>, candidate:<id>, patch:<id>, repo:<id>@<treeish>, or workspace Git treeish
+        /// State ref: graft:empty, tree:<id>, candidate:<id>, patch:<id>, or repo:<id>@<treeish>
         state: String,
         #[arg(
             long,
@@ -349,7 +349,7 @@ enum Command {
     },
     /// Materialize any state ref into an isolated inspection state
     Materialize {
-        /// State ref: graft:empty, tree:<id>, candidate:<id>, patch:<id>, repo:<id>@<treeish>, or workspace Git treeish
+        /// State ref: graft:empty, tree:<id>, candidate:<id>, patch:<id>, or repo:<id>@<treeish>
         id: String,
         #[arg(
             long,
@@ -581,9 +581,9 @@ enum PatchCommand {
     },
     /// Show object-to-object changes between materializable refs
     Diff {
-        /// Source state ref: graft:empty, tree:<id>, candidate:<id>, patch:<id>, repo:<id>@<treeish>, or workspace Git treeish
+        /// Source state ref: graft:empty, tree:<id>, candidate:<id>, patch:<id>, or repo:<id>@<treeish>
         from: String,
-        /// Target state ref: graft:empty, tree:<id>, candidate:<id>, patch:<id>, repo:<id>@<treeish>, or workspace Git treeish
+        /// Target state ref: graft:empty, tree:<id>, candidate:<id>, patch:<id>, or repo:<id>@<treeish>
         to: String,
     },
     /// Compose two sequential patches into a new candidate (target(first) == base(second))
@@ -1435,6 +1435,38 @@ fn route_patch_command(command: &PatchCommand) -> PatchCommandRoute<'_> {
     }
 }
 
+fn run_candidate_from_scratch_command(
+    store: &GraftStore,
+    workspace_root: &Path,
+    workspace_id: &str,
+    socket: Option<&Path>,
+    args: &crate::candidate::CandidateFromScratchArgs,
+) -> Result<CommandEnvelope> {
+    let command = CandidateCommand::FromScratch(args.clone());
+    let mut envelope = run_candidate_command(workspace_root, workspace_id, socket, &command)?;
+    if !args.validates_on_create() {
+        return Ok(envelope);
+    }
+
+    let candidate_id = envelope.candidate_id.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "[E_CANDIDATE_RESULT_CONTRACT] from-scratch result omitted candidate id; cannot validate --expect properties"
+        )
+    })?;
+    let candidate = store
+        .read_candidate(&candidate_id)
+        .with_context(|| format!("read candidate record {candidate_id}"))?;
+    let evidence_records = validate_candidate(store, &candidate, &[])?;
+    envelope.evidence_ids = evidence_records
+        .iter()
+        .map(|record| record.id.to_string())
+        .collect();
+    envelope.evidence = evidence_records.iter().map(evidence_view).collect();
+    envelope.next_actions = next_actions_for_candidate(&candidate, &evidence_records);
+    envelope.cache_changed = true;
+    Ok(envelope)
+}
+
 fn run_patch_command(
     command: &PatchCommand,
     cli: &Cli,
@@ -1456,8 +1488,7 @@ fn run_patch_command(
                     "[E_NO_WORKSPACE_ID] typed daemon op requires a resolved workspace_id"
                 )
             })?;
-            let command = CandidateCommand::FromScratch(args.clone());
-            run_candidate_command(workspace_root, workspace_id, None, &command)
+            run_candidate_from_scratch_command(store, workspace_root, workspace_id, None, args)
         }
         PatchCommandRoute::Show {
             id,
@@ -1569,7 +1600,15 @@ impl LocalCommandRouter<'_> {
                         "[E_NO_WORKSPACE_ID] typed daemon op requires a resolved workspace_id"
                     )
                 })?;
-                run_candidate_command(workspace_root, workspace_id, socket.as_deref(), command)
+                match command {
+                    CandidateCommand::FromScratch(args) => run_candidate_from_scratch_command(
+                        store,
+                        workspace_root,
+                        workspace_id,
+                        socket.as_deref(),
+                        args,
+                    ),
+                }
             }
             Command::Candidates {
                 property,
@@ -6321,21 +6360,6 @@ fn v2_cli_check(app: Application) -> Property {
         let home = test_workspace("graft-cli-materialize-commit-home");
         fs::create_dir_all(&cwd).unwrap();
         fs::create_dir_all(&home).unwrap();
-        run_process(std::ffi::OsStr::new("git"), &["init"], &cwd, None).unwrap();
-        run_process(
-            std::ffi::OsStr::new("git"),
-            &["config", "user.email", "graft@example.test"],
-            &cwd,
-            None,
-        )
-        .unwrap();
-        run_process(
-            std::ffi::OsStr::new("git"),
-            &["config", "user.name", "Graft Test"],
-            &cwd,
-            None,
-        )
-        .unwrap();
         let _guard = EnvGuard::set("GRAFT_HOME", &home);
         let store = GraftStore::open(&cwd);
         run_init_command(&store, false).unwrap();
@@ -6399,22 +6423,24 @@ fn v2_cli_check(app: Application) -> Property {
     #[test]
     fn ensure_materialized_commit_uses_git_safe_patch_ref() {
         let _lock = env_lock();
-        let cwd = test_workspace("graft-cli-promote-cache-ref-test");
+        let cwd = test_workspace("graft-cli-promote-cache-ref-workspace");
+        let target = test_workspace("graft-cli-promote-cache-ref-target");
         let home = test_workspace("graft-cli-promote-cache-ref-home");
         fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&target).unwrap();
         fs::create_dir_all(&home).unwrap();
-        run_process(std::ffi::OsStr::new("git"), &["init"], &cwd, None).unwrap();
+        run_process(std::ffi::OsStr::new("git"), &["init"], &target, None).unwrap();
         run_process(
             std::ffi::OsStr::new("git"),
             &["config", "user.email", "graft@example.test"],
-            &cwd,
+            &target,
             None,
         )
         .unwrap();
         run_process(
             std::ffi::OsStr::new("git"),
             &["config", "user.name", "Graft Test"],
-            &cwd,
+            &target,
             None,
         )
         .unwrap();
@@ -6461,7 +6487,7 @@ fn v2_cli_check(app: Application) -> Property {
             &GixBackend,
             &store,
             &config,
-            &cwd,
+            &target,
             &patch,
             patch.id.as_str(),
         )
@@ -6470,7 +6496,7 @@ fn v2_cli_check(app: Application) -> Property {
         let resolved = run_process(
             std::ffi::OsStr::new("git"),
             &["rev-parse", "refs/graft/patches/promote-cache-test"],
-            &cwd,
+            &target,
             None,
         )
         .unwrap();
@@ -6480,7 +6506,7 @@ fn v2_cli_check(app: Application) -> Property {
             &GixBackend,
             &store,
             &config,
-            &cwd,
+            &target,
             &patch,
             patch.id.as_str(),
         )
@@ -6492,7 +6518,7 @@ fn v2_cli_check(app: Application) -> Property {
                 "--verify",
                 "refs/graft/patches/patch:promote-cache-test",
             ])
-            .current_dir(&cwd)
+            .current_dir(&target)
             .output()
             .unwrap();
         assert!(
@@ -6501,6 +6527,7 @@ fn v2_cli_check(app: Application) -> Property {
         );
 
         let _ = fs::remove_dir_all(&cwd);
+        let _ = fs::remove_dir_all(&target);
         let _ = fs::remove_dir_all(&home);
     }
 

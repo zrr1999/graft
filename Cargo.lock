@@ -1545,6 +1545,7 @@ name = "graft-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "graft-daemon",
  "graft-runtime",
 ]
 

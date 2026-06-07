@@ -2,11 +2,12 @@
 /target
 /dist
 
-# Graft local fact/cache space
-/.graft
-/.spark
+# Local runtime and agent state
+/.graft/
+/.spark/
 .learnings/
 .pi/
+.pi-lens/
 
 # Python tooling
 .venv/

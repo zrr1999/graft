@@ -14,12 +14,16 @@ setup_bins
 setup_workspace
 trap cleanup_workspace EXIT
 
-# 1) cwd may be a Git worktree; workspace identity is registry/discovery, not .git.
+# 1) Graft workspace roots are Git-independent; .git is an explicit boundary.
 GIT_WS="$WORKDIR/git-ws"
 mkdir -p "$GIT_WS"
 git -C "$GIT_WS" init -b main >/dev/null
-"$GRAFT" --cwd "$GIT_WS" init >"$WORKDIR/git-ok.out" 2>"$WORKDIR/git-err.out" || {
-  echo "FAIL: graft init failed inside a Git worktree"
+if "$GRAFT" --cwd "$GIT_WS" init >"$WORKDIR/git-ok.out" 2>"$WORKDIR/git-err.out"; then
+  echo "FAIL: graft init unexpectedly succeeded inside a Git worktree"
+  exit 1
+fi
+grep -q "E_GIT_WORKSPACE_UNSUPPORTED" "$WORKDIR/git-err.out" || {
+  echo "FAIL: graft init did not report Git workspace rejection"
   cat "$WORKDIR/git-err.out"
   exit 1
 }
@@ -49,6 +53,8 @@ scratch=$(grep -oE 'scratch:[0-9a-f]+' <<<"$scratch_out" | tail -n1)
 create=$("$GRAFT" candidate from-scratch "$scratch" --expect workspace:touches_hello --message v2-smoke)
 candidate=$(grep -oE 'candidate:[0-9a-f]+' <<<"$create" | head -n1)
 [[ -n $candidate ]] || { echo "FAIL: no candidate id"; echo "$create"; exit 1; }
+find .graft/store/private/evidence_refs -type f | grep -q . || { echo "FAIL: from-scratch --expect did not create evidence refs"; echo "$create"; exit 1; }
+find .graft/store/derived/evidence -type f | grep -q . || { echo "FAIL: from-scratch --expect did not create evidence body"; echo "$create"; exit 1; }
 "$GRAFT" validate "$candidate" --expect workspace:touches_hello >/dev/null
 admit=$("$GRAFT" admit "$candidate" --require workspace:touches_hello)
 patch=$(grep -oE 'patch:[0-9a-f]+' <<<"$admit" | head -n1)

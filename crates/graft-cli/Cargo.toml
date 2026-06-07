@@ -11,6 +11,11 @@ license.workspace = true
 name = "graft"
 path = "src/main.rs"
 
+[[bin]]
+name = "graftd"
+path = "src/graftd.rs"
+
 [dependencies]
 anyhow.workspace = true
+graft-daemon = { path = "../graft-daemon" }
 graft-runtime = { path = "../graft-runtime" }
