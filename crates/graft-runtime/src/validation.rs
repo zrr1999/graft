@@ -5,7 +5,7 @@ use std::process::Command as ProcessCommand;
 
 use anyhow::{Context, Result, bail};
 use graft_core::{
-    ApplicationEndpoint, ApplicationPlan, ChangeRef, ChangeSet, CheckPlan, EvidenceRecord,
+    ApplicationEndpoint, ApplicationPlan, ApplicationRef, Change, CheckPlan, EvidenceRecord,
     EvidenceResult, FileChange, FileChangeKind, FileRefPlan, GraftCandidate, HistorySelector,
     OverlayPlan, PatchRecord, PathSetPlan, ProbePlan, ProbePolarity, ProbeResult, PropertyRef,
     PropertyScope, PropertySpec, RunPlan, RunSelectorPlan, ScopedPropertyRef, StateId, TreeEntry,
@@ -32,8 +32,12 @@ pub(crate) fn validate_candidate(
     expected: &[String],
 ) -> Result<Vec<EvidenceRecord>> {
     let config = load_graft_config(store)?;
-    let target =
-        validation_target_for_change(store, &config, candidate.id.as_str(), &candidate.change)?;
+    let target = validation_target_for_application(
+        store,
+        &config,
+        candidate.id.as_str(),
+        &candidate.application,
+    )?;
     ensure_integrity_passed(&target.integrity)?;
     let properties = validation_properties_with_base(&config, expected, &candidate.expected)?;
     let mut records = Vec::new();
@@ -56,7 +60,8 @@ pub(crate) fn validate_patch(
     expected: &[String],
 ) -> Result<Vec<EvidenceRecord>> {
     let config = load_graft_config(store)?;
-    let target = validation_target_for_change(store, &config, patch.id.as_str(), &patch.change)?;
+    let target =
+        validation_target_for_application(store, &config, patch.id.as_str(), &patch.application)?;
     ensure_integrity_passed(&target.integrity)?;
     let patch_properties = patch
         .properties
@@ -517,7 +522,7 @@ fn snapshot_for_tree_plan(
 struct HistoricalFailure {
     subject: String,
     created_at: String,
-    change: ChangeRef,
+    application: ApplicationRef,
 }
 
 fn previous_failure_snapshot(
@@ -528,15 +533,15 @@ fn previous_failure_snapshot(
     endpoint: &ApplicationEndpoint,
 ) -> std::result::Result<TreeSnapshot, String> {
     let failure = select_previous_failure(store, property, selector)?;
-    let ChangeRef::Stored(change_id) = &failure.change else {
-        return Err(format!(
-            "previous failed application `{}` has only an inline change summary",
-            failure.subject
-        ));
-    };
-    let change = store
-        .read_change(change_id.as_str())
-        .map_err(|error| format!("read previous failed change `{change_id}`: {error}"))?;
+    let resolved = store
+        .resolve_application(&failure.application)
+        .map_err(|error| {
+            format!(
+                "read previous failed application `{}`: {error}",
+                failure.subject
+            )
+        })?;
+    let change = resolved.change;
     let state = match endpoint {
         ApplicationEndpoint::Base => &change.base_state,
         ApplicationEndpoint::Target => &change.target_state,
@@ -566,7 +571,7 @@ fn select_previous_failure(
         record_failed_application(
             &mut failures,
             subject,
-            &candidate.change,
+            &candidate.application,
             property,
             evidence,
         );
@@ -579,7 +584,13 @@ fn select_previous_failure(
         let evidence = store
             .registry_evidence_for_subject(subject)
             .map_err(|error| format!("read patch evidence for `{subject}`: {error}"))?;
-        record_failed_application(&mut failures, subject, &patch.change, property, evidence);
+        record_failed_application(
+            &mut failures,
+            subject,
+            &patch.application,
+            property,
+            evidence,
+        );
     }
     let mut failures = failures.into_values().collect::<Vec<_>>();
     failures.sort_by(|left, right| {
@@ -611,7 +622,7 @@ fn select_previous_failure(
 fn record_failed_application(
     failures: &mut BTreeMap<String, HistoricalFailure>,
     subject: &str,
-    change: &ChangeRef,
+    application: &ApplicationRef,
     property: &PropertyRef,
     evidence: Vec<EvidenceRecord>,
 ) {
@@ -621,7 +632,7 @@ fn record_failed_application(
             let failure = HistoricalFailure {
                 subject: subject.to_string(),
                 created_at: record.created_at,
-                change: change.clone(),
+                application: application.clone(),
             };
             failures
                 .entry(subject.to_string())
@@ -834,66 +845,47 @@ pub(crate) fn evidence_for_current_verifiers(
         .collect())
 }
 
-fn validation_target_for_change(
+fn validation_target_for_application(
     store: &GraftStore,
     config: &GraftConfig,
     id: &str,
-    change: &ChangeRef,
+    application: &ApplicationRef,
 ) -> Result<ValidationTarget> {
-    match change {
-        ChangeRef::Stored(change_id) => {
-            let change = store.read_change(change_id.as_str())?;
-            let changed_paths = change
-                .files
-                .iter()
-                .filter(|file| !matches!(file.kind, FileChangeKind::Unchanged))
-                .map(|file| file.path.clone())
-                .collect();
-            let base_snapshot = materialized_snapshot_for_state(store, config, &change.base_state)?;
-            let target_snapshot =
-                materialized_snapshot_for_state(store, config, &change.target_state)?;
-            let integrity =
-                change_integrity_for_snapshots(&change, &base_snapshot, &target_snapshot);
-            Ok(ValidationTarget {
-                subject: ValidationSubject::with_change(id.to_string(), changed_paths),
-                base_snapshot: Some(base_snapshot),
-                target_snapshot: Some(target_snapshot),
-                integrity,
-            })
-        }
-        ChangeRef::InlineSummary(summary) => Ok(ValidationTarget {
-            subject: ValidationSubject::new(id.to_string()),
-            base_snapshot: None,
-            target_snapshot: None,
-            integrity: EvidenceResult::Unknown {
-                reason: graft_explain::diagnostics::c002_inline_change_not_transformable(summary)
-                    .format_reason(),
-            },
-        }),
-    }
+    let resolved = store.resolve_application(application)?;
+    let change = resolved.change;
+    let changed_paths = change
+        .endpoint_diff()
+        .into_iter()
+        .filter(|file| !matches!(file.kind, FileChangeKind::Unchanged))
+        .map(|file| file.path)
+        .collect();
+    let base_snapshot = materialized_snapshot_for_state(store, config, &change.base_state)?;
+    let target_snapshot = materialized_snapshot_for_state(store, config, &change.target_state)?;
+    let integrity = change_integrity_for_snapshots(&change, &base_snapshot, &target_snapshot);
+    Ok(ValidationTarget {
+        subject: ValidationSubject::with_change(id.to_string(), changed_paths),
+        base_snapshot: Some(base_snapshot),
+        target_snapshot: Some(target_snapshot),
+        integrity,
+    })
 }
 
 pub(crate) fn ensure_change_integrity(
     store: &GraftStore,
     config: &GraftConfig,
-    change: &ChangeRef,
+    application: &ApplicationRef,
 ) -> Result<()> {
-    let result = change_integrity_for_ref(store, config, change)?;
+    let result = change_integrity_for_application(store, config, application)?;
     ensure_integrity_passed(&result)
 }
 
-fn change_integrity_for_ref(
+fn change_integrity_for_application(
     store: &GraftStore,
     config: &GraftConfig,
-    change: &ChangeRef,
+    application: &ApplicationRef,
 ) -> Result<EvidenceResult> {
-    let ChangeRef::Stored(change_id) = change else {
-        return Ok(EvidenceResult::Unknown {
-            reason: "patch has only an inline change summary; no stored ChangeSet is available"
-                .to_string(),
-        });
-    };
-    let change = store.read_change(change_id.as_str())?;
+    let resolved = store.resolve_application(application)?;
+    let change = resolved.change;
     let target_snapshot = match materialized_snapshot_for_state(store, config, &change.target_state)
     {
         Ok(snapshot) => snapshot,
@@ -929,7 +921,7 @@ fn ensure_integrity_passed(result: &EvidenceResult) -> Result<()> {
 fn change_integrity_for_change(
     store: &GraftStore,
     config: &GraftConfig,
-    change: &ChangeSet,
+    change: &Change,
     target_snapshot: &TreeSnapshot,
 ) -> EvidenceResult {
     let base_snapshot = match materialized_snapshot_for_state(store, config, &change.base_state) {
@@ -945,7 +937,7 @@ fn change_integrity_for_change(
 }
 
 fn change_integrity_for_snapshots(
-    change: &ChangeSet,
+    change: &Change,
     base_snapshot: &TreeSnapshot,
     target_snapshot: &TreeSnapshot,
 ) -> EvidenceResult {
@@ -956,7 +948,7 @@ fn change_integrity_for_snapshots(
 }
 
 fn validate_change_replays_to_target(
-    change: &ChangeSet,
+    change: &Change,
     base_snapshot: &TreeSnapshot,
     target_snapshot: &TreeSnapshot,
 ) -> std::result::Result<(), String> {
@@ -965,7 +957,7 @@ fn validate_change_replays_to_target(
 
     let mut applied = snapshot_entries(base_snapshot);
     let mut seen = BTreeSet::new();
-    for file in &change.files {
+    for file in change.endpoint_diff() {
         if !seen.insert(file.path.clone()) {
             return Err(format!("duplicate change entry for path {}", file.path));
         }
@@ -974,22 +966,22 @@ fn validate_change_replays_to_target(
                 if applied.contains_key(&file.path) {
                     return Err(format!("path {} already exists in base", file.path));
                 }
-                let entry = target_entry_from_change(file)?;
+                let entry = target_entry_from_change(&file, target_snapshot)?;
                 applied.insert(file.path.clone(), entry);
             }
             FileChangeKind::Modified => {
                 let Some(base_entry) = applied.get(&file.path) else {
                     return Err(format!("path {} is missing from base", file.path));
                 };
-                ensure_change_matches_base(file, base_entry)?;
-                let entry = target_entry_from_change(file)?;
+                ensure_change_matches_base(&file, base_entry, base_snapshot)?;
+                let entry = target_entry_from_change(&file, target_snapshot)?;
                 applied.insert(file.path.clone(), entry);
             }
             FileChangeKind::Deleted => {
                 let Some(base_entry) = applied.get(&file.path) else {
                     return Err(format!("path {} is missing from base", file.path));
                 };
-                ensure_change_matches_base(file, base_entry)?;
+                ensure_change_matches_base(&file, base_entry, base_snapshot)?;
                 if file.target_hash.is_some() || file.target_size.is_some() {
                     return Err(format!("deleted path {} has target content", file.path));
                 }
@@ -999,8 +991,8 @@ fn validate_change_replays_to_target(
                 let Some(base_entry) = applied.get(&file.path) else {
                     return Err(format!("unchanged path {} is missing from base", file.path));
                 };
-                ensure_change_matches_base(file, base_entry)?;
-                let entry = target_entry_from_change(file)?;
+                ensure_change_matches_base(&file, base_entry, base_snapshot)?;
+                let entry = target_entry_from_change(&file, target_snapshot)?;
                 if entry != *base_entry {
                     return Err(format!(
                         "unchanged path {} changes content in target",
@@ -1045,26 +1037,38 @@ fn snapshot_entries(snapshot: &TreeSnapshot) -> BTreeMap<String, TreeEntry> {
         .collect()
 }
 
-fn target_entry_from_change(file: &FileChange) -> std::result::Result<TreeEntry, String> {
-    let Some(hash) = &file.target_hash else {
-        return Err(format!("path {} has no target hash", file.path));
-    };
-    let Some(size) = file.target_size else {
-        return Err(format!("path {} has no target size", file.path));
-    };
-    Ok(TreeEntry {
-        path: file.path.clone(),
-        hash: hash.clone(),
-        size,
-    })
+fn target_entry_from_change(
+    file: &FileChange,
+    target_snapshot: &TreeSnapshot,
+) -> std::result::Result<TreeEntry, String> {
+    if let (Some(hash), Some(size)) = (&file.target_hash, file.target_size) {
+        return Ok(TreeEntry {
+            path: file.path.clone(),
+            hash: hash.clone(),
+            size,
+        });
+    }
+    snapshot_entries(target_snapshot)
+        .get(&file.path)
+        .cloned()
+        .ok_or_else(|| format!("path {} is missing from target snapshot", file.path))
 }
 
 fn ensure_change_matches_base(
     file: &FileChange,
     base_entry: &TreeEntry,
+    base_snapshot: &TreeSnapshot,
 ) -> std::result::Result<(), String> {
-    if file.base_hash.as_deref() != Some(base_entry.hash.as_str())
-        || file.base_size != Some(base_entry.size)
+    let base_entries = snapshot_entries(base_snapshot);
+    let declared_hash = file
+        .base_hash
+        .clone()
+        .or_else(|| base_entries.get(&file.path).map(|entry| entry.hash.clone()));
+    let declared_size = file
+        .base_size
+        .or_else(|| base_entries.get(&file.path).map(|entry| entry.size));
+    if declared_hash.as_deref() != Some(base_entry.hash.as_str())
+        || declared_size != Some(base_entry.size)
     {
         return Err(format!(
             "path {} does not match declared base content",
@@ -1104,11 +1108,11 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use graft_core::{
-        ApplicationEndpoint, ApplicationPlan, ChangeRef, ChangeSet, CheckPlan, EvidenceRecord,
-        EvidenceResult, HistorySelector, PatchId, PatchRecord, PathSetPlan, ProbePlan,
+        ApplicationEndpoint, ApplicationPlan, Change, ChangeOp, CheckPlan, EvidenceRecord,
+        EvidenceResult, FileMode, HistorySelector, PatchId, PatchRecord, PathSetPlan, ProbePlan,
         ProbePolarity, PropertyName, PropertyPlan, PropertyRef, PropertyScope, PropertySpec,
         Provenance, RunPlan, ScopedPropertyRef, Severity, StateId, TreeEntry, TreePlan,
-        TreeSnapshot,
+        TreeSnapshot, application_from_change,
     };
     use graft_store::GraftStore;
     use graft_validate::ValidationSubject;
@@ -1158,18 +1162,17 @@ mod tests {
         }]);
         store.write_tree_snapshot(&base_snapshot).unwrap();
         store.write_tree_snapshot(&target_snapshot).unwrap();
-        let change = ChangeSet::from_snapshots(
+        let change = Change::from_snapshots(
             StateId::GraftTree(base_snapshot.id().unwrap()),
             Some(&base_snapshot),
             StateId::GraftTree(target_snapshot.id().unwrap()),
             &target_snapshot,
         );
-        let (change_id, _) = store.write_change(&change).unwrap();
+        let materialized = application_from_change(&change).unwrap();
+        let application = store.write_materialized_application(&materialized).unwrap();
         let patch = PatchRecord {
             id: PatchId::new(patch_id),
-            base_state: change.base_state.clone(),
-            target_state: change.target_state.clone(),
-            change: ChangeRef::Stored(change_id),
+            application,
             properties: vec![property.clone()],
             provenance: Provenance::now("test", None),
             admitted_at: "test-time".to_string(),
@@ -1201,7 +1204,7 @@ mod tests {
             hash: "new".to_string(),
             size: 3,
         }]);
-        let change = ChangeSet::from_snapshots(
+        let change = Change::from_snapshots(
             StateId::GraftTree(base.id().unwrap()),
             Some(&base),
             StateId::GraftTree(target.id().unwrap()),
@@ -1223,13 +1226,18 @@ mod tests {
             hash: "new".to_string(),
             size: 3,
         }]);
-        let mut change = ChangeSet::from_snapshots(
-            StateId::GraftTree(base.id().unwrap()),
-            Some(&base),
-            StateId::GraftTree(target.id().unwrap()),
-            &target,
-        );
-        change.files[0].base_hash = Some("other".to_string());
+        let change = Change {
+            base_state: StateId::GraftTree(base.id().unwrap()),
+            target_state: StateId::GraftTree(target.id().unwrap()),
+            ops: vec![ChangeOp::ReplaceFile {
+                path: "src/lib.rs".to_string(),
+                before: "other".to_string(),
+                after: "new".to_string(),
+                mode_before: FileMode::Regular,
+                mode_after: FileMode::Regular,
+            }],
+            capture: false,
+        };
 
         let reason = validate_change_replays_to_target(&change, &base, &target).unwrap_err();
 

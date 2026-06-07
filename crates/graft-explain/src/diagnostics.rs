@@ -193,7 +193,7 @@ pub fn r001_registry_index_corrupt(detail: &str) -> Diagnostic {
         "registry index is corrupt or missing tables",
     )
     .at(one_line(detail))
-    .fix("delete .graft/registry/index.sqlite and re-run `graft init` to rebuild")
+    .fix("delete .graft/local/index.sqlite and re-run `graft init` to rebuild")
     .see("registry")
 }
 
@@ -347,7 +347,7 @@ pub const ALL_DIAGNOSTICS: &[DiagnosticDoc] = &[
     DiagnosticDoc {
         code: DiagCode::new(DiagDomain::Registry, 1),
         summary: "registry index is corrupt or missing tables",
-        fix_hints: &["delete .graft/registry/index.sqlite and re-run `graft init` to rebuild"],
+        fix_hints: &["delete .graft/local/index.sqlite and re-run `graft init` to rebuild"],
         see_also: &["registry"],
     },
     // G — git bridge

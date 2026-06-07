@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
 use graft_client::{daemon_socket_path, request_result_or_spawn};
-use graft_core::{BaseRefSpec, ChangeSet, ScratchNode, StateId, scratch_id};
+use graft_core::{BaseRefSpec, Change, ScratchNode, StateId, scratch_id};
 use graft_store::GraftStore;
 use serde_json::{Map, Value, json};
 
@@ -350,17 +350,13 @@ fn run_scratch_capture(
     let captured_snapshot = store.capture_worktree_snapshot(workspace_root)?;
     let target_snapshot = store.capture_target_snapshot(&base_snapshot, &captured_snapshot);
     let target_tree_id = target_snapshot.id()?;
-    let change = ChangeSet::from_snapshots(
+    let change = Change::from_snapshots(
         base_state.clone(),
         Some(&base_snapshot),
         StateId::GraftTree(target_tree_id.clone()),
         &target_snapshot,
     );
-    let changed_paths = change
-        .files
-        .iter()
-        .map(|file| file.path.clone())
-        .collect::<Vec<_>>();
+    let changed_paths = change.changed_paths();
     if changed_paths.is_empty() {
         bail!("[E_EMPTY_CAPTURE] scratch capture found no changes; cwd left unchanged");
     }

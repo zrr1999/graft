@@ -216,13 +216,19 @@ pub(crate) fn resolve_base_state(
             let candidate = store
                 .read_candidate(id.as_str())
                 .with_context(|| format!("read candidate {id} for base ref `{from}`"))?;
-            Ok(candidate.target_state)
+            Ok(store
+                .resolve_application(&candidate.application)?
+                .record
+                .target_state)
         }
         BaseRefSpec::Patch(id) => {
             let patch = store
                 .read_patch(id.as_str())
                 .with_context(|| format!("read patch {id} for base ref `{from}`"))?;
-            Ok(patch.target_state)
+            Ok(store
+                .resolve_application(&patch.application)?
+                .record
+                .target_state)
         }
         BaseRefSpec::Repo { repo_id, treeish } => {
             let repo_config = config

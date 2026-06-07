@@ -267,8 +267,8 @@ fn dedupe_scoped_properties(properties: Vec<ScopedPropertyRef>) -> Vec<ScopedPro
 mod tests {
     use super::*;
     use graft_core::{
-        ChangeRef, CheckPlan, PropertyName, PropertyPlan, PropertyRef, PropertySpec, Provenance,
-        Severity, StateId,
+        ApplicationId, ApplicationRef, CheckPlan, PropertyName, PropertyPlan, PropertyRef,
+        PropertySpec, Provenance, Severity,
     };
 
     fn config_with_properties(names: &[&str]) -> GraftConfig {
@@ -473,9 +473,7 @@ mod tests {
     fn demo_candidate(config: &GraftConfig) -> GraftCandidate {
         GraftCandidate {
             id: graft_core::CandidateId::new("candidate:demo"),
-            base_state: StateId::GitTree("base".to_string()),
-            target_state: StateId::GitTree("target".to_string()),
-            change: ChangeRef::InlineSummary("demo".to_string()),
+            application: ApplicationRef::Stored(ApplicationId::new("application:demo")),
             expected: vec![ScopedPropertyRef::new(
                 PropertyScope::Workspace,
                 resolve_property(config, "tests_pass").unwrap(),

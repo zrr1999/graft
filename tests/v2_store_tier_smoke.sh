@@ -123,7 +123,7 @@ grep -q 'E_SYNC_DISABLED' <<<"$disabled_sync" || {
 sed -i.bak 's/enabled = false/enabled = true/' graft.toml
 rm -f graft.toml.bak
 "$GRAFT" sync "$REMOTE" --push-only >/dev/null
-grep -q "$REMOTE" .graft/state/remotes/default || { echo "FAIL: default sync remote was not recorded"; exit 1; }
+grep -q "$REMOTE" .graft/local/remotes/default || { echo "FAIL: default sync remote was not recorded"; exit 1; }
 "$GRAFT" sync --fetch-only >/dev/null
 git --git-dir "$REMOTE" show-ref --verify refs/graft/facts >/dev/null
 git --git-dir "$REMOTE" show-ref --verify refs/graft/blobs >/dev/null

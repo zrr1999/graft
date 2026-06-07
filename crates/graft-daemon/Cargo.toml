@@ -8,6 +8,7 @@ repository.workspace = true
 license.workspace = true
 
 [dependencies]
+clap.workspace = true
 graft-client = { path = "../graft-client" }
 graft-core = { path = "../graft-core" }
 graft-runtime = { path = "../graft-runtime" }

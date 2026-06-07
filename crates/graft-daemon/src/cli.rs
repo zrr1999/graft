@@ -8,6 +8,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use clap::{Parser, Subcommand};
 use graft_client::{
     DaemonSocketState, WireResponse, daemon_socket_path, daemon_socket_state, encode_response,
     prepare_daemon_socket_for_bind, request_result as client_request_result,
@@ -19,6 +20,55 @@ use crate::{DaemonState, handle_frame};
 
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
+#[derive(Parser, Debug)]
+#[command(
+    name = "graftd",
+    about = "Graft workspace daemon (Unix socket writer)",
+    long_about = "Run and control graftd, the process that owns $GRAFT_HOME/run/daemon.sock, serializes `.graft/` writes, and serves CLI wire requests."
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<DaemonCommand>,
+
+    #[arg(
+        long,
+        global = true,
+        help = "Unix socket path; defaults to $GRAFT_HOME/run/daemon.sock"
+    )]
+    socket: Option<PathBuf>,
+
+    #[arg(
+        long,
+        global = true,
+        help = "Workspace directory whose .graft/ store the daemon serves"
+    )]
+    cwd: Option<PathBuf>,
+}
+
+#[derive(Subcommand, Debug)]
+enum DaemonCommand {
+    /// Start the daemon. Without `--fg`, spawn a detached background child and
+    /// wait for the socket to come up before returning.
+    Start {
+        #[arg(
+            long,
+            short = 'f',
+            help = "Run in the foreground instead of spawning a detached child"
+        )]
+        fg: bool,
+    },
+    /// Run the daemon in the foreground (also used by the spawned background
+    /// child). Owns $GRAFT_HOME/run/daemon.sock and daemon.pid.
+    Serve,
+    /// Stop the running daemon (if any) and start a fresh one.
+    Restart,
+    /// Check daemon status over the Unix socket.
+    Status,
+    /// Request graceful daemon shutdown.
+    #[command(visible_aliases = ["shutdown"])]
+    Stop,
+}
+
 pub fn run() {
     if let Err(error) = run_inner() {
         eprintln!("graftd: {error}");
@@ -27,44 +77,19 @@ pub fn run() {
 }
 
 fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
-    let args = env::args().skip(1).collect::<Vec<_>>();
-    let command = args.first().map(String::as_str).unwrap_or("start");
-    let socket = match option_value(&args, "--socket") {
-        Some(socket) => PathBuf::from(socket),
+    let cli = Cli::parse();
+    let socket = match cli.socket {
+        Some(socket) => socket,
         None => daemon_socket_path()?,
     };
+    let cwd = resolve_daemon_cwd(cli.cwd)?;
 
-    match command {
-        "start" => {
-            let cwd = resolve_daemon_cwd(&args)?;
-            start(
-                &cwd,
-                &socket,
-                has_flag(&args, "--fg") || has_flag(&args, "-f"),
-            )
-        }
-        "serve" => {
-            let cwd = resolve_daemon_cwd(&args)?;
-            serve(&cwd, &socket)
-        }
-        "restart" => {
-            let cwd = resolve_daemon_cwd(&args)?;
-            restart(&cwd, &socket)
-        }
-        "status" => request_once(&socket, "status", serde_json::json!({})),
-        "stop" | "shutdown" => request_once(&socket, "shutdown", serde_json::json!({})),
-        "help" | "--help" | "-h" => {
-            print_help();
-            Ok(())
-        }
-        "--version" | "-V" => {
-            println!("graftd {}", env!("CARGO_PKG_VERSION"));
-            Ok(())
-        }
-        other => Err(format!(
-            "unknown command {other}; expected start/serve/restart/status/stop/shutdown"
-        )
-        .into()),
+    match cli.command.unwrap_or(DaemonCommand::Start { fg: false }) {
+        DaemonCommand::Start { fg } => start(&cwd, &socket, fg),
+        DaemonCommand::Serve => serve(&cwd, &socket),
+        DaemonCommand::Restart => restart(&cwd, &socket),
+        DaemonCommand::Status => request_once(&socket, "status", serde_json::json!({})),
+        DaemonCommand::Stop => request_once(&socket, "shutdown", serde_json::json!({})),
     }
 }
 
@@ -432,40 +457,23 @@ fn request_once(
     Ok(())
 }
 
-fn option_value(args: &[String], name: &str) -> Option<String> {
-    args.windows(2)
-        .find(|window| window[0] == name)
-        .map(|window| window[1].clone())
-}
-
-fn has_flag(args: &[String], name: &str) -> bool {
-    args.iter().any(|arg| arg == name)
-}
-
-fn resolve_daemon_cwd(args: &[String]) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    resolve_daemon_cwd_with(args, env::current_dir)
+fn resolve_daemon_cwd(cwd: Option<PathBuf>) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    resolve_daemon_cwd_with(cwd, env::current_dir)
 }
 
 fn resolve_daemon_cwd_with<F>(
-    args: &[String],
+    cwd: Option<PathBuf>,
     current_dir: F,
 ) -> Result<PathBuf, Box<dyn std::error::Error>>
 where
     F: FnOnce() -> io::Result<PathBuf>,
 {
-    if let Some(cwd) = option_value(args, "--cwd") {
-        return Ok(PathBuf::from(cwd));
+    if let Some(cwd) = cwd {
+        return Ok(cwd);
     }
     current_dir().map_err(|error| {
         format!("[E_CWD_UNAVAILABLE] cannot resolve default daemon cwd: {error}").into()
     })
-}
-
-fn print_help() {
-    println!(
-        "graftd {}\n\nUsage:\n  graftd start [--fg] [--cwd PATH] [--socket PATH]\n  graftd serve [--cwd PATH] [--socket PATH]\n  graftd restart [--cwd PATH] [--socket PATH]\n  graftd status [--socket PATH]\n  graftd stop [--socket PATH]\n  graftd shutdown [--socket PATH]\n\nCommands:\n  start     Start the daemon. Without --fg, spawn a detached background\n            child and wait for the socket to come up before returning.\n  serve     Run the daemon in the foreground (also used by the spawned\n            background child). Owns $GRAFT_HOME/run/daemon.sock and daemon.pid.\n  restart   Stop the running daemon (if any) and start a fresh one.\n  status    Check daemon status over the Unix socket.\n  stop      Request graceful daemon shutdown.\n  shutdown  Alias for stop.",
-        env!("CARGO_PKG_VERSION")
-    );
 }
 
 #[cfg(test)]
@@ -563,11 +571,37 @@ idle_timeout_seconds = "fast"
     }
 
     #[test]
-    fn option_value_reads_socket_path() {
-        assert_eq!(
-            option_value(&["--socket".into(), "sock".into()], "--socket"),
-            Some("sock".to_string())
-        );
+    fn cli_parse_reads_global_socket_and_cwd() {
+        let cli = Cli::try_parse_from([
+            "graftd",
+            "status",
+            "--socket",
+            "run/daemon.sock",
+            "--cwd",
+            "/workspace/project",
+        ])
+        .unwrap();
+
+        assert!(matches!(cli.command, Some(DaemonCommand::Status)));
+        assert_eq!(cli.socket.as_deref(), Some(Path::new("run/daemon.sock")));
+        assert_eq!(cli.cwd.as_deref(), Some(Path::new("/workspace/project")));
+    }
+
+    #[test]
+    fn cli_parse_defaults_to_start_without_subcommand() {
+        let cli = Cli::try_parse_from(["graftd"]).unwrap();
+
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn cli_parse_accepts_foreground_short_flag() {
+        let cli = Cli::try_parse_from(["graftd", "start", "-f"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Some(DaemonCommand::Start { fg: true })
+        ));
     }
 
     #[test]
@@ -590,10 +624,9 @@ idle_timeout_seconds = "fast"
 
     #[test]
     fn daemon_cwd_uses_explicit_arg_without_reading_process_cwd() {
-        let cwd = resolve_daemon_cwd_with(
-            &["start".into(), "--cwd".into(), "/workspace/project".into()],
-            || panic!("explicit --cwd must not inspect process cwd"),
-        )
+        let cwd = resolve_daemon_cwd_with(Some(PathBuf::from("/workspace/project")), || {
+            panic!("explicit --cwd must not inspect process cwd")
+        })
         .unwrap();
 
         assert_eq!(cwd, PathBuf::from("/workspace/project"));
@@ -601,17 +634,15 @@ idle_timeout_seconds = "fast"
 
     #[test]
     fn daemon_cwd_defaults_to_current_dir() {
-        let cwd = resolve_daemon_cwd_with(&["start".into()], || {
-            Ok(PathBuf::from("/workspace/current"))
-        })
-        .unwrap();
+        let cwd =
+            resolve_daemon_cwd_with(None, || Ok(PathBuf::from("/workspace/current"))).unwrap();
 
         assert_eq!(cwd, PathBuf::from("/workspace/current"));
     }
 
     #[test]
     fn daemon_cwd_reports_unavailable_current_dir() {
-        let error = resolve_daemon_cwd_with(&["start".into()], || {
+        let error = resolve_daemon_cwd_with(None, || {
             Err(io::Error::new(io::ErrorKind::NotFound, "cwd vanished"))
         })
         .unwrap_err()
@@ -619,12 +650,6 @@ idle_timeout_seconds = "fast"
 
         assert!(error.contains("[E_CWD_UNAVAILABLE]"), "{error}");
         assert!(error.contains("cwd vanished"), "{error}");
-    }
-
-    #[test]
-    fn has_flag_finds_foreground_aliases() {
-        assert!(has_flag(&["start".into(), "--fg".into()], "--fg"));
-        assert!(!has_flag(&["start".into()], "--fg"));
     }
 
     #[test]

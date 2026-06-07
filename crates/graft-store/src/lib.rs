@@ -6,10 +6,18 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use graft_core::{
-    CandidateId, ChangeSet, EvidenceRecord, GraftCandidate, PatchId, PatchRecord, PatchRelation,
+    Action, ActionId, ApplicationId, ApplicationRecord, ApplicationRef, CandidateId, Change,
+    EvidenceRecord, GraftCandidate, MaterializedApplication, PatchId, PatchRecord, PatchRelation,
     PromotionRecord, PropertyDef, PropertyId, PropertyRef, PropertySpec, StateId, TreeEntry,
-    TreeSnapshot, evidence_id,
+    TreeSnapshot, action_id, evidence_id,
 };
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedApplication {
+    pub record: ApplicationRecord,
+    pub change: Change,
+    pub action: Action,
+}
 use rusqlite::Connection;
 
 pub mod discovery;
@@ -225,6 +233,14 @@ impl GraftPaths {
         self.root.join("store").join("public").join("change")
     }
 
+    pub fn object_actions(&self) -> PathBuf {
+        self.root.join("store").join("public").join("action")
+    }
+
+    pub fn object_applications(&self) -> PathBuf {
+        self.root.join("store").join("public").join("application")
+    }
+
     pub fn object_properties(&self) -> PathBuf {
         self.root.join("store").join("public").join("property")
     }
@@ -264,12 +280,34 @@ impl GraftPaths {
         self.root.join("store").join("public").join("promotion")
     }
 
+    /// Workspace-local mutable bookkeeping (aliases, sync pointers, indexes).
+    ///
+    /// Named `local/` to avoid confusion with patch-theory [`StateId`] ("State").
+    pub const LOCAL_DIR: &str = "local";
+
+    const LEGACY_LOCAL_DIR: &str = "state";
+
+    pub fn local_root(&self) -> PathBuf {
+        self.root.join(Self::LOCAL_DIR)
+    }
+
     pub fn index(&self) -> PathBuf {
-        self.root.join("state").join("index.sqlite")
+        self.local_root().join("index.sqlite")
     }
 
     pub fn refs(&self) -> PathBuf {
-        self.root.join("state").join("aliases")
+        self.local_root().join("aliases")
+    }
+
+    pub fn default_sync_remote(&self) -> PathBuf {
+        self.local_root().join("remotes").join("default")
+    }
+
+    pub fn remote_last_synced(&self, remote_key: &str) -> PathBuf {
+        self.local_root()
+            .join("remotes")
+            .join(remote_key)
+            .join("last_synced")
     }
 
     pub fn materialized_refs(&self) -> PathBuf {
@@ -349,8 +387,11 @@ impl GraftStore {
     }
 
     pub fn init_storage(&self) -> Result<()> {
+        self.migrate_legacy_local_dir()?;
         fs::create_dir_all(self.paths.object_blobs())?;
         fs::create_dir_all(self.paths.object_trees())?;
+        fs::create_dir_all(self.paths.object_actions())?;
+        fs::create_dir_all(self.paths.object_applications())?;
         fs::create_dir_all(self.paths.object_changes())?;
         fs::create_dir_all(self.paths.object_properties())?;
         fs::create_dir_all(self.paths.object_patches())?;
@@ -522,11 +563,13 @@ impl GraftStore {
             VirtualBaseRef::Tree(id) => self.read_tree_snapshot(id),
             VirtualBaseRef::Candidate(id) => {
                 let candidate = self.read_candidate(id.as_str())?;
-                self.virtual_tree_for_state(&candidate.target_state)
+                let resolved = self.resolve_application(&candidate.application)?;
+                self.virtual_tree_for_state(&resolved.record.target_state)
             }
             VirtualBaseRef::Patch(id) => {
                 let patch = self.read_patch(id.as_str())?;
-                self.virtual_tree_for_state(&patch.target_state)
+                let resolved = self.resolve_application(&patch.application)?;
+                self.virtual_tree_for_state(&resolved.record.target_state)
             }
         }
     }
@@ -601,7 +644,34 @@ impl GraftStore {
             .collect()
     }
 
-    pub fn write_change(&self, change: &ChangeSet) -> Result<(graft_core::ChangeId, PathBuf)> {
+    pub fn write_action(&self, action: &Action) -> Result<(ActionId, PathBuf)> {
+        fs::create_dir_all(self.paths.object_actions())?;
+        let id = action_id(action).map_err(StoreError::Core)?;
+        let path = self.paths.object_actions().join(format!("{id}.json"));
+        write_json(&path, action)?;
+        Ok((id, path))
+    }
+
+    pub fn read_action(&self, id: &str) -> Result<Action> {
+        read_json(&self.paths.object_actions().join(format!("{id}.json")))
+    }
+
+    pub fn write_application(
+        &self,
+        record: &ApplicationRecord,
+    ) -> Result<(ApplicationId, PathBuf)> {
+        fs::create_dir_all(self.paths.object_applications())?;
+        let id = record.id().map_err(StoreError::Core)?;
+        let path = self.paths.object_applications().join(format!("{id}.json"));
+        write_json(&path, record)?;
+        Ok((id, path))
+    }
+
+    pub fn read_application(&self, id: &str) -> Result<ApplicationRecord> {
+        read_json(&self.paths.object_applications().join(format!("{id}.json")))
+    }
+
+    pub fn write_change(&self, change: &Change) -> Result<(graft_core::ChangeId, PathBuf)> {
         fs::create_dir_all(self.paths.object_changes())?;
         let id = change.id().map_err(StoreError::Core)?;
         let path = self.paths.object_changes().join(format!("{id}.json"));
@@ -609,12 +679,70 @@ impl GraftStore {
         Ok((id, path))
     }
 
-    pub fn read_change(&self, id: &str) -> Result<ChangeSet> {
+    pub fn read_change(&self, id: &str) -> Result<Change> {
         read_json(&self.paths.object_changes().join(format!("{id}.json")))
     }
 
-    pub fn list_change_objects(&self) -> Result<Vec<(String, ChangeSet)>> {
-        read_named_json_records::<ChangeSet>(&self.paths.object_changes())?
+    pub fn write_materialized_application(
+        &self,
+        materialized: &MaterializedApplication,
+    ) -> Result<ApplicationRef> {
+        self.write_action(&materialized.action)?;
+        self.write_change(&materialized.change)?;
+        let (application_id, _) = self.write_application(&materialized.record)?;
+        Ok(ApplicationRef::Stored(application_id))
+    }
+
+    pub fn resolve_application(&self, application: &ApplicationRef) -> Result<ResolvedApplication> {
+        let ApplicationRef::Stored(application_id) = application;
+        let record = self.read_application(application_id.as_str())?;
+        let change = self.read_change(record.change.as_str())?;
+        let action = self.read_action(record.action.as_str())?;
+        Ok(ResolvedApplication {
+            record,
+            change,
+            action,
+        })
+    }
+
+    pub fn list_change_objects(&self) -> Result<Vec<(String, Change)>> {
+        read_named_json_records::<Change>(&self.paths.object_changes())?
+            .into_iter()
+            .map(|record| {
+                let actual = record.value.id().map_err(StoreError::Core)?.to_string();
+                if actual != record.id {
+                    return Err(StoreError::StoreObjectIdMismatch {
+                        path: record.path,
+                        expected: record.id,
+                        actual,
+                    });
+                }
+                Ok((record.id, record.value))
+            })
+            .collect()
+    }
+
+    pub fn list_action_objects(&self) -> Result<Vec<(String, Action)>> {
+        read_named_json_records::<Action>(&self.paths.object_actions())?
+            .into_iter()
+            .map(|record| {
+                let actual = action_id(&record.value)
+                    .map_err(StoreError::Core)?
+                    .to_string();
+                if actual != record.id {
+                    return Err(StoreError::StoreObjectIdMismatch {
+                        path: record.path,
+                        expected: record.id,
+                        actual,
+                    });
+                }
+                Ok((record.id, record.value))
+            })
+            .collect()
+    }
+
+    pub fn list_application_objects(&self) -> Result<Vec<(String, ApplicationRecord)>> {
+        read_named_json_records::<ApplicationRecord>(&self.paths.object_applications())?
             .into_iter()
             .map(|record| {
                 let actual = record.value.id().map_err(StoreError::Core)?.to_string();
@@ -950,11 +1078,27 @@ impl GraftStore {
             .map_err(StoreError::from)
     }
 
+    fn migrate_legacy_local_dir(&self) -> Result<()> {
+        let legacy = self.paths.root().join(GraftPaths::LEGACY_LOCAL_DIR);
+        let local = self.paths.local_root();
+        if legacy.is_dir() && !local.exists() {
+            fs::rename(&legacy, &local)?;
+        }
+        Ok(())
+    }
+
     fn init_index(&self) -> Result<()> {
         if let Some(parent) = self.paths.index().parent() {
             fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(self.paths.index())?;
+        let index_path = self.paths.index();
+        if index_path.is_file() {
+            let header = fs::read(&index_path).unwrap_or_default();
+            if header.len() < 16 || &header[..16] != b"SQLite format 3\0" {
+                fs::remove_file(&index_path)?;
+            }
+        }
+        let conn = Connection::open(index_path)?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS patches (
                 patch_id TEXT PRIMARY KEY,
@@ -978,14 +1122,15 @@ impl GraftStore {
     }
 
     fn index_patch(&self, patch: &PatchRecord) -> Result<()> {
+        let resolved = self.resolve_application(&patch.application)?;
         let conn = Connection::open(self.paths.index())?;
         conn.execute(
             "INSERT OR REPLACE INTO patches (patch_id, base_state, target_state, admitted_at)
              VALUES (?1, ?2, ?3, ?4)",
             (
                 patch.id.to_string(),
-                serde_json::to_string(&patch.base_state)?,
-                serde_json::to_string(&patch.target_state)?,
+                serde_json::to_string(&resolved.record.base_state)?,
+                serde_json::to_string(&resolved.record.target_state)?,
                 patch.admitted_at.clone(),
             ),
         )?;
@@ -1523,9 +1668,21 @@ fn normalize_relative_path(root: &Path, path: &Path) -> Result<String> {
 mod tests {
     use super::*;
     use graft_core::{
-        ChangeRef, PatchId, PatchRelation, PatchRelationKind, PromotionId, PromotionRecord,
-        PropertyId, Provenance, RelationId, StateId,
+        PatchId, PatchRelation, PatchRelationKind, PromotionId, PromotionRecord, PropertyId,
+        Provenance, RelationId, StateId, materialize_application,
     };
+
+    fn test_application_ref(
+        store: &GraftStore,
+        base_state: StateId,
+        base: Option<&TreeSnapshot>,
+        target_snapshot: &TreeSnapshot,
+    ) -> ApplicationRef {
+        let target_state = StateId::GraftTree(target_snapshot.id().unwrap());
+        let materialized =
+            materialize_application(base_state, base, target_state, target_snapshot).unwrap();
+        store.write_materialized_application(&materialized).unwrap()
+    }
 
     #[test]
     fn workspace_path_normalization_preserves_missing_suffix_under_canonical_parent() {
@@ -2209,11 +2366,16 @@ mod tests {
         }]);
         let (tree_id, _) = store.write_tree_snapshot(&snapshot).unwrap();
 
+        let application = test_application_ref(
+            &store,
+            StateId::GraftTree("tree:base".to_string()),
+            None,
+            &snapshot,
+        );
+
         let candidate = GraftCandidate {
             id: graft_core::CandidateId::new("candidate:demo"),
-            base_state: StateId::GraftTree("tree:base".to_string()),
-            target_state: StateId::GraftTree(tree_id.clone()),
-            change: ChangeRef::InlineSummary("demo".to_string()),
+            application: application.clone(),
             expected: Vec::new(),
             provenance: Provenance {
                 producer: "test".to_string(),
@@ -2225,9 +2387,7 @@ mod tests {
 
         let patch = PatchRecord {
             id: PatchId::new("patch:demo"),
-            base_state: StateId::GraftTree("tree:base".to_string()),
-            target_state: StateId::GraftTree(tree_id.clone()),
-            change: ChangeRef::InlineSummary("demo".to_string()),
+            application,
             properties: Vec::new(),
             provenance: Provenance {
                 producer: "test".to_string(),
@@ -2309,11 +2469,22 @@ mod tests {
         store.init().unwrap();
 
         let property = PropertyRef::new(PropertyId::new("property:observation"), "ObservationOnly");
+        let hash = store.write_blob(b"demo\n").unwrap();
+        let snapshot = TreeSnapshot::new(vec![TreeEntry {
+            path: "src/lib.rs".to_string(),
+            hash,
+            size: 5,
+        }]);
+        store.write_tree_snapshot(&snapshot).unwrap();
+        let application = test_application_ref(
+            &store,
+            StateId::GitTree("base".to_string()),
+            None,
+            &snapshot,
+        );
         let patch = PatchRecord {
             id: PatchId::new("patch:demo"),
-            base_state: StateId::GitTree("base".to_string()),
-            target_state: StateId::GraftTree("target".to_string()),
-            change: ChangeRef::InlineSummary("demo".to_string()),
+            application,
             properties: vec![property.clone()],
             provenance: Provenance {
                 producer: "test".to_string(),
@@ -2566,6 +2737,28 @@ mod tests {
                 .unwrap()
                 .exists()
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn init_storage_migrates_legacy_state_dir_to_local() {
+        let dir = std::env::temp_dir().join(format!(
+            "graft-store-local-dir-migrate-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let legacy = dir.join(".graft").join("state");
+        fs::create_dir_all(legacy.join("aliases")).unwrap();
+        fs::write(legacy.join("index.sqlite"), b"legacy").unwrap();
+
+        let store = GraftStore::open(&dir);
+        store.init_storage().unwrap();
+
+        assert!(!legacy.exists());
+        assert!(store.paths().local_root().is_dir());
+        assert!(store.paths().index().is_file());
+        assert!(store.paths().refs().is_dir());
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -4,9 +4,9 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use graft_core::{
-    CanonicalScratchOp, ChangeSet, FileViewHash, FileViewHashSeed, GraftCandidate, HashlineEdit,
+    CanonicalScratchOp, Change, FileViewHash, FileViewHashSeed, GraftCandidate, HashlineEdit,
     ScopedPropertyRef, ScratchId, ScratchNode, StateId, TreeEntry, TreeSnapshot, candidate_id,
-    file_view_hash, scratch_id,
+    file_view_hash, materialize_application, scratch_id,
 };
 use graft_store::{GraftStore, StoreError, VirtualBaseRef, VirtualFile};
 
@@ -314,17 +314,13 @@ impl ScratchEngine {
     ) -> Result<ScratchCapture> {
         let base_tree = self.store.read_tree_snapshot(base_tree_id)?;
         let target_tree = self.store.read_tree_snapshot(target_tree_id)?;
-        let change = ChangeSet::from_snapshots(
+        let change = Change::from_snapshots(
             base_state.clone(),
             Some(&base_tree),
             StateId::GraftTree(target_tree_id.to_string()),
             &target_tree,
         );
-        let changed_paths = change
-            .files
-            .iter()
-            .map(|file| file.path.clone())
-            .collect::<Vec<_>>();
+        let changed_paths = change.changed_paths();
         if changed_paths.is_empty() {
             return Err(ScratchError::EmptyChange);
         }
@@ -351,7 +347,7 @@ impl ScratchEngine {
     pub fn diff(&self, from: &ScratchId, to: &ScratchId) -> Result<ScratchDiff> {
         let from_state = self.state(from)?;
         let to_state = self.state(to)?;
-        let change = ChangeSet::from_snapshots(
+        let change = Change::from_snapshots(
             from_state.node.base_state,
             Some(&from_state.tree),
             to_state.node.base_state,
@@ -360,7 +356,7 @@ impl ScratchEngine {
         Ok(ScratchDiff {
             from: from.clone(),
             to: to.clone(),
-            changed_paths: change.files.into_iter().map(|file| file.path).collect(),
+            changed_paths: change.changed_paths(),
         })
     }
 
@@ -417,23 +413,22 @@ impl ScratchEngine {
         let state = self.state(scratch)?;
         let target_tree_id = state.tree.id()?;
         self.store.write_tree_snapshot(&state.tree)?;
-        let change = ChangeSet::from_snapshots(
+        let target_state = StateId::GraftTree(target_tree_id);
+        let materialized = materialize_application(
             state.node.base_state.clone(),
             Some(&state.base_tree),
-            StateId::GraftTree(target_tree_id),
+            target_state,
             &state.tree,
-        );
-        let changed_paths = change
-            .files
-            .iter()
-            .map(|file| file.path.clone())
-            .collect::<Vec<_>>();
-        let (change_id, _) = self.store.write_change(&change)?;
+        )
+        .map_err(ScratchError::Core)?;
+        let changed_paths = materialized.change.changed_paths();
+        let application = self
+            .store
+            .write_materialized_application(&materialized)
+            .map_err(ScratchError::Store)?;
         let mut candidate = GraftCandidate {
             id: graft_core::CandidateId::new("candidate:pending"),
-            base_state: change.base_state,
-            target_state: change.target_state,
-            change: graft_core::ChangeRef::Stored(change_id),
+            application,
             expected,
             provenance: graft_core::Provenance::now(producer, message),
         };
@@ -503,8 +498,20 @@ fn base_state_for_ref(store: &GraftStore, base: &VirtualBaseRef) -> Result<State
             Ok(StateId::GraftTree(tree_id))
         }
         VirtualBaseRef::Tree(id) => Ok(StateId::GraftTree(id.clone())),
-        VirtualBaseRef::Candidate(id) => Ok(store.read_candidate(id.as_str())?.target_state),
-        VirtualBaseRef::Patch(id) => Ok(store.read_patch(id.as_str())?.target_state),
+        VirtualBaseRef::Candidate(id) => {
+            let candidate = store.read_candidate(id.as_str())?;
+            Ok(store
+                .resolve_application(&candidate.application)?
+                .record
+                .target_state)
+        }
+        VirtualBaseRef::Patch(id) => {
+            let patch = store.read_patch(id.as_str())?;
+            Ok(store
+                .resolve_application(&patch.application)?
+                .record
+                .target_state)
+        }
     }
 }
 
@@ -1243,28 +1250,26 @@ mod tests {
             .store
             .read_candidate(result.candidate.as_str())
             .unwrap();
-        let change_id = match candidate.change {
-            graft_core::ChangeRef::Stored(id) => id,
-            graft_core::ChangeRef::InlineSummary(_) => {
-                panic!("candidate_from_scratch must store change")
-            }
-        };
-        let change = engine.store.read_change(change_id.as_str()).unwrap();
+        let resolved = engine
+            .store
+            .resolve_application(&candidate.application)
+            .unwrap();
+        let change = resolved.change;
         assert!(
             change
-                .files
+                .endpoint_diff()
                 .iter()
                 .any(|file| { file.path == "README.md" && file.kind == FileChangeKind::Deleted })
         );
         assert!(
             change
-                .files
+                .endpoint_diff()
                 .iter()
                 .any(|file| { file.path == "src/lib.rs" && file.kind == FileChangeKind::Modified })
         );
         assert!(
             change
-                .files
+                .endpoint_diff()
                 .iter()
                 .any(|file| { file.path == "src/main.rs" && file.kind == FileChangeKind::Added })
         );

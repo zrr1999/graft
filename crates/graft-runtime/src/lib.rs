@@ -27,16 +27,16 @@ use config::{GraftConfig, load_graft_config, load_property_defs};
 use daemon_client::workspace_root_wire_string;
 use graft_client::{daemon_socket_path, request_result_or_spawn};
 use graft_core::{
-    ChangeRef, ChangeSet, EvidenceRecord, EvidenceResult, FileChangeKind, GraftCandidate,
+    ApplicationRef, Change, EvidenceRecord, EvidenceResult, FileChangeKind, GraftCandidate,
     PatchRecord, PatchRelation, PatchRelationKind, PromotionRecord, PropertyId, Provenance,
-    ScopedPropertyRef, StateId, TreeEntry, TreeSnapshot, candidate_id, patch_id, promotion_id,
-    relation_id,
+    ScopedPropertyRef, StateId, TreeEntry, TreeSnapshot, application_from_change, candidate_id,
+    patch_id, promotion_id, relation_id,
 };
 use graft_explain::NextAction;
 use graft_promote::GixBackend;
 use graft_store::{
-    DEFAULT_WORKSPACE_ID, GraftStore, RegistryStore, StoreError, WorkspaceDiscovery,
-    default_workspace_root, normalize_workspace_path,
+    DEFAULT_WORKSPACE_ID, GraftStore, RegistryStore, ResolvedApplication, StoreError,
+    WorkspaceDiscovery, default_workspace_root, normalize_workspace_path,
 };
 #[cfg(test)]
 use graft_store::{WorkspaceKind, local_workspace_id_for_root};
@@ -1674,7 +1674,7 @@ impl LocalCommandRouter<'_> {
                 let candidate = store.read_candidate(id)?;
                 let evidence = store.candidate_evidence_records(id)?;
                 let config = load_graft_config(store)?;
-                ensure_change_integrity(store, &config, &candidate.change)?;
+                ensure_change_integrity(store, &config, &candidate.application)?;
                 ensure_candidate_expected_properties_current(&config, &candidate)?;
                 let required_properties =
                     admission_required_scoped_properties(&config, &candidate, required)?;
@@ -1683,9 +1683,7 @@ impl LocalCommandRouter<'_> {
                 require_passed_scoped_evidence(&required_properties, &current_evidence, id)?;
                 let mut patch = PatchRecord {
                     id: graft_core::PatchId::new("patch:pending"),
-                    base_state: candidate.base_state,
-                    target_state: candidate.target_state,
-                    change: candidate.change,
+                    application: candidate.application.clone(),
                     properties: property_refs_for_scoped(&required_properties),
                     provenance: candidate.provenance,
                     admitted_at: OffsetDateTime::now_utc().to_string(),
@@ -1756,16 +1754,16 @@ impl LocalCommandRouter<'_> {
                 store.init_storage()?;
                 let first_patch = store.read_patch(first)?;
                 let second_patch = store.read_patch(second)?;
-                if first_patch.target_state != second_patch.base_state {
+                let first_resolved = store.resolve_application(&first_patch.application)?;
+                let second_resolved = store.resolve_application(&second_patch.application)?;
+                if first_resolved.record.target_state != second_resolved.record.base_state {
                     bail!(
                         "[E_COMPOSE_CONFLICT] cannot compose {first} then {second}: target({first}) = {} but base({second}) = {}; create a new candidate manually from the desired resolution",
-                        state_label(&first_patch.target_state),
-                        state_label(&second_patch.base_state),
+                        state_label(&first_resolved.record.target_state),
+                        state_label(&second_resolved.record.base_state),
                     );
                 }
-                let first_change = stored_change(store, &first_patch.change)?;
-                let second_change = stored_change(store, &second_patch.change)?;
-                let change = ChangeSet::compose(&first_change, &second_change);
+                let change = Change::compose(&first_resolved.change, &second_resolved.change);
                 let config = load_graft_config(store)?;
                 let (candidate, evidence) = write_candidate_from_change(
                     store,
@@ -1796,14 +1794,15 @@ impl LocalCommandRouter<'_> {
             } => {
                 store.init_storage()?;
                 let patch = store.read_patch(id)?;
-                let change = stored_change(store, &patch.change)?;
+                let resolved = store.resolve_application(&patch.application)?;
+                let change = resolved.change;
                 let config = load_graft_config(store)?;
                 let base_state = resolve_base_state(store, &config, onto)?;
                 let Some(base_snapshot) = base_snapshot_for_state(store, &config, &base_state)?
                 else {
                     bail!("cannot resolve base snapshot for {onto}");
                 };
-                let migration = migrate_change(&change, &patch, base_state, &base_snapshot)?;
+                let migration = migrate_change(&change, base_state, &base_snapshot)?;
                 let migrated = match migration {
                     MigrationOutcome::Clean { change, snapshot } => {
                         store.write_tree_snapshot(&snapshot)?;
@@ -1844,7 +1843,10 @@ impl LocalCommandRouter<'_> {
             } => {
                 store.init_storage()?;
                 let patch = store.read_patch(id)?;
-                let change = stored_change(store, &patch.change)?.reversed();
+                let change = store
+                    .resolve_application(&patch.application)?
+                    .change
+                    .reversed();
                 let config = load_graft_config(store)?;
                 let (candidate, evidence) = write_candidate_from_change(
                     store,
@@ -1925,7 +1927,7 @@ impl LocalCommandRouter<'_> {
                 let patch = store.read_patch(id)?;
                 let evidence = store.registry_evidence_for_subject(id)?;
                 let config = load_graft_config(store)?;
-                ensure_change_integrity(store, &config, &patch.change)?;
+                ensure_change_integrity(store, &config, &patch.application)?;
                 let requirement_plan = promotion_requirement_plan(&config, required)?;
                 let mut required_properties = requirement_plan.properties.clone();
                 let configured_target = config.promote_targets.get(to);
@@ -2349,12 +2351,7 @@ fn write_default_sync_remote(store: &GraftStore, remote: &Path) -> Result<bool> 
 }
 
 fn default_sync_remote_path(store: &GraftStore) -> PathBuf {
-    store
-        .paths()
-        .root()
-        .join("state")
-        .join("remotes")
-        .join("default")
+    store.paths().default_sync_remote()
 }
 
 fn normalize_sync_remote_path(remote: &Path) -> PathBuf {
@@ -2442,7 +2439,7 @@ fn object_diff_summary(store: &GraftStore, from: &str, to: &str) -> Result<Strin
     let config = load_graft_config(store)?;
     let from_state = resolve_state_ref(store, &config, from)?;
     let to_state = resolve_state_ref(store, &config, to)?;
-    let change = ChangeSet::from_snapshots(
+    let change = Change::from_snapshots(
         from_state.state.clone(),
         Some(&from_state.snapshot),
         to_state.state.clone(),
@@ -2462,7 +2459,7 @@ fn object_diff_summary(store: &GraftStore, from: &str, to: &str) -> Result<Strin
     if summary.added == 0 && summary.modified == 0 && summary.deleted == 0 {
         lines.push("clean".to_string());
     }
-    for file in &change.files {
+    for file in change.endpoint_diff() {
         lines.push(format!("{}\t{}", file_change_symbol(file.kind), file.path));
     }
     Ok(lines.join("\n"))
@@ -2596,11 +2593,15 @@ fn target_snapshot_for_patch(
     config: &GraftConfig,
     patch: &PatchRecord,
 ) -> Result<graft_core::TreeSnapshot> {
-    materialized_snapshot_for_state(store, config, &patch.target_state).with_context(|| {
+    let target_state = store
+        .resolve_application(&patch.application)?
+        .record
+        .target_state;
+    materialized_snapshot_for_state(store, config, &target_state).with_context(|| {
         format!(
             "materialize patch {} target state {}",
             patch.id,
-            state_label(&patch.target_state)
+            state_label(&target_state)
         )
     })
 }
@@ -2970,8 +2971,12 @@ fn related_concepts(id: &str) -> Vec<String> {
 fn incoming_command(store: &GraftStore) -> Result<CommandEnvelope> {
     let mut patches = store.list_patches()?;
     patches.sort_by_key(|patch| {
+        let base_state = store
+            .resolve_application(&patch.application)
+            .map(|resolved| resolved.record.base_state)
+            .unwrap_or(StateId::GraftTree("application:missing".to_string()));
         (
-            state_label(&patch.base_state),
+            state_label(&base_state),
             patch.admitted_at.clone(),
             patch.id.to_string(),
         )
@@ -2979,7 +2984,12 @@ fn incoming_command(store: &GraftStore) -> Result<CommandEnvelope> {
     let mut lines = Vec::new();
     let mut current_base: Option<String> = None;
     for patch in &patches {
-        let base = state_label(&patch.base_state);
+        let base = state_label(
+            &store
+                .resolve_application(&patch.application)?
+                .record
+                .base_state,
+        );
         if current_base.as_deref() != Some(base.as_str()) {
             current_base = Some(base.clone());
             lines.push(format!("base {base}"));
@@ -3063,7 +3073,12 @@ fn search_patches(
         patches = filtered;
     }
     if let Some(base) = base {
-        patches.retain(|patch| state_label(&patch.base_state).contains(base));
+        patches.retain(|patch| {
+            store
+                .resolve_application(&patch.application)
+                .ok()
+                .is_some_and(|resolved| state_label(&resolved.record.base_state).contains(base))
+        });
     }
     if let Some(producer) = producer {
         patches.retain(|patch| patch.provenance.producer == *producer);
@@ -3098,17 +3113,11 @@ fn search_patches(
         .collect())
 }
 
-fn stored_change(store: &GraftStore, change: &ChangeRef) -> Result<ChangeSet> {
-    match change {
-        ChangeRef::Stored(id) => Ok(store.read_change(id.as_str())?),
-        ChangeRef::InlineSummary(summary) => {
-            bail!(
-                "{}",
-                graft_explain::diagnostics::c002_inline_change_not_transformable(summary)
-                    .format_reason()
-            )
-        }
-    }
+fn resolved_application(
+    store: &GraftStore,
+    application: &ApplicationRef,
+) -> Result<ResolvedApplication> {
+    store.resolve_application(application).map_err(Into::into)
 }
 
 fn ensure_candidate_expected_properties_current(
@@ -3137,20 +3146,18 @@ fn ensure_candidate_expected_properties_current(
 
 fn write_candidate_from_change(
     store: &GraftStore,
-    change: ChangeSet,
+    change: Change,
     expected: Vec<ScopedPropertyRef>,
     producer: &str,
     message: Option<String>,
     validate: bool,
 ) -> Result<(GraftCandidate, Vec<EvidenceRecord>)> {
-    let base_state = change.base_state.clone();
-    let target_state = change.target_state.clone();
-    let (change_id, _) = store.write_change(&change)?;
+    store.write_change(&change)?;
+    let materialized = application_from_change(&change)?;
+    let application = store.write_materialized_application(&materialized)?;
     let mut candidate = GraftCandidate {
         id: graft_core::CandidateId::new("candidate:pending"),
-        base_state,
-        target_state,
-        change: ChangeRef::Stored(change_id),
+        application,
         expected,
         provenance: Provenance::now(producer, message),
     };
@@ -3166,7 +3173,7 @@ fn write_candidate_from_change(
 
 enum MigrationOutcome {
     Clean {
-        change: ChangeSet,
+        change: Change,
         snapshot: TreeSnapshot,
     },
     Blocked {
@@ -3175,8 +3182,7 @@ enum MigrationOutcome {
 }
 
 fn migrate_change(
-    change: &ChangeSet,
-    _patch: &PatchRecord,
+    change: &Change,
     base_state: StateId,
     base_snapshot: &TreeSnapshot,
 ) -> Result<MigrationOutcome> {
@@ -3187,7 +3193,7 @@ fn migrate_change(
         .collect::<std::collections::BTreeMap<_, _>>();
     let mut blocks = Vec::new();
 
-    for file in &change.files {
+    for file in change.endpoint_diff() {
         let current = entries.get(&file.path);
         match file.kind {
             FileChangeKind::Added | FileChangeKind::Captured => {
@@ -3253,8 +3259,7 @@ fn migrate_change(
 
     let snapshot = TreeSnapshot::new(entries.into_values().collect());
     let target_state = StateId::GraftTree(snapshot.id()?);
-    let migrated =
-        ChangeSet::from_snapshots(base_state, Some(base_snapshot), target_state, &snapshot);
+    let migrated = Change::from_snapshots(base_state, Some(base_snapshot), target_state, &snapshot);
     Ok(MigrationOutcome::Clean {
         change: migrated,
         snapshot,
@@ -3333,7 +3338,7 @@ fn show_record(
                 .with_context(|| format!("read candidate record {id}"))?;
             let evidence_records = store.cached_evidence_for_subject(id)?;
             let change_view = if include_change {
-                change_view_for_ref(store, &candidate.change)?
+                change_view_for_application(store, &candidate.application)?
             } else {
                 None
             };
@@ -3358,7 +3363,7 @@ fn show_record(
                 .with_context(|| format!("read patch record {id}"))?;
             let evidence_records = store.registry_evidence_for_subject(id)?;
             let change_view = if include_change {
-                change_view_for_ref(store, &patch.change)?
+                change_view_for_application(store, &patch.application)?
             } else {
                 None
             };
@@ -3414,10 +3419,11 @@ fn summarize_candidate_with_evidence(
     candidate: &GraftCandidate,
     evidence: &[EvidenceRecord],
 ) -> Result<CandidateSummary> {
+    let resolved = resolved_application(store, &candidate.application)?;
     Ok(CandidateSummary {
         id: candidate.id.to_string(),
-        base_state: state_label(&candidate.base_state),
-        target_state: state_label(&candidate.target_state),
+        base_state: state_label(&resolved.record.base_state),
+        target_state: state_label(&resolved.record.target_state),
         expected: candidate
             .expected
             .iter()
@@ -3427,7 +3433,7 @@ fn summarize_candidate_with_evidence(
         message: candidate.provenance.message.clone(),
         created_at: candidate.provenance.created_at.clone(),
         evidence: EvidenceCounts::from_records(evidence),
-        change: change_view_for_ref(store, &candidate.change)?,
+        change: change_view_for_application(store, &candidate.application)?,
     })
 }
 
@@ -3436,16 +3442,17 @@ fn summarize_patch_with_evidence(
     patch: &PatchRecord,
     evidence: &[EvidenceRecord],
 ) -> Result<PatchSummary> {
+    let resolved = resolved_application(store, &patch.application)?;
     Ok(PatchSummary {
         id: patch.id.to_string(),
-        base_state: state_label(&patch.base_state),
-        target_state: state_label(&patch.target_state),
+        base_state: state_label(&resolved.record.base_state),
+        target_state: state_label(&resolved.record.target_state),
         properties: patch.properties.iter().map(property_label).collect(),
         producer: patch.provenance.producer.clone(),
         message: patch.provenance.message.clone(),
         admitted_at: patch.admitted_at.clone(),
         evidence: EvidenceCounts::from_records(evidence),
-        change: change_view_for_ref(store, &patch.change)?,
+        change: change_view_for_application(store, &patch.application)?,
     })
 }
 
@@ -3460,42 +3467,29 @@ fn promotion_view(promotion: &PromotionRecord) -> PromotionView {
     }
 }
 
-fn change_view_for_ref(store: &GraftStore, change: &ChangeRef) -> Result<Option<ChangeView>> {
-    match change {
-        ChangeRef::Stored(id) => {
-            let change = store.read_change(id.as_str())?;
-            let summary = change.summary();
-            Ok(Some(ChangeView {
-                id: Some(id.to_string()),
-                description: None,
-                files: summary.files,
-                added: summary.added,
-                modified: summary.modified,
-                deleted: summary.deleted,
-                unchanged: summary.unchanged,
-                captured: summary.captured,
-                target_bytes: summary.target_bytes,
-                sample_paths: change
-                    .files
-                    .iter()
-                    .take(8)
-                    .map(|file| file.path.clone())
-                    .collect(),
-            }))
-        }
-        ChangeRef::InlineSummary(summary) => Ok(Some(ChangeView {
-            id: None,
-            description: Some(summary.clone()),
-            files: 0,
-            added: 0,
-            modified: 0,
-            deleted: 0,
-            unchanged: 0,
-            captured: 0,
-            target_bytes: 0,
-            sample_paths: Vec::new(),
-        })),
-    }
+fn change_view_for_application(
+    store: &GraftStore,
+    application: &ApplicationRef,
+) -> Result<Option<ChangeView>> {
+    let resolved = resolved_application(store, application)?;
+    let summary = resolved.change.summary();
+    Ok(Some(ChangeView {
+        id: Some(resolved.record.change.to_string()),
+        description: None,
+        files: summary.files,
+        added: summary.added,
+        modified: summary.modified,
+        deleted: summary.deleted,
+        unchanged: summary.unchanged,
+        captured: summary.captured,
+        target_bytes: summary.target_bytes,
+        sample_paths: resolved
+            .change
+            .changed_paths()
+            .into_iter()
+            .take(8)
+            .collect(),
+    }))
 }
 
 fn evidence_view(record: &EvidenceRecord) -> EvidenceView {
@@ -3651,6 +3645,28 @@ mod tests {
             .get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn write_test_application(
+        store: &GraftStore,
+        base_state: StateId,
+        base: Option<&TreeSnapshot>,
+        target_snapshot: &TreeSnapshot,
+    ) -> ApplicationRef {
+        let target_state = StateId::GraftTree(target_snapshot.id().unwrap());
+        let materialized =
+            graft_core::materialize_application(base_state, base, target_state, target_snapshot)
+                .unwrap();
+        store.write_materialized_application(&materialized).unwrap()
+    }
+
+    fn write_test_application_from_trees(
+        store: &GraftStore,
+        base_state: StateId,
+        base_snapshot: &TreeSnapshot,
+        target_snapshot: &TreeSnapshot,
+    ) -> ApplicationRef {
+        write_test_application(store, base_state, Some(base_snapshot), target_snapshot)
     }
 
     fn error_chain_text(error: anyhow::Error) -> String {
@@ -4448,21 +4464,41 @@ mod tests {
         let store = GraftStore::open(&dir);
         store.init().unwrap();
 
+        let patch_target = TreeSnapshot::new(vec![TreeEntry {
+            path: "patch.txt".to_string(),
+            hash: store.write_blob(b"patch\n").unwrap(),
+            size: 6,
+        }]);
+        store.write_tree_snapshot(&patch_target).unwrap();
+        let patch_application = write_test_application(
+            &store,
+            StateId::GraftTree("tree:base".to_string()),
+            None,
+            &patch_target,
+        );
         let patch = PatchRecord {
             id: graft_core::PatchId::new("patch:admitted"),
-            base_state: StateId::GraftTree("tree:base".to_string()),
-            target_state: StateId::GraftTree("tree:patch-target".to_string()),
-            change: ChangeRef::InlineSummary("admitted patch".to_string()),
+            application: patch_application,
             properties: Vec::new(),
             provenance: Provenance::now("patch-producer", None),
             admitted_at: "now".to_string(),
         };
         store.write_patch(&patch).unwrap();
+        let candidate_target = TreeSnapshot::new(vec![TreeEntry {
+            path: "candidate.txt".to_string(),
+            hash: store.write_blob(b"candidate\n").unwrap(),
+            size: 10,
+        }]);
+        store.write_tree_snapshot(&candidate_target).unwrap();
+        let candidate_application = write_test_application(
+            &store,
+            StateId::GraftTree("tree:base".to_string()),
+            None,
+            &candidate_target,
+        );
         let candidate = GraftCandidate {
             id: graft_core::CandidateId::new("candidate:queued"),
-            base_state: StateId::GraftTree("tree:base".to_string()),
-            target_state: StateId::GraftTree("tree:candidate-target".to_string()),
-            change: ChangeRef::InlineSummary("queued candidate".to_string()),
+            application: candidate_application,
             expected: Vec::new(),
             provenance: Provenance::now("candidate-producer", None),
         };
@@ -4805,11 +4841,21 @@ mod tests {
 
         let property =
             PropertyRef::new(PropertyId::new("property:registryexport"), "RegistryExport");
+        let target_snapshot = TreeSnapshot::new(vec![TreeEntry {
+            path: "registry.txt".to_string(),
+            hash: source_store.write_blob(b"demo\n").unwrap(),
+            size: 5,
+        }]);
+        source_store.write_tree_snapshot(&target_snapshot).unwrap();
+        let application = write_test_application(
+            &source_store,
+            StateId::GitTree("base".to_string()),
+            None,
+            &target_snapshot,
+        );
         let patch = PatchRecord {
             id: graft_core::PatchId::new("patch:registryexport"),
-            base_state: StateId::GitTree("base".to_string()),
-            target_state: StateId::GraftTree("target".to_string()),
-            change: ChangeRef::InlineSummary("demo".to_string()),
+            application,
             properties: vec![property.clone()],
             provenance: Provenance {
                 producer: "test".to_string(),
@@ -4949,7 +4995,7 @@ mod tests {
         let bundle = dir.join("registry.json");
         fs::write(
             &bundle,
-            r#"{"patches":[{"id":"patch:demo","base_state":{"kind":"git_tree","value":"base"},"target_state":{"kind":"graft_tree","value":"tree:target"},"change":{"kind":"inline_summary","value":"demo"},"properties":[],"provenance":{"producer":"test","message":null,"created_at":"now"},"admitted_at":"now","surprise":true}],"evidence":[],"relations":[],"promotions":[]}"#,
+            r#"{"patches":[{"id":"patch:demo","application":{"kind":"stored","value":"application:demo"},"properties":[],"provenance":{"producer":"test","message":null,"created_at":"now"},"admitted_at":"now","surprise":true}],"evidence":[],"relations":[],"promotions":[]}"#,
         )
         .unwrap();
 
@@ -5345,11 +5391,21 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let store = GraftStore::open(&dir);
         store.init().unwrap();
+        let target_snapshot = TreeSnapshot::new(vec![TreeEntry {
+            path: "corrupt-index.txt".to_string(),
+            hash: store.write_blob(b"x\n").unwrap(),
+            size: 2,
+        }]);
+        store.write_tree_snapshot(&target_snapshot).unwrap();
+        let application = write_test_application(
+            &store,
+            StateId::GraftTree("tree:base".to_string()),
+            None,
+            &target_snapshot,
+        );
         let patch = PatchRecord {
             id: graft_core::PatchId::new("patch:corrupt-index"),
-            base_state: StateId::GraftTree("tree:base".to_string()),
-            target_state: StateId::GraftTree("tree:target".to_string()),
-            change: ChangeRef::InlineSummary("corrupt index test".to_string()),
+            application,
             properties: Vec::new(),
             provenance: Provenance::now("test", None),
             admitted_at: "now".to_string(),
@@ -5383,11 +5439,21 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let store = GraftStore::open(&dir);
         store.init().unwrap();
+        let target_snapshot = TreeSnapshot::new(vec![TreeEntry {
+            path: "corrupt-incoming.txt".to_string(),
+            hash: store.write_blob(b"x\n").unwrap(),
+            size: 2,
+        }]);
+        store.write_tree_snapshot(&target_snapshot).unwrap();
+        let application = write_test_application(
+            &store,
+            StateId::GraftTree("tree:base".to_string()),
+            None,
+            &target_snapshot,
+        );
         let patch = PatchRecord {
             id: graft_core::PatchId::new("patch:corrupt-incoming-index"),
-            base_state: StateId::GraftTree("tree:base".to_string()),
-            target_state: StateId::GraftTree("tree:target".to_string()),
-            change: ChangeRef::InlineSummary("corrupt incoming index test".to_string()),
+            application,
             properties: Vec::new(),
             provenance: Provenance::now("test", None),
             admitted_at: "now".to_string(),
@@ -6215,19 +6281,16 @@ fn v2_cli_check(app: Application) -> Property {
             size: 4,
         }]);
         let (base_tree_id, _) = store.write_tree_snapshot(&base_snapshot).unwrap();
-        let (target_tree_id, _) = store.write_tree_snapshot(&target_snapshot).unwrap();
-        let change = ChangeSet::from_snapshots(
+        let (_target_tree_id, _) = store.write_tree_snapshot(&target_snapshot).unwrap();
+        let application = write_test_application_from_trees(
+            &store,
             StateId::GraftTree(base_tree_id.clone()),
-            Some(&base_snapshot),
-            StateId::GraftTree(target_tree_id.clone()),
+            &base_snapshot,
             &target_snapshot,
         );
-        let (change_id, _) = store.write_change(&change).unwrap();
         let mut candidate = GraftCandidate {
             id: graft_core::CandidateId::new("candidate:pending"),
-            base_state: StateId::GraftTree(base_tree_id),
-            target_state: StateId::GraftTree(target_tree_id),
-            change: ChangeRef::Stored(change_id),
+            application,
             expected: vec![ScopedPropertyRef::new(
                 PropertyScope::Workspace,
                 property.clone(),
@@ -6297,25 +6360,16 @@ fn v2_cli_check(app: Application) -> Property {
             size: 4,
         }]);
         let (base_tree_id, _) = store.write_tree_snapshot(&base_snapshot).unwrap();
-        let (target_tree_id, _) = store.write_tree_snapshot(&target_snapshot).unwrap();
-        let change = ChangeSet {
-            base_state: StateId::GraftTree(base_tree_id.clone()),
-            target_state: StateId::GraftTree(target_tree_id.clone()),
-            files: vec![graft_core::FileChange {
-                path: "foo.txt".to_string(),
-                kind: FileChangeKind::Modified,
-                base_hash: Some(old_blob),
-                target_hash: Some(new_blob),
-                base_size: Some(4),
-                target_size: Some(4),
-            }],
-        };
-        let (change_id, _) = store.write_change(&change).unwrap();
+        let (_target_tree_id, _) = store.write_tree_snapshot(&target_snapshot).unwrap();
+        let application = write_test_application_from_trees(
+            &store,
+            StateId::GraftTree(base_tree_id.clone()),
+            &base_snapshot,
+            &target_snapshot,
+        );
         let patch = PatchRecord {
             id: graft_core::PatchId::new("patch:materialize-test"),
-            base_state: StateId::GraftTree(base_tree_id),
-            target_state: StateId::GraftTree(target_tree_id),
-            change: ChangeRef::Stored(change_id),
+            application,
             properties: Vec::new(),
             provenance: Provenance::now("test", None),
             admitted_at: "now".to_string(),
@@ -6335,7 +6389,12 @@ fn v2_cli_check(app: Application) -> Property {
         })
         .unwrap();
 
-        let destination = materialize_worktree_path(&store, &patch.target_state);
+        let target_state = store
+            .resolve_application(&patch.application)
+            .unwrap()
+            .record
+            .target_state;
+        let destination = materialize_worktree_path(&store, &target_state);
         assert!(
             envelope
                 .message
@@ -6373,25 +6432,16 @@ fn v2_cli_check(app: Application) -> Property {
             size: 9,
         }]);
         let (base_tree_id, _) = store.write_tree_snapshot(&base_snapshot).unwrap();
-        let (target_tree_id, _) = store.write_tree_snapshot(&target_snapshot).unwrap();
-        let change = ChangeSet {
-            base_state: StateId::GraftTree(base_tree_id.clone()),
-            target_state: StateId::GraftTree(target_tree_id.clone()),
-            files: vec![graft_core::FileChange {
-                path: "detached.txt".to_string(),
-                kind: FileChangeKind::Added,
-                base_hash: None,
-                target_hash: Some(target_blob),
-                base_size: None,
-                target_size: Some(9),
-            }],
-        };
-        let (change_id, _) = store.write_change(&change).unwrap();
+        let (_target_tree_id, _) = store.write_tree_snapshot(&target_snapshot).unwrap();
+        let application = write_test_application_from_trees(
+            &store,
+            StateId::GraftTree(base_tree_id.clone()),
+            &base_snapshot,
+            &target_snapshot,
+        );
         let patch = PatchRecord {
             id: graft_core::PatchId::new("patch:materialize-commit-test"),
-            base_state: StateId::GraftTree(base_tree_id),
-            target_state: StateId::GraftTree(target_tree_id),
-            change: ChangeRef::Stored(change_id),
+            application,
             properties: Vec::new(),
             provenance: Provenance::now("test", None),
             admitted_at: "now".to_string(),
@@ -6458,25 +6508,16 @@ fn v2_cli_check(app: Application) -> Property {
             size: 7,
         }]);
         let (base_tree_id, _) = store.write_tree_snapshot(&base_snapshot).unwrap();
-        let (target_tree_id, _) = store.write_tree_snapshot(&target_snapshot).unwrap();
-        let change = ChangeSet {
-            base_state: StateId::GraftTree(base_tree_id.clone()),
-            target_state: StateId::GraftTree(target_tree_id.clone()),
-            files: vec![graft_core::FileChange {
-                path: "cached.txt".to_string(),
-                kind: FileChangeKind::Added,
-                base_hash: None,
-                target_hash: Some(target_blob),
-                base_size: None,
-                target_size: Some(7),
-            }],
-        };
-        let (change_id, _) = store.write_change(&change).unwrap();
+        let (_target_tree_id, _) = store.write_tree_snapshot(&target_snapshot).unwrap();
+        let application = write_test_application_from_trees(
+            &store,
+            StateId::GraftTree(base_tree_id.clone()),
+            &base_snapshot,
+            &target_snapshot,
+        );
         let patch = PatchRecord {
             id: graft_core::PatchId::new("patch:promote-cache-test"),
-            base_state: StateId::GraftTree(base_tree_id),
-            target_state: StateId::GraftTree(target_tree_id),
-            change: ChangeRef::Stored(change_id),
+            application,
             properties: Vec::new(),
             provenance: Provenance::now("test", None),
             admitted_at: "now".to_string(),
@@ -6550,19 +6591,16 @@ fn v2_cli_check(app: Application) -> Property {
             hash: blob,
             size: 7,
         }]);
-        let (target_tree_id, _) = store.write_tree_snapshot(&target_snapshot).unwrap();
-        let change = ChangeSet::from_snapshots(
+        let (_target_tree_id, _) = store.write_tree_snapshot(&target_snapshot).unwrap();
+        let application = write_test_application(
+            &store,
             StateId::GraftTree("tree:empty".to_string()),
             None,
-            StateId::GraftTree(target_tree_id.clone()),
             &target_snapshot,
         );
-        let (change_id, _) = store.write_change(&change).unwrap();
         let patch = PatchRecord {
             id: graft_core::PatchId::new("patch:diff-test"),
-            base_state: StateId::GraftTree("tree:empty".to_string()),
-            target_state: StateId::GraftTree(target_tree_id),
-            change: ChangeRef::Stored(change_id),
+            application,
             properties: Vec::new(),
             provenance: Provenance::now("test", None),
             admitted_at: "now".to_string(),
@@ -6640,32 +6678,22 @@ check = "changed_paths_any_match"
 
     #[test]
     fn migration_blocks_when_modified_path_is_missing_on_new_base() {
-        let change = ChangeSet {
+        let change = Change {
             base_state: StateId::GraftTree("tree:old".to_string()),
             target_state: StateId::GraftTree("tree:target".to_string()),
-            files: vec![graft_core::FileChange {
+            ops: vec![graft_core::ChangeOp::ReplaceFile {
                 path: "src/lib.rs".to_string(),
-                kind: FileChangeKind::Modified,
-                base_hash: Some("old".to_string()),
-                target_hash: Some("new".to_string()),
-                base_size: Some(3),
-                target_size: Some(3),
+                before: "old".to_string(),
+                after: "new".to_string(),
+                mode_before: graft_core::FileMode::Regular,
+                mode_after: graft_core::FileMode::Regular,
             }],
-        };
-        let patch = PatchRecord {
-            id: graft_core::PatchId::new("patch:test"),
-            base_state: StateId::GraftTree("tree:old".to_string()),
-            target_state: StateId::GraftTree("tree:target".to_string()),
-            change: ChangeRef::InlineSummary("test".to_string()),
-            properties: Vec::new(),
-            provenance: Provenance::now("test", None),
-            admitted_at: "now".to_string(),
+            capture: false,
         };
         let new_base = TreeSnapshot::new(Vec::new());
 
         let outcome = migrate_change(
             &change,
-            &patch,
             StateId::GraftTree(new_base.id().unwrap()),
             &new_base,
         )

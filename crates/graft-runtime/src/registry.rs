@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, bail};
 use clap::Subcommand;
 use graft_core::{
-    ChangeSet, EvidenceRecord, PatchRecord, PatchRelation, PromotionRecord, TreeSnapshot,
+    Action, ApplicationRecord, Change, EvidenceRecord, PatchRecord, PatchRelation, PromotionRecord,
+    TreeSnapshot,
 };
 use graft_store::{EvidenceRefsRecord, GraftStore};
 use serde::{Deserialize, Serialize};
@@ -32,7 +33,11 @@ struct RegistryBundle {
     #[serde(default)]
     trees: Vec<TreeObject>,
     #[serde(default)]
+    actions: Vec<ActionObject>,
+    #[serde(default)]
     changes: Vec<ChangeObject>,
+    #[serde(default)]
+    applications: Vec<ApplicationObject>,
     #[serde(default)]
     blobs: Vec<BlobObject>,
     #[serde(default)]
@@ -54,7 +59,21 @@ struct TreeObject {
 #[serde(deny_unknown_fields)]
 struct ChangeObject {
     id: String,
-    change: ChangeSet,
+    change: Change,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ActionObject {
+    id: String,
+    action: Action,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ApplicationObject {
+    id: String,
+    application: ApplicationRecord,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -77,10 +96,20 @@ pub(crate) fn run_registry_command(
                     .into_iter()
                     .map(|(id, snapshot)| TreeObject { id, snapshot })
                     .collect(),
+                actions: store
+                    .list_action_objects()?
+                    .into_iter()
+                    .map(|(id, action)| ActionObject { id, action })
+                    .collect(),
                 changes: store
                     .list_change_objects()?
                     .into_iter()
                     .map(|(id, change)| ChangeObject { id, change })
+                    .collect(),
+                applications: store
+                    .list_application_objects()?
+                    .into_iter()
+                    .map(|(id, application)| ApplicationObject { id, application })
                     .collect(),
                 blobs: store
                     .list_blob_objects()?
@@ -121,6 +150,16 @@ pub(crate) fn run_registry_command(
                     );
                 }
             }
+            for action in &bundle.actions {
+                let (id, _) = store.write_action(&action.action)?;
+                if id.as_str() != action.id {
+                    bail!(
+                        "[E_REGISTRY_BUNDLE] action id mismatch: expected {}, got {}",
+                        action.id,
+                        id
+                    );
+                }
+            }
             for change in &bundle.changes {
                 let (id, _) = store.write_change(&change.change)?;
                 if id.as_str() != change.id {
@@ -128,6 +167,16 @@ pub(crate) fn run_registry_command(
                         "{}",
                         graft_explain::diagnostics::m002_registry_change_id_mismatch(&change.id)
                             .format_reason()
+                    );
+                }
+            }
+            for application in &bundle.applications {
+                let (id, _) = store.write_application(&application.application)?;
+                if id.as_str() != application.id {
+                    bail!(
+                        "[E_REGISTRY_BUNDLE] application id mismatch: expected {}, got {}",
+                        application.id,
+                        id
                     );
                 }
             }

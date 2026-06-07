@@ -3,8 +3,9 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use graft_core::{
-    ChangeSet, PatchRecord, PatchRelation, PromotionRecord, PropertySpec, TreeSnapshot,
-    blake3_hex_digest, patch_id, promotion_id, relation_id, stable_typed_id,
+    Action, ApplicationRecord, Change, PatchRecord, PatchRelation, PromotionRecord, PropertySpec,
+    TreeSnapshot, action_id, application_id, blake3_hex_digest, patch_id, promotion_id,
+    relation_id, stable_typed_id,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -405,11 +406,7 @@ fn write_remote_last_synced(
 }
 
 fn remote_last_synced_path(workspace_root: &Path, remote: &Path) -> PathBuf {
-    workspace_root
-        .join("state")
-        .join("remotes")
-        .join(remote_state_key(remote))
-        .join("last_synced")
+    graft_store::GraftPaths::new(workspace_root).remote_last_synced(&remote_state_key(remote))
 }
 
 fn remote_state_key(remote: &Path) -> String {
@@ -916,7 +913,27 @@ fn validate_public_store_objects(public: &Path) -> Result<()> {
                         message: error.to_string(),
                     })
             })?,
-            "change" => validate_typed_json_dir::<ChangeSet, _>(&path, "change", |path, value| {
+            "action" => validate_typed_json_dir::<Action, _>(&path, "action", |path, value| {
+                action_id(value).map(|id| id.to_string()).map_err(|error| {
+                    SyncError::InvalidStoreObject {
+                        path: path.to_path_buf(),
+                        message: error.to_string(),
+                    }
+                })
+            })?,
+            "application" => validate_typed_json_dir::<ApplicationRecord, _>(
+                &path,
+                "application",
+                |path, value| {
+                    application_id(value)
+                        .map(|id| id.to_string())
+                        .map_err(|error| SyncError::InvalidStoreObject {
+                            path: path.to_path_buf(),
+                            message: error.to_string(),
+                        })
+                },
+            )?,
+            "change" => validate_typed_json_dir::<Change, _>(&path, "change", |path, value| {
                 value
                     .id()
                     .map(|id| id.to_string())
@@ -1349,7 +1366,9 @@ fn newest_updated_at(left: Option<&str>, right: Option<&str>) -> Option<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use graft_core::{ChangeRef, PatchId, Provenance, StateId};
+    use graft_core::{
+        ApplicationRef, PatchId, Provenance, StateId, action_id, materialize_application,
+    };
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[cfg(unix)]
@@ -1705,7 +1724,7 @@ mod tests {
             manifest.prev_manifest.as_deref(),
             first.manifest_id.as_deref()
         );
-        assert_eq!(manifest.summary.facts_files, 1);
+        assert_eq!(manifest.summary.facts_files, 5);
         assert_eq!(manifest.summary.blob_files, 1);
         fs::remove_dir_all(dir).ok();
     }
@@ -2044,7 +2063,7 @@ mod tests {
         let dest = dir.join("dest");
         let remote = dir.join("remote.git");
         let source_public = source.join("store").join("public");
-        let mut patch = valid_patch_record("remote-tamper");
+        let mut patch = valid_patch_record("remote-tamper", &source_public);
         write_patch_object(&source_public, &patch);
         sync_public_store(&source, &remote, true, false).unwrap();
 
@@ -2078,7 +2097,7 @@ mod tests {
         let dest = dir.join("dest");
         let remote = dir.join("remote.git");
         let source_public = source.join("store").join("public");
-        let patch = valid_patch_record("local-conflict");
+        let patch = valid_patch_record("local-conflict", &source_public);
         write_patch_object(&source_public, &patch);
         sync_public_store(&source, &remote, true, false).unwrap();
 
@@ -2224,17 +2243,63 @@ mod tests {
     }
 
     fn write_valid_patch_object(public: &Path, message: &str) -> String {
-        let patch = valid_patch_record(message);
+        let patch = valid_patch_record(message, public);
         write_patch_object(public, &patch);
         patch.id.to_string()
     }
 
-    fn valid_patch_record(message: &str) -> PatchRecord {
+    fn write_application_objects(public: &Path, message: &str) -> ApplicationRef {
+        let target = TreeSnapshot::new(vec![graft_core::TreeEntry {
+            path: format!("{message}.txt"),
+            hash: blake3_hex_digest(message.as_bytes()),
+            size: message.len() as u64,
+        }]);
+        let materialized = materialize_application(
+            StateId::GraftTree("tree:base".to_string()),
+            None,
+            StateId::GraftTree(target.id().unwrap()),
+            &target,
+        )
+        .unwrap();
+        let action_id = action_id(&materialized.action).unwrap();
+        let application_id = materialized.record.id().unwrap();
+        let change_id = materialized.change.id().unwrap();
+        fs::create_dir_all(public.join("action")).unwrap();
+        fs::create_dir_all(public.join("application")).unwrap();
+        fs::create_dir_all(public.join("change")).unwrap();
+        fs::create_dir_all(public.join("tree")).unwrap();
+        fs::write(
+            public.join("action").join(format!("{action_id}.json")),
+            serde_json::to_vec(&materialized.action).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            public
+                .join("application")
+                .join(format!("{application_id}.json")),
+            serde_json::to_vec(&materialized.record).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            public.join("change").join(format!("{change_id}.json")),
+            serde_json::to_vec(&materialized.change).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            public
+                .join("tree")
+                .join(format!("{}.json", target.id().unwrap())),
+            serde_json::to_vec(&target).unwrap(),
+        )
+        .unwrap();
+        ApplicationRef::Stored(application_id)
+    }
+
+    fn valid_patch_record(message: &str, public: &Path) -> PatchRecord {
+        let application = write_application_objects(public, message);
         let mut patch = PatchRecord {
             id: PatchId::new("patch:pending"),
-            base_state: StateId::GraftTree("tree:base".to_string()),
-            target_state: StateId::GraftTree("tree:target".to_string()),
-            change: ChangeRef::InlineSummary(format!("change for {message}")),
+            application,
             properties: Vec::new(),
             provenance: Provenance {
                 producer: "graft-sync-test".to_string(),

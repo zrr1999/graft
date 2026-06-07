@@ -38,6 +38,16 @@ id_type!(CandidateId);
 id_type!(PatchId);
 id_type!(EvidenceId);
 id_type!(ChangeId);
+id_type!(ActionId);
+id_type!(ApplicationId);
+
+mod application_model;
+
+pub use application_model::{
+    Action, ApplicabilityProof, ApplicabilityStep, ApplicationRecord, ApplicationRef, Change,
+    ChangeOp, FileMode, MaterializedApplication, action_id, application_from_change,
+    application_id, materialize_application,
+};
 id_type!(PropertyId);
 id_type!(RelationId);
 id_type!(PromotionId);
@@ -222,18 +232,6 @@ impl BaseRefSpec {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(
-    tag = "kind",
-    content = "value",
-    rename_all = "snake_case",
-    deny_unknown_fields
-)]
-pub enum ChangeRef {
-    Stored(ChangeId),
-    InlineSummary(String),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TreeEntry {
     pub path: String,
@@ -372,213 +370,6 @@ pub struct FileChange {
     pub target_hash: Option<String>,
     pub base_size: Option<u64>,
     pub target_size: Option<u64>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ChangeSet {
-    pub base_state: StateId,
-    pub target_state: StateId,
-    pub files: Vec<FileChange>,
-}
-
-impl ChangeSet {
-    pub fn from_snapshots(
-        base_state: StateId,
-        base: Option<&TreeSnapshot>,
-        target_state: StateId,
-        target: &TreeSnapshot,
-    ) -> Self {
-        let mut files = Vec::new();
-        let target_entries = target
-            .entries
-            .iter()
-            .map(|entry| (entry.path.as_str(), entry))
-            .collect::<BTreeMap<_, _>>();
-
-        if let Some(base) = base {
-            let base_entries = base
-                .entries
-                .iter()
-                .map(|entry| (entry.path.as_str(), entry))
-                .collect::<BTreeMap<_, _>>();
-            for (path, base_entry) in &base_entries {
-                match target_entries.get(*path) {
-                    Some(target_entry) if target_entry.hash == base_entry.hash => {}
-                    Some(target_entry) => {
-                        files.push(FileChange {
-                            path: (*path).to_string(),
-                            kind: FileChangeKind::Modified,
-                            base_hash: Some(base_entry.hash.clone()),
-                            target_hash: Some(target_entry.hash.clone()),
-                            base_size: Some(base_entry.size),
-                            target_size: Some(target_entry.size),
-                        });
-                    }
-                    None => {
-                        files.push(FileChange {
-                            path: (*path).to_string(),
-                            kind: FileChangeKind::Deleted,
-                            base_hash: Some(base_entry.hash.clone()),
-                            target_hash: None,
-                            base_size: Some(base_entry.size),
-                            target_size: None,
-                        });
-                    }
-                }
-            }
-            for (path, target_entry) in target_entries {
-                if !base_entries.contains_key(path) {
-                    files.push(FileChange {
-                        path: path.to_string(),
-                        kind: FileChangeKind::Added,
-                        base_hash: None,
-                        target_hash: Some(target_entry.hash.clone()),
-                        base_size: None,
-                        target_size: Some(target_entry.size),
-                    });
-                }
-            }
-        } else {
-            files.extend(target.entries.iter().map(|entry| FileChange {
-                path: entry.path.clone(),
-                kind: FileChangeKind::Captured,
-                base_hash: None,
-                target_hash: Some(entry.hash.clone()),
-                base_size: None,
-                target_size: Some(entry.size),
-            }));
-        }
-
-        files.sort_by(|left, right| left.path.cmp(&right.path));
-        Self {
-            base_state,
-            target_state,
-            files,
-        }
-    }
-
-    pub fn id(&self) -> Result<ChangeId> {
-        Ok(ChangeId::new(stable_typed_id("change", self)?))
-    }
-
-    pub fn compose(first: &Self, second: &Self) -> Self {
-        #[derive(Default)]
-        struct Endpoints {
-            base_hash: Option<String>,
-            target_hash: Option<String>,
-            base_size: Option<u64>,
-            target_size: Option<u64>,
-            has_base: bool,
-        }
-
-        let mut endpoints = BTreeMap::<String, Endpoints>::new();
-        for file in &first.files {
-            let entry = endpoints.entry(file.path.clone()).or_default();
-            entry.base_hash = file.base_hash.clone();
-            entry.base_size = file.base_size;
-            entry.target_hash = file.target_hash.clone();
-            entry.target_size = file.target_size;
-            entry.has_base = true;
-        }
-        for file in &second.files {
-            let entry = endpoints.entry(file.path.clone()).or_default();
-            if !entry.has_base {
-                entry.base_hash = file.base_hash.clone();
-                entry.base_size = file.base_size;
-                entry.has_base = true;
-            }
-            entry.target_hash = file.target_hash.clone();
-            entry.target_size = file.target_size;
-        }
-
-        let files = endpoints
-            .into_iter()
-            .filter_map(|(path, entry)| {
-                let kind = file_change_kind(&entry.base_hash, &entry.target_hash)?;
-                Some(FileChange {
-                    path,
-                    kind,
-                    base_hash: entry.base_hash,
-                    target_hash: entry.target_hash,
-                    base_size: entry.base_size,
-                    target_size: entry.target_size,
-                })
-            })
-            .collect();
-
-        Self {
-            base_state: first.base_state.clone(),
-            target_state: second.target_state.clone(),
-            files,
-        }
-    }
-
-    pub fn migrated(&self, base_state: StateId) -> Self {
-        Self {
-            base_state,
-            target_state: self.target_state.clone(),
-            files: self.files.clone(),
-        }
-    }
-
-    pub fn reversed(&self) -> Self {
-        let mut files = self
-            .files
-            .iter()
-            .map(|file| {
-                let kind = match file.kind {
-                    FileChangeKind::Added | FileChangeKind::Captured => FileChangeKind::Deleted,
-                    FileChangeKind::Modified => FileChangeKind::Modified,
-                    FileChangeKind::Deleted => FileChangeKind::Added,
-                    FileChangeKind::Unchanged => FileChangeKind::Unchanged,
-                };
-                FileChange {
-                    path: file.path.clone(),
-                    kind,
-                    base_hash: file.target_hash.clone(),
-                    target_hash: file.base_hash.clone(),
-                    base_size: file.target_size,
-                    target_size: file.base_size,
-                }
-            })
-            .collect::<Vec<_>>();
-        files.sort_by(|left, right| left.path.cmp(&right.path));
-        Self {
-            base_state: self.target_state.clone(),
-            target_state: self.base_state.clone(),
-            files,
-        }
-    }
-
-    pub fn summary(&self) -> ChangeSummary {
-        let mut summary = ChangeSummary::default();
-        for file in &self.files {
-            summary.files += 1;
-            match file.kind {
-                FileChangeKind::Added => summary.added += 1,
-                FileChangeKind::Modified => summary.modified += 1,
-                FileChangeKind::Deleted => summary.deleted += 1,
-                FileChangeKind::Unchanged => summary.unchanged += 1,
-                FileChangeKind::Captured => summary.captured += 1,
-            }
-            summary.target_bytes += file.target_size.unwrap_or(0);
-        }
-        summary
-    }
-}
-
-fn file_change_kind(
-    base_hash: &Option<String>,
-    target_hash: &Option<String>,
-) -> Option<FileChangeKind> {
-    match (base_hash, target_hash) {
-        (None, None) => None,
-        (None, Some(_)) => Some(FileChangeKind::Added),
-        (Some(_), None) => Some(FileChangeKind::Deleted),
-        (Some(base), Some(target)) if base == target => None,
-        (Some(_), Some(_)) => Some(FileChangeKind::Modified),
-    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -994,9 +785,7 @@ impl ScopedPropertyRef {
 #[serde(deny_unknown_fields)]
 pub struct GraftCandidate {
     pub id: CandidateId,
-    pub base_state: StateId,
-    pub target_state: StateId,
-    pub change: ChangeRef,
+    pub application: ApplicationRef,
     pub expected: Vec<ScopedPropertyRef>,
     pub provenance: Provenance,
 }
@@ -1005,9 +794,7 @@ pub struct GraftCandidate {
 #[serde(deny_unknown_fields)]
 pub struct PatchRecord {
     pub id: PatchId,
-    pub base_state: StateId,
-    pub target_state: StateId,
-    pub change: ChangeRef,
+    pub application: ApplicationRef,
     pub properties: Vec<PropertyRef>,
     pub provenance: Provenance,
     pub admitted_at: String,
@@ -1163,9 +950,7 @@ pub fn file_view_hash(seed: &FileViewHashSeed<'_>) -> Result<FileViewHash> {
 
 pub fn candidate_id(candidate: &GraftCandidate) -> Result<CandidateId> {
     let seed = CandidateSeed {
-        base_state: &candidate.base_state,
-        target_state: &candidate.target_state,
-        change: &candidate.change,
+        application: &candidate.application,
         expected: &candidate.expected,
         provenance: &candidate.provenance,
     };
@@ -1174,9 +959,7 @@ pub fn candidate_id(candidate: &GraftCandidate) -> Result<CandidateId> {
 
 pub fn patch_id(patch: &PatchRecord) -> Result<PatchId> {
     let seed = PatchSeed {
-        base_state: &patch.base_state,
-        target_state: &patch.target_state,
-        change: &patch.change,
+        application: &patch.application,
         properties: &patch.properties,
         producer: &patch.provenance.producer,
         message: patch.provenance.message.as_deref(),
@@ -1215,18 +998,14 @@ pub fn promotion_id(promotion: &PromotionRecord) -> Result<PromotionId> {
 
 #[derive(Serialize)]
 struct CandidateSeed<'a> {
-    base_state: &'a StateId,
-    target_state: &'a StateId,
-    change: &'a ChangeRef,
+    application: &'a ApplicationRef,
     expected: &'a [ScopedPropertyRef],
     provenance: &'a Provenance,
 }
 
 #[derive(Serialize)]
 struct PatchSeed<'a> {
-    base_state: &'a StateId,
-    target_state: &'a StateId,
-    change: &'a ChangeRef,
+    application: &'a ApplicationRef,
     properties: &'a [PropertyRef],
     producer: &'a str,
     message: Option<&'a str>,
@@ -1573,26 +1352,14 @@ mod tests {
     }
 
     #[test]
-    fn change_ref_json_rejects_unknown_fields() {
-        let error = serde_json::from_str::<ChangeRef>(
-            r#"{"kind":"inline_summary","value":"demo","surprise":true}"#,
-        )
-        .unwrap_err()
-        .to_string();
-
-        assert!(error.contains("expected \"kind\" or \"value\""), "{error}");
-        assert!(error.contains("surprise"), "{error}");
-    }
-
-    #[test]
-    fn change_set_summarizes_snapshot_capture() {
+    fn change_summarizes_snapshot_capture() {
         let snapshot = TreeSnapshot::new(vec![TreeEntry {
             path: "src/lib.rs".to_string(),
             hash: "abc".to_string(),
             size: 7,
         }]);
         let target = StateId::GraftTree(snapshot.id().unwrap());
-        let change = ChangeSet::from_snapshots(
+        let change = Change::from_snapshots(
             StateId::GitTree("unknown".to_string()),
             None,
             target,
@@ -1603,7 +1370,7 @@ mod tests {
     }
 
     #[test]
-    fn change_set_summarizes_snapshot_diff() {
+    fn change_summarizes_snapshot_diff() {
         let base = TreeSnapshot::new(vec![
             TreeEntry {
                 path: "a.txt".to_string(),
@@ -1638,7 +1405,7 @@ mod tests {
                 size: 5,
             },
         ]);
-        let change = ChangeSet::from_snapshots(
+        let change = Change::from_snapshots(
             StateId::GraftTree(base.id().unwrap()),
             Some(&base),
             StateId::GraftTree(target.id().unwrap()),
@@ -1650,45 +1417,51 @@ mod tests {
         assert_eq!(summary.deleted, 1);
         assert_eq!(summary.unchanged, 0);
         assert_eq!(summary.files, 3);
-        assert!(!change.files.iter().any(|file| file.path == "same.txt"));
+        assert!(
+            !change
+                .endpoint_diff()
+                .iter()
+                .any(|file| file.path == "same.txt")
+        );
     }
 
     #[test]
-    fn change_sets_compose_and_reverse() {
-        let first = ChangeSet {
+    fn changes_compose_and_reverse() {
+        let first = Change {
             base_state: StateId::GraftTree("a".to_string()),
             target_state: StateId::GraftTree("b".to_string()),
-            files: vec![FileChange {
+            ops: vec![ChangeOp::CreateFile {
                 path: "src/lib.rs".to_string(),
-                kind: FileChangeKind::Added,
-                base_hash: None,
-                target_hash: Some("b1".to_string()),
-                base_size: None,
-                target_size: Some(10),
+                blob: "b1".to_string(),
+                mode: FileMode::Regular,
             }],
+            capture: false,
         };
-        let second = ChangeSet {
+        let second = Change {
             base_state: StateId::GraftTree("b".to_string()),
             target_state: StateId::GraftTree("c".to_string()),
-            files: vec![FileChange {
+            ops: vec![ChangeOp::ReplaceFile {
                 path: "src/lib.rs".to_string(),
-                kind: FileChangeKind::Modified,
-                base_hash: Some("b1".to_string()),
-                target_hash: Some("c1".to_string()),
-                base_size: Some(10),
-                target_size: Some(12),
+                before: "b1".to_string(),
+                after: "c1".to_string(),
+                mode_before: FileMode::Regular,
+                mode_after: FileMode::Regular,
             }],
+            capture: false,
         };
-        let composed = ChangeSet::compose(&first, &second);
+        let composed = Change::compose(&first, &second);
         assert_eq!(composed.base_state, StateId::GraftTree("a".to_string()));
         assert_eq!(composed.target_state, StateId::GraftTree("c".to_string()));
-        assert_eq!(composed.files[0].kind, FileChangeKind::Added);
-        assert_eq!(composed.files[0].target_hash.as_deref(), Some("c1"));
+        assert_eq!(composed.endpoint_diff()[0].kind, FileChangeKind::Added);
+        assert_eq!(
+            composed.endpoint_diff()[0].target_hash.as_deref(),
+            Some("c1")
+        );
 
         let reversed = composed.reversed();
         assert_eq!(reversed.base_state, StateId::GraftTree("c".to_string()));
         assert_eq!(reversed.target_state, StateId::GraftTree("a".to_string()));
-        assert_eq!(reversed.files[0].kind, FileChangeKind::Deleted);
+        assert_eq!(reversed.endpoint_diff()[0].kind, FileChangeKind::Deleted);
     }
 
     #[test]
@@ -1914,9 +1687,7 @@ mod tests {
     fn patch_ids_ignore_admission_time() {
         let patch = PatchRecord {
             id: PatchId::new("patch:pending"),
-            base_state: StateId::GitTree("base".to_string()),
-            target_state: StateId::GraftTree("target".to_string()),
-            change: ChangeRef::InlineSummary("demo".to_string()),
+            application: ApplicationRef::Stored(ApplicationId::new("application:demo")),
             properties: vec![test_property_ref("TestsPass")],
             provenance: Provenance {
                 producer: "test".to_string(),

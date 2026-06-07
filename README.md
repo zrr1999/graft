@@ -109,7 +109,7 @@ graft workspace status
     public/{blob,tree,change,patch,evidence_refs,relation,promotion}/
     private/{candidate,evidence_refs,relation}/
     derived/evidence/
-  state/{cwd,aliases/,index.sqlite}
+  local/{aliases/,index.sqlite,remotes/}
   run/{daemon.sock,daemon.pid,trials/,worktrees/,tmp/}
 
 graft.toml
