@@ -476,6 +476,22 @@ mod tests {
     }
 
     #[test]
+    fn registered_roto_host_values_are_not_zero_sized() {
+        assert_ne!(std::mem::size_of::<Application>(), 0);
+        assert_ne!(std::mem::size_of::<Property>(), 0);
+        assert_ne!(std::mem::size_of::<Severity>(), 0);
+        assert_ne!(std::mem::size_of::<CheckPlan>(), 0);
+        assert_ne!(std::mem::size_of::<ProbePlan>(), 0);
+        assert_ne!(std::mem::size_of::<PathSet>(), 0);
+        assert_ne!(std::mem::size_of::<TreePlan>(), 0);
+        assert_ne!(std::mem::size_of::<RunPlan>(), 0);
+        assert_ne!(std::mem::size_of::<FileRefPlan>(), 0);
+        assert_ne!(std::mem::size_of::<OverlayPlan>(), 0);
+        assert_ne!(std::mem::size_of::<RunSelectorPlan>(), 0);
+        assert_ne!(std::mem::size_of::<HistorySelector>(), 0);
+    }
+
+    #[test]
     fn loads_v2_roto_property_specs() {
         let path = temp_roto(
             "basic",
@@ -540,6 +556,29 @@ fn real_property(app: Application) -> Property {
             specs.keys().cloned().collect::<Vec<_>>(),
             vec!["real_property"]
         );
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn property_helpers_can_pass_registered_application_without_roto_ice() {
+        let path = temp_roto(
+            "helper-application",
+            r#"
+fn docs_change(app: Application) -> Check {
+    app.changed_paths().all_match(["docs/**", "README.md"]).success()
+}
+
+fn docs_only(app: Application) -> Property {
+    property([docs_change(app)], "docs only", Severity.Info, [])
+}
+"#,
+        );
+
+        let specs = load_roto_property_specs(&path).unwrap();
+        assert_eq!(specs.keys().cloned().collect::<Vec<_>>(), vec!["docs_only"]);
+        let docs = specs.get("docs_only").unwrap();
+        assert_eq!(docs.plan.checks.len(), 1);
 
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
