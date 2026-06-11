@@ -37,11 +37,11 @@ lock_properties
 scratch_out=$("$GRAFT_BIN" scratch write --base graft:empty hello.txt --content $'hello\n')
 scratch=$(grep -oE 'scratch:[0-9a-f]+' <<<"$scratch_out" | tail -n1)
 [[ -n $scratch ]] || { echo "FAIL: no scratch captured"; echo "$scratch_out"; exit 1; }
-created=$("$GRAFT_BIN" candidate from-scratch "$scratch" --message retry-evidence)
-candidate=$(grep -oE 'candidate:[0-9a-f]+' <<<"$created" | head -n1)
+created=$("$GRAFT_BIN" patch from-scratch "$scratch" --message retry-evidence)
+candidate=$(first_graft_id candidate "$created")
 [[ -n $candidate ]] || { echo "FAIL: no candidate captured"; echo "$created"; exit 1; }
 
-failed=$("$GRAFT_BIN" validate "$candidate" --expect workspace:retry_passes)
+failed=$("$GRAFT_BIN" patch validate "$candidate" --expect retry_passes)
 if ! grep -q 'failed:' <<<"$failed"; then
   echo "FAIL: first validation should record failed evidence"
   echo "$failed"; exit 1
@@ -56,13 +56,13 @@ path.write_text(text.replace('["false"]', '["true"]', 1))
 PY
 lock_properties
 
-passed=$("$GRAFT_BIN" validate "$candidate" --expect workspace:retry_passes)
+passed=$("$GRAFT_BIN" patch validate "$candidate" --expect retry_passes)
 if ! grep -q 'passed' <<<"$passed"; then
   echo "FAIL: second validation should record passing evidence"
   echo "$passed"; exit 1
 fi
 
-admitted=$("$GRAFT_BIN" admit "$candidate" --require workspace:retry_passes)
+admitted=$("$GRAFT_BIN" patch admit "$candidate" --require retry_passes)
 if ! grep -qE 'admitted patch patch:[0-9a-f]+ from candidate' <<<"$admitted"; then
   echo "FAIL: admit should accept latest passing retry_passes evidence after retry"
   echo "$admitted"; exit 1

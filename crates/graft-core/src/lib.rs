@@ -6,6 +6,8 @@ use time::OffsetDateTime;
 pub enum CoreError {
     #[error("failed to canonicalize record for stable id: {0}")]
     Canonicalize(#[from] serde_json::Error),
+    #[error("[E_CHANGE_INTEGRITY] {0}")]
+    ApplicationIntegrity(#[from] ApplicationIntegrityError),
 }
 
 pub type Result<T> = std::result::Result<T, CoreError>;
@@ -44,9 +46,10 @@ id_type!(ApplicationId);
 mod application_model;
 
 pub use application_model::{
-    Action, ApplicabilityProof, ApplicabilityStep, ApplicationRecord, ApplicationRef, Change,
-    ChangeOp, FileMode, MaterializedApplication, action_id, application_from_change,
-    application_id, materialize_application,
+    Action, ApplicabilityProof, ApplicabilityStep, ApplicationIntegrityError, ApplicationRecord,
+    ApplicationRef, Change, ChangeOp, FileMode, MaterializedApplication, action_id,
+    application_from_change, application_id, materialize_application,
+    validate_application_integrity,
 };
 id_type!(PropertyId);
 id_type!(RelationId);
@@ -402,6 +405,67 @@ impl PropertyRef {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Constraint {
+    Top,
+    Bottom,
+    Primitive {
+        property: PropertyRef,
+    },
+    Both {
+        left: Box<Constraint>,
+        right: Box<Constraint>,
+    },
+    Either {
+        left: Box<Constraint>,
+        right: Box<Constraint>,
+    },
+}
+
+impl Constraint {
+    pub fn top() -> Self {
+        Self::Top
+    }
+
+    pub fn bottom() -> Self {
+        Self::Bottom
+    }
+
+    pub fn primitive(property: PropertyRef) -> Self {
+        Self::Primitive { property }
+    }
+
+    pub fn all_of(items: impl IntoIterator<Item = Constraint>) -> Self {
+        fold_right(items, Self::Top, |left, right| Self::Both {
+            left: Box::new(left),
+            right: Box::new(right),
+        })
+    }
+
+    pub fn any_of(items: impl IntoIterator<Item = Constraint>) -> Self {
+        fold_right(items, Self::Bottom, |left, right| Self::Either {
+            left: Box::new(left),
+            right: Box::new(right),
+        })
+    }
+}
+
+fn fold_right(
+    items: impl IntoIterator<Item = Constraint>,
+    empty: Constraint,
+    combine: impl Fn(Constraint, Constraint) -> Constraint,
+) -> Constraint {
+    let mut items = items.into_iter().collect::<Vec<_>>();
+    match items.pop() {
+        None => empty,
+        Some(last) => items
+            .into_iter()
+            .rev()
+            .fold(last, |right, left| combine(left, right)),
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Query {
     ChangeMeta,
     TargetSnapshot,
@@ -741,53 +805,19 @@ impl Provenance {
     }
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(
-    tag = "kind",
-    content = "value",
-    rename_all = "snake_case",
-    deny_unknown_fields
-)]
-pub enum PropertyScope {
-    Workspace,
-}
-
-impl PropertyScope {
-    pub fn label(&self) -> &str {
-        match self {
-            Self::Workspace => "workspace",
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ScopedPropertyRef {
-    pub scope: PropertyScope,
-    pub property: PropertyRef,
-}
-
-impl ScopedPropertyRef {
-    pub fn new(scope: PropertyScope, property: PropertyRef) -> Self {
-        Self { scope, property }
-    }
-
-    pub fn label(&self) -> String {
-        format!("{}:{}", self.scope.label(), self.property.name)
-    }
-
-    pub fn evidence_subject(&self, subject: &str) -> String {
-        format!("{subject}@{}", self.scope.label())
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GraftCandidate {
     pub id: CandidateId,
     pub application: ApplicationRef,
-    pub expected: Vec<ScopedPropertyRef>,
+    pub constraint: Constraint,
     pub provenance: Provenance,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdmissionSummary {
+    pub constraint: Constraint,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -795,9 +825,9 @@ pub struct GraftCandidate {
 pub struct PatchRecord {
     pub id: PatchId,
     pub application: ApplicationRef,
-    pub properties: Vec<PropertyRef>,
+    pub constraint: Constraint,
     pub provenance: Provenance,
-    pub admitted_at: String,
+    pub admission: AdmissionSummary,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -951,7 +981,7 @@ pub fn file_view_hash(seed: &FileViewHashSeed<'_>) -> Result<FileViewHash> {
 pub fn candidate_id(candidate: &GraftCandidate) -> Result<CandidateId> {
     let seed = CandidateSeed {
         application: &candidate.application,
-        expected: &candidate.expected,
+        constraint: &candidate.constraint,
         provenance: &candidate.provenance,
     };
     Ok(CandidateId::new(stable_typed_id("candidate", &seed)?))
@@ -960,9 +990,10 @@ pub fn candidate_id(candidate: &GraftCandidate) -> Result<CandidateId> {
 pub fn patch_id(patch: &PatchRecord) -> Result<PatchId> {
     let seed = PatchSeed {
         application: &patch.application,
-        properties: &patch.properties,
+        constraint: &patch.constraint,
         producer: &patch.provenance.producer,
         message: patch.provenance.message.as_deref(),
+        admission: &patch.admission,
     };
     Ok(PatchId::new(stable_typed_id("patch", &seed)?))
 }
@@ -999,16 +1030,17 @@ pub fn promotion_id(promotion: &PromotionRecord) -> Result<PromotionId> {
 #[derive(Serialize)]
 struct CandidateSeed<'a> {
     application: &'a ApplicationRef,
-    expected: &'a [ScopedPropertyRef],
+    constraint: &'a Constraint,
     provenance: &'a Provenance,
 }
 
 #[derive(Serialize)]
 struct PatchSeed<'a> {
     application: &'a ApplicationRef,
-    properties: &'a [PropertyRef],
+    constraint: &'a Constraint,
     producer: &'a str,
     message: Option<&'a str>,
+    admission: &'a AdmissionSummary,
 }
 
 #[derive(Serialize)]
@@ -1684,21 +1716,73 @@ mod tests {
     }
 
     #[test]
-    fn patch_ids_ignore_admission_time() {
+    fn constraint_smart_constructors_fold_empty_and_singleton() {
+        let primitive = Constraint::primitive(test_property_ref("TestsPass"));
+
+        assert_eq!(Constraint::all_of(Vec::new()), Constraint::Top);
+        assert_eq!(Constraint::any_of(Vec::new()), Constraint::Bottom);
+        assert_eq!(
+            Constraint::all_of(vec![primitive.clone()]),
+            primitive.clone()
+        );
+        assert_eq!(Constraint::any_of(vec![primitive.clone()]), primitive);
+    }
+
+    #[test]
+    fn constraint_smart_constructors_fold_right_associative() {
+        let first = Constraint::primitive(test_property_ref("First"));
+        let second = Constraint::primitive(test_property_ref("Second"));
+        let third = Constraint::primitive(test_property_ref("Third"));
+
+        let expected = Constraint::Both {
+            left: Box::new(first.clone()),
+            right: Box::new(Constraint::Both {
+                left: Box::new(second.clone()),
+                right: Box::new(third.clone()),
+            }),
+        };
+
+        assert_eq!(Constraint::all_of(vec![first, second, third]), expected);
+    }
+
+    #[test]
+    fn constraint_serdes_every_lattice_node() {
+        let primitive = Constraint::primitive(test_property_ref("TestsPass"));
+        let constraint = Constraint::Either {
+            left: Box::new(Constraint::Both {
+                left: Box::new(Constraint::Top),
+                right: Box::new(primitive),
+            }),
+            right: Box::new(Constraint::Bottom),
+        };
+
+        let json = serde_json::to_string(&constraint).unwrap();
+        let roundtrip = serde_json::from_str::<Constraint>(&json).unwrap();
+
+        assert_eq!(roundtrip, constraint);
+    }
+
+    #[test]
+    fn patch_ids_include_admission_summary_but_ignore_provenance_time() {
+        let constraint = Constraint::primitive(test_property_ref("TestsPass"));
         let patch = PatchRecord {
             id: PatchId::new("patch:pending"),
             application: ApplicationRef::Stored(ApplicationId::new("application:demo")),
-            properties: vec![test_property_ref("TestsPass")],
+            constraint: constraint.clone(),
             provenance: Provenance {
                 producer: "test".to_string(),
                 message: None,
                 created_at: "time-a".to_string(),
             },
-            admitted_at: "time-a".to_string(),
+            admission: AdmissionSummary { constraint },
         };
         let mut later = patch.clone();
-        later.admitted_at = "time-b".to_string();
         later.provenance.created_at = "time-b".to_string();
         assert_eq!(patch_id(&patch).unwrap(), patch_id(&later).unwrap());
+
+        later.admission = AdmissionSummary {
+            constraint: Constraint::Top,
+        };
+        assert_ne!(patch_id(&patch).unwrap(), patch_id(&later).unwrap());
     }
 }

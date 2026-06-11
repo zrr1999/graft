@@ -22,9 +22,9 @@ pub(crate) struct CandidateFromScratchArgs {
     scratch: String,
     #[arg(
         long = "expect",
-        help = "Whole-state property to validate immediately and require later, for example workspace:tests_pass (repeatable)"
+        help = "Whole-state property primitive to validate immediately and add to the candidate constraint, for example tests_pass (repeatable; repeats compose as all_of)"
     )]
-    expected: Vec<String>,
+    constraint: Vec<String>,
     #[arg(
         long,
         default_value = "graft-cli",
@@ -40,7 +40,7 @@ pub(crate) struct CandidateFromScratchArgs {
 
 impl CandidateFromScratchArgs {
     pub(crate) fn validates_on_create(&self) -> bool {
-        !self.expected.is_empty()
+        !self.constraint.is_empty()
     }
 }
 
@@ -75,7 +75,7 @@ fn from_scratch_params(args: &CandidateFromScratchArgs) -> Result<Value> {
     }
     let mut params = Map::new();
     params.insert("scratch".to_string(), json!(args.scratch));
-    params.insert("expected".to_string(), json!(args.expected));
+    params.insert("constraint".to_string(), json!(args.constraint));
     params.insert("producer".to_string(), json!(args.producer));
     if let Some(message) = &args.message {
         params.insert("message".to_string(), json!(message));
@@ -119,7 +119,10 @@ mod tests {
     fn from_scratch_params_omit_absent_optional_message() {
         let args = CandidateFromScratchArgs {
             scratch: "scratch:abc".to_string(),
-            expected: vec!["only_touches_docs".to_string()],
+            constraint: vec![
+                "only_touches_docs".to_string(),
+                "cargo_tests_pass".to_string(),
+            ],
             producer: "test".to_string(),
             message: None,
         };
@@ -128,7 +131,10 @@ mod tests {
 
         assert_eq!(params["scratch"].as_str(), Some("scratch:abc"));
         assert_eq!(params["producer"].as_str(), Some("test"));
-        assert_eq!(params["expected"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            params["constraint"],
+            json!(["only_touches_docs", "cargo_tests_pass"])
+        );
         assert!(
             params.get("message").is_none(),
             "message must be omitted instead of serialized as null"
@@ -139,7 +145,7 @@ mod tests {
     fn from_scratch_params_include_present_message() {
         let args = CandidateFromScratchArgs {
             scratch: "scratch:abc".to_string(),
-            expected: Vec::new(),
+            constraint: Vec::new(),
             producer: "test".to_string(),
             message: Some("ready".to_string()),
         };
@@ -161,7 +167,7 @@ mod tests {
         ] {
             let args = CandidateFromScratchArgs {
                 scratch: "scratch:abc".to_string(),
-                expected: Vec::new(),
+                constraint: Vec::new(),
                 producer: producer.to_string(),
                 message,
             };

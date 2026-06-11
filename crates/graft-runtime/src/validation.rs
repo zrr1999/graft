@@ -8,15 +8,14 @@ use graft_core::{
     ApplicationEndpoint, ApplicationPlan, ApplicationRef, Change, CheckPlan, EvidenceRecord,
     EvidenceResult, FileChange, FileChangeKind, FileRefPlan, GraftCandidate, HistorySelector,
     OverlayPlan, PatchRecord, PathSetPlan, ProbePlan, ProbePolarity, ProbeResult, PropertyRef,
-    PropertyScope, PropertySpec, RunPlan, RunSelectorPlan, ScopedPropertyRef, StateId, TreeEntry,
-    TreePlan, TreeSnapshot,
+    PropertySpec, RunPlan, RunSelectorPlan, StateId, TreeEntry, TreePlan, TreeSnapshot,
 };
 use graft_store::GraftStore;
 use graft_validate::ValidationSubject;
 
 use crate::config::{GraftConfig, load_graft_config, resolve_property};
 use crate::repo::materialized_snapshot_for_state;
-use crate::requirements::validation_properties_with_base;
+use crate::requirements::{constraint_primitives, validation_constraint_with_base};
 
 #[derive(Clone)]
 struct ValidationTarget {
@@ -29,7 +28,7 @@ struct ValidationTarget {
 pub(crate) fn validate_candidate(
     store: &GraftStore,
     candidate: &GraftCandidate,
-    expected: &[String],
+    constraint_primitives_to_validate: &[String],
 ) -> Result<Vec<EvidenceRecord>> {
     let config = load_graft_config(store)?;
     let target = validation_target_for_application(
@@ -39,12 +38,17 @@ pub(crate) fn validate_candidate(
         &candidate.application,
     )?;
     ensure_integrity_passed(&target.integrity)?;
-    let properties = validation_properties_with_base(&config, expected, &candidate.expected)?;
+    let constraint = validation_constraint_with_base(
+        &config,
+        constraint_primitives_to_validate,
+        &candidate.constraint,
+    )?;
+    let primitives = constraint_primitives(&constraint);
     let mut records = Vec::new();
     let mut memo = BTreeMap::new();
-    for property in properties {
+    for property in primitives {
         let mut property_records =
-            validate_scoped_property(store, &config, &target, &property, &mut memo)?;
+            validate_property_ref(store, &config, &target, &property, &mut memo)?;
         for evidence in &property_records {
             store.write_evidence(evidence)?;
             store.append_candidate_evidence_index(candidate.id.as_str(), evidence.id.as_str())?;
@@ -57,24 +61,23 @@ pub(crate) fn validate_candidate(
 pub(crate) fn validate_patch(
     store: &GraftStore,
     patch: &PatchRecord,
-    expected: &[String],
+    constraint_primitives_to_validate: &[String],
 ) -> Result<Vec<EvidenceRecord>> {
     let config = load_graft_config(store)?;
     let target =
         validation_target_for_application(store, &config, patch.id.as_str(), &patch.application)?;
     ensure_integrity_passed(&target.integrity)?;
-    let patch_properties = patch
-        .properties
-        .iter()
-        .cloned()
-        .map(|property| ScopedPropertyRef::new(PropertyScope::Workspace, property))
-        .collect::<Vec<_>>();
-    let properties = validation_properties_with_base(&config, expected, &patch_properties)?;
+    let constraint = validation_constraint_with_base(
+        &config,
+        constraint_primitives_to_validate,
+        &patch.constraint,
+    )?;
+    let primitives = constraint_primitives(&constraint);
     let mut records = Vec::new();
     let mut memo = BTreeMap::new();
-    for property in properties {
+    for property in primitives {
         let mut property_records =
-            validate_scoped_property(store, &config, &target, &property, &mut memo)?;
+            validate_property_ref(store, &config, &target, &property, &mut memo)?;
         for evidence in &property_records {
             store.write_evidence(evidence)?;
             store.append_patch_evidence_index(patch.id.as_str(), evidence.id.as_str())?;
@@ -84,32 +87,30 @@ pub(crate) fn validate_patch(
     Ok(records)
 }
 
-fn validate_scoped_property(
+fn validate_property_ref(
     store: &GraftStore,
     config: &GraftConfig,
     target: &ValidationTarget,
-    property: &ScopedPropertyRef,
+    property: &PropertyRef,
     memo: &mut BTreeMap<String, Vec<EvidenceRecord>>,
 ) -> Result<Vec<EvidenceRecord>> {
-    let memo_key = property.label();
+    let memo_key = property.id.to_string();
     if let Some(records) = memo.get(&memo_key) {
         return Ok(records.clone());
     }
-    let spec = property_spec_for_ref(config, &property.property)?;
+    let spec = property_spec_for_ref(config, property)?;
     let mut blockers = Vec::new();
     for required in &spec.plan.requires {
         let required_ref = resolve_property(config, required.as_str())?;
-        let required_ref = ScopedPropertyRef::new(property.scope.clone(), required_ref);
-        let required_records =
-            validate_scoped_property(store, config, target, &required_ref, memo)?;
+        let required_records = validate_property_ref(store, config, target, &required_ref, memo)?;
         if !required_records
             .iter()
             .all(|record| record.result.satisfies_requirement())
         {
             blockers.push(format!(
                 "`{}` ({}) => {}",
-                required_ref.label(),
-                required_ref.property.id,
+                required_ref.name,
+                required_ref.id,
                 evidence_results_label(&required_records)
             ));
         }
@@ -119,8 +120,8 @@ fn validate_scoped_property(
         verify_property_spec(store, config, target, property, spec)?
     } else {
         EvidenceRecord::skipped(
-            property.evidence_subject(&target.subject.id),
-            property.property.id.clone(),
+            target.subject.id.clone(),
+            property.id.clone(),
             verifier_id_for_spec(spec)?,
             format!("required properties did not pass: {}", blockers.join("; ")),
         )?
@@ -135,10 +136,10 @@ fn validate_property(
     store: &GraftStore,
     config: &GraftConfig,
     target: &ValidationTarget,
-    property: &ScopedPropertyRef,
+    property: &PropertyRef,
     memo: &mut BTreeMap<String, Vec<EvidenceRecord>>,
 ) -> Result<Vec<EvidenceRecord>> {
-    validate_scoped_property(store, config, target, property, memo)
+    validate_property_ref(store, config, target, property, memo)
 }
 
 fn property_spec_for_ref<'a>(
@@ -167,22 +168,14 @@ fn verify_property_spec(
     store: &GraftStore,
     config: &GraftConfig,
     target: &ValidationTarget,
-    property: &ScopedPropertyRef,
+    property: &PropertyRef,
     spec: &PropertySpec,
 ) -> Result<EvidenceRecord> {
-    let mut scoped_target = target.clone();
-    scoped_target.subject.id = property.evidence_subject(&target.subject.id);
     let verifier = verifier_id_for_spec(spec)?;
-    let result = evaluate_check_list_as_all(
-        store,
-        config,
-        &scoped_target,
-        &property.property,
-        &spec.plan.checks,
-    );
+    let result = evaluate_check_list_as_all(store, config, target, property, &spec.plan.checks);
     Ok(EvidenceRecord::new(
-        scoped_target.subject.id.clone(),
-        property.property.id.clone(),
+        target.subject.id.clone(),
+        property.id.clone(),
         verifier,
         result,
     )?)
@@ -818,26 +811,23 @@ fn evidence_result_label(result: &EvidenceResult) -> String {
 
 pub(crate) fn evidence_for_current_verifiers(
     config: &GraftConfig,
-    required: &[ScopedPropertyRef],
+    required: &[PropertyRef],
     evidence: &[EvidenceRecord],
     subject: &str,
 ) -> Result<Vec<EvidenceRecord>> {
     let mut current_verifiers = BTreeMap::new();
     for property in required {
-        let spec = property_spec_for_ref(config, &property.property)?;
-        current_verifiers.insert(
-            (property.scope.clone(), property.property.id.clone()),
-            verifier_id_for_spec(spec)?,
-        );
+        let spec = property_spec_for_ref(config, property)?;
+        current_verifiers.insert(property.id.clone(), verifier_id_for_spec(spec)?);
     }
     Ok(evidence
         .iter()
         .filter(|record| {
             required.iter().any(|property| {
-                record.property == property.property.id
-                    && record.subject == property.evidence_subject(subject)
+                record.property == property.id
+                    && record.subject == subject
                     && current_verifiers
-                        .get(&(property.scope.clone(), property.property.id.clone()))
+                        .get(&property.id)
                         .is_some_and(|verifier| verifier == &record.verifier)
             })
         })
@@ -1108,10 +1098,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use graft_core::{
-        ApplicationEndpoint, ApplicationPlan, Change, ChangeOp, CheckPlan, EvidenceRecord,
-        EvidenceResult, FileMode, HistorySelector, PatchId, PatchRecord, PathSetPlan, ProbePlan,
-        ProbePolarity, PropertyName, PropertyPlan, PropertyRef, PropertyScope, PropertySpec,
-        Provenance, RunPlan, ScopedPropertyRef, Severity, StateId, TreeEntry, TreePlan,
+        AdmissionSummary, ApplicationEndpoint, ApplicationPlan, Change, ChangeOp, CheckPlan,
+        Constraint, EvidenceRecord, EvidenceResult, FileMode, HistorySelector, PatchId,
+        PatchRecord, PathSetPlan, ProbePlan, ProbePolarity, PropertyName, PropertyPlan,
+        PropertyRef, PropertySpec, Provenance, RunPlan, Severity, StateId, TreeEntry, TreePlan,
         TreeSnapshot, application_from_change,
     };
     use graft_store::GraftStore;
@@ -1142,8 +1132,8 @@ mod tests {
         }
     }
 
-    fn workspace_property(property: PropertyRef) -> ScopedPropertyRef {
-        ScopedPropertyRef::new(PropertyScope::Workspace, property)
+    fn workspace_property(property: PropertyRef) -> PropertyRef {
+        property
     }
 
     fn write_historical_failed_patch(
@@ -1173,9 +1163,11 @@ mod tests {
         let patch = PatchRecord {
             id: PatchId::new(patch_id),
             application,
-            properties: vec![property.clone()],
+            constraint: Constraint::primitive(property.clone()),
             provenance: Provenance::now("test", None),
-            admitted_at: "test-time".to_string(),
+            admission: AdmissionSummary {
+                constraint: Constraint::primitive(property.clone()),
+            },
         };
         store.write_patch(&patch).unwrap();
         let evidence = EvidenceRecord::failed(
@@ -2007,16 +1999,15 @@ mod tests {
         let property = workspace_property(spec.property_ref().unwrap());
         let current_verifier = verifier_id_for_spec(&spec).unwrap();
         config.properties.insert("current".to_string(), spec);
-        let subject = property.evidence_subject("candidate:demo");
+        let subject = "candidate:demo";
         let stale = EvidenceRecord::passed(
-            &subject,
-            property.property.id.clone(),
+            subject,
+            property.id.clone(),
             "legacy-verifier-with-same-property-id",
         )
         .unwrap();
         let current =
-            EvidenceRecord::passed(&subject, property.property.id.clone(), current_verifier)
-                .unwrap();
+            EvidenceRecord::passed(subject, property.id.clone(), current_verifier).unwrap();
 
         let filtered = evidence_for_current_verifiers(
             &config,
@@ -2069,7 +2060,7 @@ mod tests {
         let dependency =
             workspace_property(config.properties["dependency"].property_ref().unwrap());
         assert!(matches!(
-            memo.get(&dependency.label()).unwrap()[0].result,
+            memo.get(dependency.id.as_str()).unwrap()[0].result,
             EvidenceResult::Unknown { ref reason } if reason.contains("dependency not available")
         ));
         let _ = fs::remove_dir_all(&dir);
@@ -2104,7 +2095,7 @@ mod tests {
         let dependency =
             workspace_property(config.properties["dependency"].property_ref().unwrap());
         assert_eq!(
-            memo.get(&dependency.label()).unwrap()[0].result,
+            memo.get(dependency.id.as_str()).unwrap()[0].result,
             EvidenceResult::Passed
         );
         let _ = fs::remove_dir_all(&dir);

@@ -23,11 +23,11 @@ scratch=$(grep -oE 'scratch:[0-9a-f]+' <<<"$scratch_out" | tail -n1)
 [[ -n $scratch ]] || { echo "FAIL: scratch write did not return scratch id"; echo "$scratch_out"; exit 1; }
 
 candidate_out=$("$GRAFT" patch from-scratch "$scratch" --message state-run-smoke)
-candidate=$(grep -oE 'candidate:[0-9a-f]+' <<<"$candidate_out" | head -n1)
+candidate=$(first_graft_id candidate "$candidate_out")
 [[ -n $candidate ]] || { echo "FAIL: patch from-scratch did not return candidate id"; echo "$candidate_out"; exit 1; }
 
 admit_out=$("$GRAFT" patch admit "$candidate")
-patch=$(grep -oE 'patch:[0-9a-f]+' <<<"$admit_out" | head -n1)
+patch=$(first_graft_id patch "$admit_out")
 [[ -n $patch ]] || { echo "FAIL: admit did not return patch id"; echo "$admit_out"; exit 1; }
 
 run_json=$("$GRAFT" --json run "$patch" --cwd worktrees/A -- /bin/sh -c 'test -f README.md; printf run-ok; printf run-err >&2; touch generated.txt')
@@ -56,7 +56,7 @@ assert view["cwd"] == ".", view
 assert view["exit_code"] == 0, view
 PY
 
-materialize_out=$("$GRAFT" materialize "$patch")
+materialize_out=$("$GRAFT" patch materialize "$patch")
 materialized_path=$(extract_materialize_path <<<"$materialize_out")
 [[ -n $materialized_path ]] || { echo "FAIL: materialize did not report output path"; echo "$materialize_out"; exit 1; }
 [[ -e "$materialized_path/worktrees/A/README.md" ]] || { echo "FAIL: materialized state missing repo path"; exit 1; }

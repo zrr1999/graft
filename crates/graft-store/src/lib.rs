@@ -7,9 +7,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use graft_core::{
     Action, ActionId, ApplicationId, ApplicationRecord, ApplicationRef, CandidateId, Change,
-    EvidenceRecord, GraftCandidate, MaterializedApplication, PatchId, PatchRecord, PatchRelation,
-    PromotionRecord, PropertyDef, PropertyId, PropertyRef, PropertySpec, StateId, TreeEntry,
-    TreeSnapshot, action_id, evidence_id,
+    Constraint, EvidenceRecord, GraftCandidate, MaterializedApplication, PatchId, PatchRecord,
+    PatchRelation, PromotionRecord, PropertyDef, PropertyId, PropertyRef, PropertySpec, StateId,
+    TreeEntry, TreeSnapshot, action_id, application_id, evidence_id,
+    validate_application_integrity,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -109,6 +110,8 @@ pub enum StoreError {
         expected: String,
         actual: String,
     },
+    #[error("[E_UNSUPPORTED_STORE_SCHEMA] unsupported legacy store schema in {path}: {message}")]
+    UnsupportedStoreSchema { path: PathBuf, message: String },
     #[error("failed to publish atomic write at {path}: {message}")]
     AtomicWrite { path: PathBuf, message: String },
     #[error("invalid materialize destination: {0}")]
@@ -219,6 +222,10 @@ impl GraftPaths {
 
     pub fn cache_tmp(&self) -> PathBuf {
         self.root.join("run").join("tmp")
+    }
+
+    pub fn store_schema_version(&self) -> PathBuf {
+        self.root.join("store").join("schema_version")
     }
 
     pub fn object_blobs(&self) -> PathBuf {
@@ -340,6 +347,8 @@ impl InitOutcome {
     }
 }
 
+const STORE_SCHEMA_VERSION: u32 = 2;
+
 impl GraftStore {
     pub fn open(workspace: impl AsRef<Path>) -> Self {
         Self {
@@ -409,6 +418,7 @@ impl GraftStore {
         fs::create_dir_all(self.paths.registry_evidence())?;
         fs::create_dir_all(self.paths.registry_relations())?;
         fs::create_dir_all(self.paths.registry_promotions())?;
+        self.ensure_store_schema_version()?;
         fs::create_dir_all(self.paths.refs().join("drafts"))?;
         fs::create_dir_all(self.paths.refs().join("registry"))?;
         fs::create_dir_all(self.paths.materialized_refs())?;
@@ -694,10 +704,26 @@ impl GraftStore {
     }
 
     pub fn resolve_application(&self, application: &ApplicationRef) -> Result<ResolvedApplication> {
-        let ApplicationRef::Stored(application_id) = application;
-        let record = self.read_application(application_id.as_str())?;
+        let ApplicationRef::Stored(expected_application_id) = application;
+        let application_path = self
+            .paths
+            .object_applications()
+            .join(format!("{expected_application_id}.json"));
+        let record = self.read_application(expected_application_id.as_str())?;
+        let actual_application_id = application_id(&record)
+            .map_err(StoreError::Core)?
+            .to_string();
+        if actual_application_id != expected_application_id.as_str() {
+            return Err(StoreError::StoreObjectIdMismatch {
+                path: application_path,
+                expected: expected_application_id.to_string(),
+                actual: actual_application_id,
+            });
+        }
         let change = self.read_change(record.change.as_str())?;
         let action = self.read_action(record.action.as_str())?;
+        validate_application_integrity(&record, &action, &change)
+            .map_err(graft_core::CoreError::from)?;
         Ok(ResolvedApplication {
             record,
             change,
@@ -753,6 +779,9 @@ impl GraftStore {
                         actual,
                     });
                 }
+                self.resolve_application(&ApplicationRef::Stored(ApplicationId::new(
+                    record.id.clone(),
+                )))?;
                 Ok((record.id, record.value))
             })
             .collect()
@@ -802,7 +831,7 @@ impl GraftStore {
     }
 
     pub fn read_candidate(&self, id: &str) -> Result<GraftCandidate> {
-        read_json(&self.paths.cache_candidates().join(format!("{id}.json")))
+        read_current_json(&self.paths.cache_candidates().join(format!("{id}.json")))
     }
 
     pub fn list_candidates(&self) -> Result<Vec<GraftCandidate>> {
@@ -1029,7 +1058,7 @@ impl GraftStore {
     }
 
     pub fn read_patch(&self, id: &str) -> Result<PatchRecord> {
-        read_json(&self.paths.registry_patches().join(format!("{id}.json")))
+        read_current_json(&self.paths.registry_patches().join(format!("{id}.json")))
     }
 
     pub fn list_patches(&self) -> Result<Vec<PatchRecord>> {
@@ -1076,6 +1105,43 @@ impl GraftStore {
         let rows = statement.query_map([property], |row| row.get::<_, String>(0))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(StoreError::from)
+    }
+
+    fn ensure_store_schema_version(&self) -> Result<()> {
+        let path = self.paths.store_schema_version();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        if path.exists() {
+            let value = fs::read_to_string(&path)?;
+            let version =
+                value
+                    .trim()
+                    .parse::<u32>()
+                    .map_err(|_| StoreError::UnsupportedStoreSchema {
+                        path: path.clone(),
+                        message: format!(
+                            "expected schema_version {STORE_SCHEMA_VERSION}, found {value:?}"
+                        ),
+                    })?;
+            if version != STORE_SCHEMA_VERSION {
+                return Err(StoreError::UnsupportedStoreSchema {
+                    path,
+                    message: format!(
+                        "expected schema_version {STORE_SCHEMA_VERSION}, found {version}"
+                    ),
+                });
+            }
+            return Ok(());
+        }
+        fs::write(
+            path,
+            format!(
+                "{STORE_SCHEMA_VERSION}
+"
+            ),
+        )?;
+        Ok(())
     }
 
     fn migrate_legacy_local_dir(&self) -> Result<()> {
@@ -1131,13 +1197,13 @@ impl GraftStore {
                 patch.id.to_string(),
                 serde_json::to_string(&resolved.record.base_state)?,
                 serde_json::to_string(&resolved.record.target_state)?,
-                patch.admitted_at.clone(),
+                patch.provenance.created_at.clone(),
             ),
         )?;
-        for property in &patch.properties {
+        for property in constraint_properties(&patch.constraint) {
             conn.execute(
                 "INSERT OR REPLACE INTO patch_properties (patch_id, property) VALUES (?1, ?2)",
-                (patch.id.to_string(), serde_json::to_string(property)?),
+                (patch.id.to_string(), serde_json::to_string(&property)?),
             )?;
         }
         Ok(())
@@ -1321,6 +1387,47 @@ fn append_unique_index(dir: &Path, subject: &str, evidence: &str) -> Result<()> 
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     let bytes = fs::read(path)?;
     Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn read_current_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
+    let bytes = fs::read(path)?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    reject_legacy_schema(path, &value)?;
+    Ok(serde_json::from_value(value)?)
+}
+
+fn reject_legacy_schema(path: &Path, value: &serde_json::Value) -> Result<()> {
+    let Some(object) = value.as_object() else {
+        return Ok(());
+    };
+    let legacy_fields = ["expected", "properties", "admitted_at"]
+        .into_iter()
+        .filter(|field| object.contains_key(*field))
+        .collect::<Vec<_>>();
+    if legacy_fields.is_empty() {
+        return Ok(());
+    }
+    Err(StoreError::UnsupportedStoreSchema {
+        path: path.to_path_buf(),
+        message: format!("legacy fields present: {}", legacy_fields.join(", ")),
+    })
+}
+
+fn constraint_properties(constraint: &Constraint) -> Vec<PropertyRef> {
+    let mut properties = Vec::new();
+    collect_constraint_properties(constraint, &mut properties);
+    properties
+}
+
+fn collect_constraint_properties(constraint: &Constraint, properties: &mut Vec<PropertyRef>) {
+    match constraint {
+        Constraint::Top | Constraint::Bottom => {}
+        Constraint::Primitive { property } => properties.push(property.clone()),
+        Constraint::Both { left, right } | Constraint::Either { left, right } => {
+            collect_constraint_properties(left, properties);
+            collect_constraint_properties(right, properties);
+        }
+    }
 }
 
 fn read_json_records<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
@@ -1668,8 +1775,8 @@ fn normalize_relative_path(root: &Path, path: &Path) -> Result<String> {
 mod tests {
     use super::*;
     use graft_core::{
-        PatchId, PatchRelation, PatchRelationKind, PromotionId, PromotionRecord, PropertyId,
-        Provenance, RelationId, StateId, materialize_application,
+        AdmissionSummary, PatchId, PatchRelation, PatchRelationKind, PromotionId, PromotionRecord,
+        PropertyId, Provenance, RelationId, StateId, materialize_application,
     };
 
     fn test_application_ref(
@@ -1682,6 +1789,157 @@ mod tests {
         let materialized =
             materialize_application(base_state, base, target_state, target_snapshot).unwrap();
         store.write_materialized_application(&materialized).unwrap()
+    }
+
+    fn test_materialized_application() -> graft_core::MaterializedApplication {
+        let target = TreeSnapshot::new(vec![TreeEntry {
+            path: "hello.txt".to_string(),
+            hash: "blob:hello".to_string(),
+            size: 5,
+        }]);
+        materialize_application(
+            StateId::GraftTree("tree:base".to_string()),
+            None,
+            StateId::GraftTree(target.id().unwrap()),
+            &target,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn resolve_application_rejects_record_id_mismatch() {
+        let dir = std::env::temp_dir().join(format!(
+            "graft-store-application-id-mismatch-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let store = GraftStore::open(&dir);
+        store.init_storage().unwrap();
+        let materialized = test_materialized_application();
+        store.write_action(&materialized.action).unwrap();
+        store.write_change(&materialized.change).unwrap();
+        let actual_id = materialized.record.id().unwrap();
+        let wrong_id = ApplicationId::new("application:wrong");
+        fs::write(
+            store
+                .paths()
+                .object_applications()
+                .join(format!("{wrong_id}.json")),
+            serde_json::to_vec(&materialized.record).unwrap(),
+        )
+        .unwrap();
+
+        let error = store
+            .resolve_application(&ApplicationRef::Stored(wrong_id))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("store object id mismatch"), "{error}");
+        assert!(error.contains(actual_id.as_str()), "{error}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_application_rejects_proof_action_mismatch() {
+        let dir = std::env::temp_dir().join(format!(
+            "graft-store-application-proof-mismatch-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let store = GraftStore::open(&dir);
+        store.init_storage().unwrap();
+        let mut materialized = test_materialized_application();
+        materialized.record.applicability_proof.action = ActionId::new("action:wrong");
+        let application_id = materialized.record.id().unwrap();
+        store.write_action(&materialized.action).unwrap();
+        store.write_change(&materialized.change).unwrap();
+        fs::write(
+            store
+                .paths()
+                .object_applications()
+                .join(format!("{application_id}.json")),
+            serde_json::to_vec(&materialized.record).unwrap(),
+        )
+        .unwrap();
+
+        let error = store
+            .resolve_application(&ApplicationRef::Stored(application_id))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("[E_CHANGE_INTEGRITY]"), "{error}");
+        assert!(error.contains("proof action"), "{error}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_application_rejects_change_endpoint_mismatch() {
+        let dir = std::env::temp_dir().join(format!(
+            "graft-store-application-endpoint-mismatch-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let store = GraftStore::open(&dir);
+        store.init_storage().unwrap();
+        let mut materialized = test_materialized_application();
+        materialized.change.target_state = StateId::GraftTree("tree:wrong-target".to_string());
+        materialized.record.change = materialized.change.id().unwrap();
+        let application_id = materialized.record.id().unwrap();
+        store.write_action(&materialized.action).unwrap();
+        store.write_change(&materialized.change).unwrap();
+        fs::write(
+            store
+                .paths()
+                .object_applications()
+                .join(format!("{application_id}.json")),
+            serde_json::to_vec(&materialized.record).unwrap(),
+        )
+        .unwrap();
+
+        let error = store
+            .resolve_application(&ApplicationRef::Stored(application_id))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("[E_CHANGE_INTEGRITY]"), "{error}");
+        assert!(error.contains("target_state"), "{error}");
+        assert!(error.contains("change target_state"), "{error}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_application_rejects_action_not_lowered_from_change() {
+        let dir = std::env::temp_dir().join(format!(
+            "graft-store-application-action-lowering-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let store = GraftStore::open(&dir);
+        store.init_storage().unwrap();
+        let mut materialized = test_materialized_application();
+        materialized.action = Action::Sequence { steps: Vec::new() };
+        materialized.record.action = action_id(&materialized.action).unwrap();
+        materialized.record.applicability_proof.action = materialized.record.action.clone();
+        let application_id = materialized.record.id().unwrap();
+        store.write_action(&materialized.action).unwrap();
+        store.write_change(&materialized.change).unwrap();
+        fs::write(
+            store
+                .paths()
+                .object_applications()
+                .join(format!("{application_id}.json")),
+            serde_json::to_vec(&materialized.record).unwrap(),
+        )
+        .unwrap();
+
+        let error = store
+            .resolve_application(&ApplicationRef::Stored(application_id))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("[E_CHANGE_INTEGRITY]"), "{error}");
+        assert!(error.contains("lowering from change ops"), "{error}");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1818,6 +2076,11 @@ mod tests {
 
         assert!(store.paths().index().exists());
         assert!(store.paths().derived_worktrees().exists());
+        assert_eq!(
+            fs::read_to_string(store.paths().store_schema_version()).unwrap(),
+            "2
+"
+        );
         assert!(!dir.join("graft.toml").exists());
 
         let _ = fs::remove_dir_all(&dir);
@@ -1988,6 +2251,30 @@ mod tests {
 
         assert!(error.contains("invalid store object path"), "{error}");
         assert!(error.contains("valid UTF-8"), "{error}");
+    }
+
+    #[test]
+    fn init_storage_rejects_unsupported_store_schema_marker() {
+        let dir = std::env::temp_dir().join(format!(
+            "graft-store-schema-marker-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let store = GraftStore::open(&dir);
+        fs::create_dir_all(store.paths().store_schema_version().parent().unwrap()).unwrap();
+        fs::write(
+            store.paths().store_schema_version(),
+            "1
+",
+        )
+        .unwrap();
+
+        let err = store.init_storage().unwrap_err();
+
+        assert!(matches!(err, StoreError::UnsupportedStoreSchema { .. }));
+        assert!(err.to_string().contains("[E_UNSUPPORTED_STORE_SCHEMA]"));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2376,7 +2663,7 @@ mod tests {
         let candidate = GraftCandidate {
             id: graft_core::CandidateId::new("candidate:demo"),
             application: application.clone(),
-            expected: Vec::new(),
+            constraint: Constraint::Top,
             provenance: Provenance {
                 producer: "test".to_string(),
                 message: None,
@@ -2388,13 +2675,15 @@ mod tests {
         let patch = PatchRecord {
             id: PatchId::new("patch:demo"),
             application,
-            properties: Vec::new(),
+            constraint: Constraint::Top,
             provenance: Provenance {
                 producer: "test".to_string(),
                 message: None,
                 created_at: "now".to_string(),
             },
-            admitted_at: "now".to_string(),
+            admission: AdmissionSummary {
+                constraint: Constraint::Top,
+            },
         };
         store.write_patch(&patch).unwrap();
 
@@ -2414,6 +2703,35 @@ mod tests {
             store.virtual_tree(&VirtualBaseRef::Tree(tree_id)).unwrap(),
             snapshot
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_candidate_rejects_legacy_expected_field() {
+        let dir = std::env::temp_dir().join(format!(
+            "graft-store-legacy-candidate-schema-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let store = GraftStore::open(&dir);
+        store.init().unwrap();
+        fs::create_dir_all(store.paths.cache_candidates()).unwrap();
+        fs::write(
+            store.paths.cache_candidates().join("candidate:legacy.json"),
+            r#"{
+              "id":"candidate:legacy",
+              "application":{"kind":"stored","value":"application:demo"},
+              "expected":[],
+              "provenance":{"producer":"test","message":null,"created_at":"now"}
+            }"#,
+        )
+        .unwrap();
+
+        let err = store.read_candidate("candidate:legacy").unwrap_err();
+
+        assert!(matches!(err, StoreError::UnsupportedStoreSchema { .. }));
+        assert!(err.to_string().contains("[E_UNSUPPORTED_STORE_SCHEMA]"));
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2485,13 +2803,15 @@ mod tests {
         let patch = PatchRecord {
             id: PatchId::new("patch:demo"),
             application,
-            properties: vec![property.clone()],
+            constraint: Constraint::primitive(property.clone()),
             provenance: Provenance {
                 producer: "test".to_string(),
                 message: None,
                 created_at: "now".to_string(),
             },
-            admitted_at: "now".to_string(),
+            admission: AdmissionSummary {
+                constraint: Constraint::primitive(property.clone()),
+            },
         };
         store.write_patch(&patch).unwrap();
 
@@ -2514,8 +2834,7 @@ mod tests {
         store.init_storage().unwrap();
 
         let property = PropertyId::new("property:indexcopy");
-        let evidence =
-            EvidenceRecord::passed("candidate:demo@workspace", property, "test-verifier").unwrap();
+        let evidence = EvidenceRecord::passed("candidate:demo", property, "test-verifier").unwrap();
         let old_evidence_id = evidence.id.to_string();
         store.write_evidence(&evidence).unwrap();
         store
@@ -2529,7 +2848,7 @@ mod tests {
         assert_ne!(copied, vec![old_evidence_id]);
         assert_eq!(store.patch_evidence_index("patch:demo").unwrap(), copied);
         let patch_evidence = store.patch_evidence_records("patch:demo").unwrap();
-        assert_eq!(patch_evidence[0].subject, "patch:demo@workspace");
+        assert_eq!(patch_evidence[0].subject, "patch:demo");
         assert_eq!(
             patch_evidence[0].property,
             PropertyId::new("property:indexcopy")

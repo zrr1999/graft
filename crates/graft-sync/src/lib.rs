@@ -1,11 +1,11 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use graft_core::{
     Action, ApplicationRecord, Change, PatchRecord, PatchRelation, PromotionRecord, PropertySpec,
     TreeSnapshot, action_id, application_id, blake3_hex_digest, patch_id, promotion_id,
-    relation_id, stable_typed_id,
+    relation_id, stable_typed_id, validate_application_integrity,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -48,6 +48,8 @@ impl SyncOptions {
         }
     }
 }
+
+const MANIFEST_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -406,7 +408,12 @@ fn write_remote_last_synced(
 }
 
 fn remote_last_synced_path(workspace_root: &Path, remote: &Path) -> PathBuf {
-    graft_store::GraftPaths::new(workspace_root).remote_last_synced(&remote_state_key(remote))
+    workspace_root
+        .join(".graft")
+        .join("local")
+        .join("remotes")
+        .join(remote_state_key(remote))
+        .join("last_synced")
 }
 
 fn remote_state_key(remote: &Path) -> String {
@@ -450,7 +457,7 @@ fn write_manifest(
     };
     let mut manifest = ManifestRecord {
         id: "manifest:pending".to_string(),
-        version: 1,
+        version: MANIFEST_VERSION,
         facts_tip,
         blobs_tip,
         prev_manifest: read_valid_previous_manifest_id(repo, remote_public)?,
@@ -542,10 +549,13 @@ fn validate_manifest_record(
             ),
         });
     }
-    if manifest.version != 1 {
+    if manifest.version != MANIFEST_VERSION {
         return Err(SyncError::InvalidManifest {
             path: path.to_path_buf(),
-            message: format!("unsupported manifest version {}", manifest.version),
+            message: format!(
+                "unsupported manifest version {}; expected {MANIFEST_VERSION}",
+                manifest.version
+            ),
         });
     }
     let actual = expected_manifest_id(manifest)?;
@@ -987,7 +997,62 @@ fn validate_public_store_objects(public: &Path) -> Result<()> {
             }
         }
     }
+    validate_public_application_graph(public)?;
     Ok(())
+}
+
+fn validate_public_application_graph(public: &Path) -> Result<()> {
+    let actions = read_public_object_map::<Action>(public, "action")?;
+    let changes = read_public_object_map::<Change>(public, "change")?;
+    let applications = read_public_object_map::<ApplicationRecord>(public, "application")?;
+    for (application_id, application) in applications {
+        let path = public
+            .join("application")
+            .join(format!("{application_id}.json"));
+        let action = actions.get(application.action.as_str()).ok_or_else(|| {
+            SyncError::InvalidStoreObject {
+                path: path.clone(),
+                message: format!(
+                    "application `{application_id}` references missing action `{}`",
+                    application.action
+                ),
+            }
+        })?;
+        let change = changes.get(application.change.as_str()).ok_or_else(|| {
+            SyncError::InvalidStoreObject {
+                path: path.clone(),
+                message: format!(
+                    "application `{application_id}` references missing change `{}`",
+                    application.change
+                ),
+            }
+        })?;
+        validate_application_integrity(&application, action, change).map_err(|error| {
+            SyncError::InvalidStoreObject {
+                path,
+                message: error.to_string(),
+            }
+        })?;
+    }
+    Ok(())
+}
+
+fn read_public_object_map<T: DeserializeOwned>(
+    public: &Path,
+    kind: &'static str,
+) -> Result<BTreeMap<String, T>> {
+    let dir = public.join(kind);
+    let mut objects = BTreeMap::new();
+    for entry in sorted_dir_entries(&dir)? {
+        let path = entry.path();
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let id = json_object_id(&path, kind)?;
+        let object = read_store_json::<T>(&path, kind)?;
+        objects.insert(id, object);
+    }
+    Ok(objects)
 }
 
 fn validate_property_dir(dir: &Path) -> Result<()> {
@@ -1367,7 +1432,8 @@ fn newest_updated_at(left: Option<&str>, right: Option<&str>) -> Option<String> 
 mod tests {
     use super::*;
     use graft_core::{
-        ApplicationRef, PatchId, Provenance, StateId, action_id, materialize_application,
+        AdmissionSummary, ApplicationRef, Constraint, PatchId, Provenance, StateId, action_id,
+        application_id, materialize_application,
     };
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1451,6 +1517,95 @@ mod tests {
     }
 
     #[test]
+    fn public_store_validation_rejects_application_missing_action() {
+        let dir = test_dir("application-missing-action");
+        let public = dir.join("public");
+        let application = write_application_objects(&public, "missing-action");
+        let ApplicationRef::Stored(application_id) = application;
+        let application_record = read_store_json::<ApplicationRecord>(
+            &public
+                .join("application")
+                .join(format!("{application_id}.json")),
+            "application",
+        )
+        .unwrap();
+        fs::remove_file(
+            public
+                .join("action")
+                .join(format!("{}.json", application_record.action)),
+        )
+        .unwrap();
+
+        let error = validate_public_store_objects(&public)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("[E_SYNC_STORE_OBJECT_INVALID]"), "{error}");
+        assert!(error.contains("references missing action"), "{error}");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn public_store_validation_rejects_application_missing_change() {
+        let dir = test_dir("application-missing-change");
+        let public = dir.join("public");
+        let application = write_application_objects(&public, "missing-change");
+        let ApplicationRef::Stored(application_id) = application;
+        let application_record = read_store_json::<ApplicationRecord>(
+            &public
+                .join("application")
+                .join(format!("{application_id}.json")),
+            "application",
+        )
+        .unwrap();
+        fs::remove_file(
+            public
+                .join("change")
+                .join(format!("{}.json", application_record.change)),
+        )
+        .unwrap();
+
+        let error = validate_public_store_objects(&public)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("[E_SYNC_STORE_OBJECT_INVALID]"), "{error}");
+        assert!(error.contains("references missing change"), "{error}");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn public_store_validation_rejects_application_proof_mismatch() {
+        let dir = test_dir("application-proof-mismatch");
+        let public = dir.join("public");
+        let application = write_application_objects(&public, "proof-mismatch");
+        let ApplicationRef::Stored(old_application_id) = application;
+        let old_path = public
+            .join("application")
+            .join(format!("{old_application_id}.json"));
+        let mut application_record =
+            read_store_json::<ApplicationRecord>(&old_path, "application").unwrap();
+        fs::remove_file(old_path).unwrap();
+        application_record.applicability_proof.action = graft_core::ActionId::new("action:wrong");
+        let new_application_id = application_id(&application_record).unwrap();
+        fs::write(
+            public
+                .join("application")
+                .join(format!("{new_application_id}.json")),
+            serde_json::to_vec(&application_record).unwrap(),
+        )
+        .unwrap();
+
+        let error = validate_public_store_objects(&public)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("[E_SYNC_STORE_OBJECT_INVALID]"), "{error}");
+        assert!(error.contains("proof action"), "{error}");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn push_sync_initializes_missing_remote() {
         let dir = test_dir("push-missing");
         let workspace = dir.join("workspace");
@@ -1465,6 +1620,45 @@ mod tests {
         assert!(report.facts_tip.is_some());
         assert!(report.blobs_tip.is_some());
         assert!(report.manifest_id.is_some());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn fetch_rejects_v1_manifest_version() {
+        let dir = test_dir("fetch-v1-manifest-version");
+        let source = dir.join("source");
+        let dest = dir.join("dest");
+        let remote = dir.join("remote.git");
+        let source_public = source.join("store").join("public");
+        let patch = write_valid_patch_object(&source_public, "v1-manifest-version");
+        sync_public_store(&source, &remote, true, false).unwrap();
+
+        let remote_public = remote.join("graft-public");
+        let manifest_id = read_manifest_id(&remote_public).unwrap().unwrap();
+        let manifest_path = remote_public
+            .join("manifest")
+            .join(format!("{manifest_id}.json"));
+        let mut manifest: ManifestRecord =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest.version = 1;
+        rewrite_manifest_head(&remote_public, manifest);
+
+        let error = sync_public_store(&dest, &remote, false, true)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("[E_SYNC_MANIFEST_INVALID]"), "{error}");
+        assert!(
+            error.contains("unsupported manifest version 1; expected 2"),
+            "{error}"
+        );
+        assert!(
+            !dest
+                .join("store/public/patch")
+                .join(format!("{patch}.json"))
+                .exists(),
+            "fetch must not copy objects from a v1 manifest"
+        );
         fs::remove_dir_all(dir).ok();
     }
 
@@ -2103,7 +2297,7 @@ mod tests {
 
         let local_public = dest.join("store").join("public");
         let mut local_patch = patch.clone();
-        local_patch.admitted_at = "different-local-display-time".to_string();
+        local_patch.provenance.created_at = "different-local-display-time".to_string();
         write_patch_object(&local_public, &local_patch);
         let local_patch_path = local_public
             .join("patch")
@@ -2300,13 +2494,15 @@ mod tests {
         let mut patch = PatchRecord {
             id: PatchId::new("patch:pending"),
             application,
-            properties: Vec::new(),
+            constraint: Constraint::Top,
             provenance: Provenance {
                 producer: "graft-sync-test".to_string(),
                 message: Some(message.to_string()),
                 created_at: "2026-06-04T00:00:00Z".to_string(),
             },
-            admitted_at: "2026-06-04T00:00:00Z".to_string(),
+            admission: AdmissionSummary {
+                constraint: Constraint::Top,
+            },
         };
         patch.id = patch_id(&patch).unwrap();
         patch

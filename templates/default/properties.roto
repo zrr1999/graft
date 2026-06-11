@@ -6,6 +6,8 @@
 // `[admission.required_properties]` / `[promotion.required_properties]` maps.
 //
 // The starter file is intentionally empty so `graft init` produces a
-// workspace gated only by core integrity (`base + change == target`).
+// workspace gated only by application core integrity:
+// `apply(action, base, proof) == target` and
+// `replay(base, change.ops) == target`.
 // See `examples/properties/` and `examples/full/properties.roto` for
 // idiomatic patterns.

@@ -6,7 +6,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use graft_core::{
-    Evaluator, EvidenceRecord, EvidenceResult, Judge, PropertyDef, PropertyId, Query,
+    Constraint, Evaluator, EvidenceRecord, EvidenceResult, Judge, PropertyDef, PropertyId, Query,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -255,6 +255,14 @@ pub fn validate_property(
     property: &PropertyDef,
 ) -> Result<EvidenceRecord> {
     ValidationEngine::default().validate(subject, property)
+}
+
+pub fn validate_constraint(
+    subject: &ValidationSubject,
+    constraint: &Constraint,
+    evidence: &[EvidenceRecord],
+) -> std::result::Result<graft_policy::AdmissionDecision, graft_policy::PolicyError> {
+    graft_policy::satisfies_subject(&subject.id, constraint, evidence)
 }
 
 #[derive(Clone, Debug)]
@@ -920,6 +928,26 @@ mod tests {
             teardown: Vec::new(),
             timeout_secs: Some(5),
         }
+    }
+
+    #[test]
+    fn validate_constraint_delegates_to_policy_with_subject_id() {
+        let subject = ValidationSubject::new("candidate:demo");
+        let property = graft_core::PropertyRef::new(
+            graft_core::PropertyId::new("property:tests_pass"),
+            "tests_pass",
+        );
+        let constraint = Constraint::primitive(property);
+
+        let error = validate_constraint(&subject, &constraint, &[])
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.starts_with("[A001]"), "{error}");
+        assert!(
+            error.contains("Constraint failed at: primitive tests_pass"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -26,7 +26,7 @@ scratch_a_id=$(grep -oE 'scratch:[0-9a-f]+' <<<"$scratch_a" | tail -n1)
 [[ -n $scratch_a_id ]] || { echo "FAIL: workspace A scratch missing"; echo "$scratch_a"; exit 1; }
 
 candidate_a=$("$GRAFT" --cwd "$WS_A" candidate from-scratch "$scratch_a_id" --message workspace-a)
-candidate_a_id=$(grep -oE 'candidate:[0-9a-f]+' <<<"$candidate_a" | head -n1)
+candidate_a_id=$(first_graft_id candidate "$candidate_a")
 [[ -n $candidate_a_id ]] || { echo "FAIL: workspace A candidate missing"; echo "$candidate_a"; exit 1; }
 [[ -e "$WS_A/.graft/store/private/candidate/$candidate_a_id.json" ]] || {
   echo "FAIL: workspace A candidate was not written to workspace A"; exit 1;
@@ -37,7 +37,7 @@ scratch_b_id=$(grep -oE 'scratch:[0-9a-f]+' <<<"$scratch_b" | tail -n1)
 [[ -n $scratch_b_id ]] || { echo "FAIL: workspace B scratch missing"; echo "$scratch_b"; exit 1; }
 
 candidate_b=$("$GRAFT" --cwd "$WS_B" candidate from-scratch "$scratch_b_id" --message workspace-b)
-candidate_b_id=$(grep -oE 'candidate:[0-9a-f]+' <<<"$candidate_b" | head -n1)
+candidate_b_id=$(first_graft_id candidate "$candidate_b")
 [[ -n $candidate_b_id ]] || { echo "FAIL: workspace B candidate missing"; echo "$candidate_b"; exit 1; }
 
 [[ -e "$WS_B/.graft/store/private/candidate/$candidate_b_id.json" ]] || {

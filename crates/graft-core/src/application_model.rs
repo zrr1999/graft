@@ -337,10 +337,10 @@ impl Change {
                     before_blob: before.clone(),
                     after_blob: after.clone(),
                 },
-                ChangeOp::Rename { from, blob, .. } => ApplicabilityStep::Sequence {
+                ChangeOp::Rename { from, to, blob, .. } => ApplicabilityStep::Sequence {
                     children: vec![
                         ApplicabilityStep::CreateFile {
-                            path: from.clone(),
+                            path: to.clone(),
                             observed_missing: true,
                         },
                         ApplicabilityStep::DeleteFile {
@@ -391,6 +391,96 @@ pub enum ApplicationRef {
 
 pub fn application_id(record: &ApplicationRecord) -> Result<ApplicationId> {
     Ok(ApplicationId::new(stable_typed_id("application", record)?))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApplicationIntegrityError {
+    pub message: String,
+}
+
+impl std::fmt::Display for ApplicationIntegrityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ApplicationIntegrityError {}
+
+impl ApplicationIntegrityError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+pub fn validate_application_integrity(
+    record: &ApplicationRecord,
+    action: &Action,
+    change: &Change,
+) -> std::result::Result<(), ApplicationIntegrityError> {
+    if record.lowering_version != ApplicationRecord::LOWERING_VERSION {
+        return Err(ApplicationIntegrityError::new(format!(
+            "unsupported application lowering_version {}; expected {}",
+            record.lowering_version,
+            ApplicationRecord::LOWERING_VERSION
+        )));
+    }
+    let actual_action = action_id(action).map_err(|error| {
+        ApplicationIntegrityError::new(format!("canonical action id failed: {error}"))
+    })?;
+    if record.action != actual_action {
+        return Err(ApplicationIntegrityError::new(format!(
+            "application action id `{}` does not match canonical action id `{actual_action}`",
+            record.action
+        )));
+    }
+    let actual_change = change.id().map_err(|error| {
+        ApplicationIntegrityError::new(format!("canonical change id failed: {error}"))
+    })?;
+    if record.change != actual_change {
+        return Err(ApplicationIntegrityError::new(format!(
+            "application change id `{}` does not match canonical change id `{actual_change}`",
+            record.change
+        )));
+    }
+    if record.base_state != change.base_state {
+        return Err(ApplicationIntegrityError::new(format!(
+            "application base_state `{:?}` does not match change base_state `{:?}`",
+            record.base_state, change.base_state
+        )));
+    }
+    if record.target_state != change.target_state {
+        return Err(ApplicationIntegrityError::new(format!(
+            "application target_state `{:?}` does not match change target_state `{:?}`",
+            record.target_state, change.target_state
+        )));
+    }
+    if record.applicability_proof.action != record.action {
+        return Err(ApplicationIntegrityError::new(format!(
+            "applicability proof action `{}` does not match application action `{}`",
+            record.applicability_proof.action, record.action
+        )));
+    }
+    if record.applicability_proof.base_state != record.base_state {
+        return Err(ApplicationIntegrityError::new(format!(
+            "applicability proof base_state `{:?}` does not match application base_state `{:?}`",
+            record.applicability_proof.base_state, record.base_state
+        )));
+    }
+    let expected_action = Action::from_change_ops(&change.ops);
+    if action != &expected_action {
+        return Err(ApplicationIntegrityError::new(
+            "application action does not match v1 lowering from change ops",
+        ));
+    }
+    let expected_steps = change.proof_steps();
+    if record.applicability_proof.steps != expected_steps {
+        return Err(ApplicationIntegrityError::new(
+            "applicability proof steps do not match v1 lowering from change ops",
+        ));
+    }
+    Ok(())
 }
 
 pub struct MaterializedApplication {
@@ -689,5 +779,101 @@ fn file_change_kind(
         (Some(_), None) => Some(FileChangeKind::Deleted),
         (Some(base), Some(target)) if base == target => None,
         (Some(_), Some(_)) => Some(FileChangeKind::Modified),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rename_change() -> Change {
+        Change {
+            base_state: StateId::GraftTree("tree:base".to_string()),
+            target_state: StateId::GraftTree("tree:target".to_string()),
+            ops: vec![ChangeOp::Rename {
+                from: "old.txt".to_string(),
+                to: "new.txt".to_string(),
+                blob: "blob:content".to_string(),
+                mode: FileMode::Regular,
+            }],
+            capture: false,
+        }
+    }
+
+    #[test]
+    fn validates_materialized_application_integrity() {
+        let change = Change {
+            base_state: StateId::GraftTree("tree:base".to_string()),
+            target_state: StateId::GraftTree("tree:target".to_string()),
+            ops: vec![ChangeOp::CreateFile {
+                path: "hello.txt".to_string(),
+                blob: "blob:hello".to_string(),
+                mode: FileMode::Regular,
+            }],
+            capture: false,
+        };
+        let materialized = application_from_change(&change).unwrap();
+
+        validate_application_integrity(
+            &materialized.record,
+            &materialized.action,
+            &materialized.change,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn rejects_action_that_does_not_lower_from_change() {
+        let change = Change {
+            base_state: StateId::GraftTree("tree:base".to_string()),
+            target_state: StateId::GraftTree("tree:target".to_string()),
+            ops: vec![ChangeOp::CreateFile {
+                path: "hello.txt".to_string(),
+                blob: "blob:hello".to_string(),
+                mode: FileMode::Regular,
+            }],
+            capture: false,
+        };
+        let mut materialized = application_from_change(&change).unwrap();
+        materialized.action = Action::Sequence { steps: Vec::new() };
+        materialized.record.action = action_id(&materialized.action).unwrap();
+        materialized.record.applicability_proof.action = materialized.record.action.clone();
+
+        let error = validate_application_integrity(
+            &materialized.record,
+            &materialized.action,
+            &materialized.change,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("lowering from change ops"), "{error}");
+    }
+
+    #[test]
+    fn rename_proof_uses_target_path_for_created_file() {
+        let materialized = application_from_change(&rename_change()).unwrap();
+
+        validate_application_integrity(
+            &materialized.record,
+            &materialized.action,
+            &materialized.change,
+        )
+        .unwrap();
+        assert_eq!(
+            materialized.record.applicability_proof.steps,
+            vec![ApplicabilityStep::Sequence {
+                children: vec![
+                    ApplicabilityStep::CreateFile {
+                        path: "new.txt".to_string(),
+                        observed_missing: true,
+                    },
+                    ApplicabilityStep::DeleteFile {
+                        path: "old.txt".to_string(),
+                        matched_blob: "blob:content".to_string(),
+                    },
+                ],
+            }]
+        );
     }
 }

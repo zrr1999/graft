@@ -110,9 +110,9 @@ const AGENT_WORKFLOW_LONG_ABOUT: &str = concat!(
     "4. Turn draft into reviewable state with `graft patch from-scratch scratch:<digest> --expect <Property> --message <msg>`; the patch from-scratch command generates a private local candidate and immediately validates any `--expect` properties, but does not admit or promote it.\n",
     "5. Re-run or add evidence with `graft patch validate candidate:<digest> --expect <Property>` and inspect with `graft patch show`, `graft patch list --candidates`, or `graft patch search`.\n",
     "6. Admit only after required evidence passes: `graft patch admit candidate:<digest> --require <Property>`; admit generates a public patch and moves candidate evidence refs to the patch.\n",
-    "7. Check output with `graft materialize <state-ref>` or `graft run <state-ref> -- <cmd>`; materialize writes isolated `.worktrees/<state>/` inspection output, not cwd or Git refs.\n",
-    "8. External promote is low-frequency and explicit: only run `graft promote <patch-id> --to <target> --yes` when an approved patch must update an outside Git branch, PR, or release target.\n",
-    "9. Low-frequency advanced write commands such as patch compose/migrate/revert, sync, repo add/sync/lock/update, bundle import, workspace gc --apply, and patch promote may use pi-graft `graft_cli_exec` argv; keep read/inspect commands on the local CLI path and keep high-frequency agents on typed scratch/patch ops plus validate/admit/show/materialize."
+    "7. Check output with `graft patch materialize <patch-id>` or `graft run <state-ref> -- <cmd>`; materialize writes isolated `.worktrees/<state>/` inspection output, not cwd or Git refs.\n",
+    "8. External promote is low-frequency and explicit: only run `graft patch promote <patch-id> --to <target> --yes` when an approved patch must update an outside Git branch, PR, or release target.\n",
+    "9. Low-frequency advanced write commands such as patch compose/migrate/revert/promote, sync, repo add/sync/lock/update, bundle import, and workspace gc --apply may use pi-graft `graft_cli_exec` argv; keep read/inspect commands on the local CLI path and keep high-frequency agents on typed scratch/patch ops plus validate/admit/show/materialize."
 );
 
 const SCRATCH_LONG_ABOUT: &str = concat!(
@@ -479,8 +479,8 @@ mod tests {
             "graft candidate from-scratch",
             "graft validate candidate:",
             "graft admit candidate:",
-            "graft materialize patch:",
-            "graft promote patch:",
+            "graft patch materialize patch:",
+            "graft patch promote patch:",
             "scratch open",
             "scratch promote",
             "registry import",

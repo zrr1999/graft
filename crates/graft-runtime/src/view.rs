@@ -144,6 +144,9 @@ pub(crate) enum GcWorkspaceView {
         orphan_evidence_bodies: usize,
         orphan_candidate_evidence_indexes: usize,
         orphan_patch_evidence_indexes: usize,
+        orphan_applications: usize,
+        orphan_actions: usize,
+        orphan_changes: usize,
         orphan_objects_selected: usize,
     },
 }
@@ -164,7 +167,7 @@ pub(crate) struct CandidateSummary {
     pub(crate) id: String,
     pub(crate) base_state: String,
     pub(crate) target_state: String,
-    pub(crate) expected: Vec<String>,
+    pub(crate) constraint: Vec<String>,
     pub(crate) producer: String,
     pub(crate) message: Option<String>,
     pub(crate) created_at: String,
@@ -178,7 +181,7 @@ pub(crate) struct PatchSummary {
     pub(crate) id: String,
     pub(crate) base_state: String,
     pub(crate) target_state: String,
-    pub(crate) properties: Vec<String>,
+    pub(crate) constraint: Vec<String>,
     pub(crate) producer: String,
     pub(crate) message: Option<String>,
     pub(crate) admitted_at: String,
@@ -436,6 +439,9 @@ fn push_gc_view(lines: &mut Vec<String>, view: &GcView) {
             orphan_evidence_bodies,
             orphan_candidate_evidence_indexes,
             orphan_patch_evidence_indexes,
+            orphan_applications,
+            orphan_actions,
+            orphan_changes,
             orphan_objects_selected,
         } => {
             push_human_kv(lines, "orphan_objects_before", orphan_objects_before);
@@ -450,6 +456,9 @@ fn push_gc_view(lines: &mut Vec<String>, view: &GcView) {
                 "orphan_patch_evidence_indexes",
                 orphan_patch_evidence_indexes,
             );
+            push_human_kv(lines, "orphan_applications", orphan_applications);
+            push_human_kv(lines, "orphan_actions", orphan_actions);
+            push_human_kv(lines, "orphan_changes", orphan_changes);
             push_human_kv(
                 lines,
                 if apply {
@@ -501,8 +510,8 @@ fn push_candidate(lines: &mut Vec<String>, candidate: &CandidateSummary) {
     lines.push(format!("  base: {}", candidate.base_state));
     lines.push(format!("  target: {}", candidate.target_state));
     lines.push(format!(
-        "  expected: {}",
-        joined_or_dash(&candidate.expected)
+        "  constraint: {}",
+        joined_or_dash(&candidate.constraint)
     ));
     lines.push(format!(
         "  evidence: {} passed, {} failed, {} unknown, {} skipped",
@@ -521,8 +530,8 @@ fn push_patch(lines: &mut Vec<String>, patch: &PatchSummary) {
     lines.push(format!("  base: {}", patch.base_state));
     lines.push(format!("  target: {}", patch.target_state));
     lines.push(format!(
-        "  properties: {}",
-        joined_or_dash(&patch.properties)
+        "  constraint: {}",
+        joined_or_dash(&patch.constraint)
     ));
     lines.push(format!("  admitted_at: {}", patch.admitted_at));
     lines.push(format!(

@@ -51,7 +51,7 @@ scratch_out=$("$GRAFT_BIN" scratch write --base graft:empty hello.txt --content 
 scratch=$(grep -oE 'scratch:[0-9a-f]+' <<<"$scratch_out" | tail -n1)
 [[ -n $scratch ]] || { echo "FAIL: no scratch from --base graft:empty"; echo "$scratch_out"; exit 1; }
 create=$("$GRAFT_BIN" patch from-scratch "$scratch" --message nogit-empty)
-candidate=$(grep -oE 'candidate:[0-9a-f]+' <<<"$create" | head -n1)
+candidate=$(first_graft_id candidate "$create")
 [[ -n $candidate ]] || { echo "FAIL: no candidate from candidate from-scratch"; echo "$create"; exit 1; }
 
 # 2) Validation must pass and render the Hole Report next-action block.

@@ -1,13 +1,14 @@
 schema = 1
 
-# Workspace-scoped properties enforced before a candidate can become an admitted patch.
+# Bare property names enforced before a candidate can become an admitted patch.
 # Names must resolve to `fn <name>(app: Application) -> Property` definitions
-# in `properties.roto`. An empty map means admission relies only on core
-# integrity (`base + change == target`).
+# in `properties.roto`. An empty table means admission relies only on
+# application core integrity (`apply(action, base, proof) == target` and
+# `replay(base, change.ops) == target`).
 [admission.required_properties]
 
-# Workspace-scoped properties enforced before an admitted patch can be projected onto a
-# promotion target (e.g. a Git ref or local file). An empty map means any
+# Bare property names enforced before an admitted patch can be projected onto a
+# promotion target (e.g. a Git ref or local file). An empty table means any
 # admitted patch can be promoted.
 [promotion.required_properties]
 

@@ -58,6 +58,44 @@ lock_properties() {
   "$graft_bin" property lock >/dev/null
 }
 
+first_graft_id() {
+  local kind="$1"
+  local input="$2"
+  awk -v kind="$kind" '
+    {
+      pattern = kind ":[0-9a-f]+"
+      if (match($0, pattern)) {
+        print substr($0, RSTART, RLENGTH)
+        exit
+      }
+    }
+  ' <<<"$input"
+}
+
+last_graft_id() {
+  local kind="$1"
+  local input="$2"
+  awk -v kind="$kind" '
+    {
+      pattern = kind ":[0-9a-f]+"
+      if (match($0, pattern)) {
+        id = substr($0, RSTART, RLENGTH)
+      }
+    }
+    END { print id }
+  ' <<<"$input"
+}
+
+first_lease_id() {
+  local input="$1"
+  awk '
+    match($0, /lease_[0-9a-f]+/) {
+      print substr($0, RSTART, RLENGTH)
+      exit
+    }
+  ' <<<"$input"
+}
+
 extract_materialize_path() {
   sed -nE 's/^.*(would write state into| into) (.*)$/\2/p' | tail -n1
 }

@@ -4,9 +4,9 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use graft_core::{
-    CanonicalScratchOp, Change, FileViewHash, FileViewHashSeed, GraftCandidate, HashlineEdit,
-    ScopedPropertyRef, ScratchId, ScratchNode, StateId, TreeEntry, TreeSnapshot, candidate_id,
-    file_view_hash, materialize_application, scratch_id,
+    CanonicalScratchOp, Change, Constraint, FileViewHash, FileViewHashSeed, GraftCandidate,
+    HashlineEdit, PropertyRef, ScratchId, ScratchNode, StateId, TreeEntry, TreeSnapshot,
+    candidate_id, file_view_hash, materialize_application, scratch_id,
 };
 use graft_store::{GraftStore, StoreError, VirtualBaseRef, VirtualFile};
 
@@ -406,7 +406,7 @@ impl ScratchEngine {
     pub fn candidate_from_scratch(
         &self,
         scratch: &ScratchId,
-        expected: Vec<ScopedPropertyRef>,
+        constraint_primitives: Vec<PropertyRef>,
         producer: impl Into<String>,
         message: Option<String>,
     ) -> Result<CandidateFromScratch> {
@@ -429,7 +429,12 @@ impl ScratchEngine {
         let mut candidate = GraftCandidate {
             id: graft_core::CandidateId::new("candidate:pending"),
             application,
-            expected,
+            constraint: Constraint::all_of(
+                constraint_primitives
+                    .into_iter()
+                    .map(|property| Constraint::Primitive { property })
+                    .collect::<Vec<_>>(),
+            ),
             provenance: graft_core::Provenance::now(producer, message),
         };
         candidate.id = candidate_id(&candidate)?;
@@ -447,11 +452,11 @@ impl ScratchEngine {
     pub fn promote(
         &self,
         scratch: &ScratchId,
-        expected: Vec<ScopedPropertyRef>,
+        constraint_primitives: Vec<PropertyRef>,
         producer: impl Into<String>,
         message: Option<String>,
     ) -> Result<CandidateFromScratch> {
-        self.candidate_from_scratch(scratch, expected, producer, message)
+        self.candidate_from_scratch(scratch, constraint_primitives, producer, message)
     }
 
     pub fn store(&self) -> &GraftStore {
@@ -823,10 +828,7 @@ fn text_matches(haystack: &str, needle: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use graft_core::{
-        FileChangeKind, PropertyId, PropertyRef, PropertyScope, ScopedPropertyRef, TreeEntry,
-        TreeSnapshot,
-    };
+    use graft_core::{FileChangeKind, PropertyId, PropertyRef, TreeEntry, TreeSnapshot};
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("graft-scratch-{name}-{}", std::process::id()));
@@ -1226,9 +1228,9 @@ mod tests {
         let result = engine
             .candidate_from_scratch(
                 &deleted.scratch,
-                vec![ScopedPropertyRef::new(
-                    PropertyScope::Workspace,
-                    PropertyRef::new(PropertyId::new("property:review-policy"), "ReviewPolicy"),
+                vec![PropertyRef::new(
+                    PropertyId::new("property:review-policy"),
+                    "ReviewPolicy",
                 )],
                 "test",
                 Some("demo".to_string()),
@@ -1250,6 +1252,13 @@ mod tests {
             .store
             .read_candidate(result.candidate.as_str())
             .unwrap();
+        assert_eq!(
+            candidate.constraint,
+            Constraint::primitive(PropertyRef::new(
+                PropertyId::new("property:review-policy"),
+                "ReviewPolicy"
+            ),)
+        );
         let resolved = engine
             .store
             .resolve_application(&candidate.application)

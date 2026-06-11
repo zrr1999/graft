@@ -29,8 +29,8 @@ printf 'alpha\nbeta\ngamma\n' > note.txt
 seed_write=$("$GRAFT" scratch write --base graft:empty note.txt --content $'alpha\nbeta\ngamma\n')
 seed_scratch=$(grep -oE 'scratch:[0-9a-f]+' <<<"$seed_write" | tail -n1)
 [[ -n $seed_scratch ]] || { echo "FAIL: no base scratch captured"; echo "$seed_write"; exit 1; }
-create=$("$GRAFT" candidate from-scratch "$seed_scratch" --message scratch-e2e-base)
-candidate=$(grep -oE 'candidate:[0-9a-f]+' <<<"$create" | head -n1)
+create=$("$GRAFT" patch from-scratch "$seed_scratch" --message scratch-e2e-base)
+candidate=$(first_graft_id candidate "$create")
 [[ -n $candidate ]] || { echo "FAIL: no base candidate captured"; echo "$create"; exit 1; }
 "$GRAFTD" start --cwd "$PROJECT" --socket "$SOCKET"
 [[ -S "$SOCKET" ]] || { echo 'FAIL: explicit global graftd start did not create socket'; exit 1; }
@@ -63,8 +63,8 @@ scratch_after_delete=$(grep -oE 'scratch:[0-9a-f]+' <<<"$delete" | tail -n1)
 diff=$("$GRAFT" scratch diff "$scratch_after_edit" "$scratch_after_delete")
 grep -q 'greeting.txt' <<<"$diff" || { echo "FAIL: scratch diff missing deleted path"; echo "$diff"; exit 1; }
 
-candidate_out=$("$GRAFT" candidate from-scratch "$scratch_after_delete" --message scratch-e2e-final)
-final_candidate=$(grep -oE 'candidate:[0-9a-f]+' <<<"$candidate_out" | head -n1)
+candidate_out=$("$GRAFT" patch from-scratch "$scratch_after_delete" --message scratch-e2e-final)
+final_candidate=$(first_graft_id candidate "$candidate_out")
 [[ -n $final_candidate ]] || { echo "FAIL: no final candidate from scratch"; echo "$candidate_out"; exit 1; }
 
 "$GRAFTD" stop --socket "$SOCKET" >/dev/null

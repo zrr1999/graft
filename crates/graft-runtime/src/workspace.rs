@@ -5,7 +5,7 @@ use std::process::Command as ProcessCommand;
 
 use anyhow::{Context, Result, bail};
 use graft_client::{DaemonSocketState, daemon_socket_path, daemon_socket_state};
-use graft_core::blake3_hex_digest;
+use graft_core::{ApplicationRef, blake3_hex_digest};
 use graft_store::{
     GraftStore, InitOutcome, Registry, RegistryStore, RepoPathsRecord, RouteRecord, StoreError,
     WorkspaceDiscovery, WorkspaceKind, WorkspaceRecord, local_workspace_id_for_root,
@@ -50,9 +50,14 @@ pub(crate) fn modernize_legacy_gc_apply_message(
     } else if numbers.len() >= 4 {
         Some(gc_workspace_view(
             true,
-            numbers[1],
-            numbers[2],
-            numbers[3],
+            GcWorkspaceCounts {
+                evidence_bodies: numbers[1],
+                candidate_evidence_indexes: numbers[2],
+                patch_evidence_indexes: numbers[3],
+                applications: 0,
+                actions: 0,
+                changes: 0,
+            },
             RegistryGcReport {
                 missing_workspaces: numbers.get(5).copied().unwrap_or(0),
                 stale_routes: numbers.get(6).copied().unwrap_or(0),
@@ -136,7 +141,7 @@ pub(crate) fn run_init_command(store: &GraftStore, register_only: bool) -> Resul
 pub(crate) fn init_workspace_files(store: &GraftStore) -> Result<(InitOutcome, bool)> {
     if store.paths().workspace().join(".git").exists() {
         bail!(
-            "[E_GIT_WORKSPACE_UNSUPPORTED] {} contains .git; Graft workspace roots must be Git-independent. Use a non-Git workspace and add external Git repositories with `graft repo add` or `graft promote`.",
+            "[E_GIT_WORKSPACE_UNSUPPORTED] {} contains .git; Graft workspace roots must be Git-independent. Use a non-Git workspace and add external Git repositories with `graft repo add` or `graft patch promote`.",
             store.paths().workspace().display()
         );
     }
@@ -663,15 +668,32 @@ pub(crate) fn run_gc(
 
     store.init_storage()?;
     let mut reachable_evidence = BTreeSet::new();
+    let mut reachable_applications = BTreeSet::new();
+    let mut reachable_actions = BTreeSet::new();
+    let mut reachable_changes = BTreeSet::new();
     for candidate in store.list_candidates()? {
         for id in store.candidate_evidence_index(candidate.id.as_str())? {
             reachable_evidence.insert(id);
         }
+        mark_reachable_application(
+            store,
+            &candidate.application,
+            &mut reachable_applications,
+            &mut reachable_actions,
+            &mut reachable_changes,
+        )?;
     }
     for patch in store.list_patches()? {
         for id in store.patch_evidence_index(patch.id.as_str())? {
             reachable_evidence.insert(id);
         }
+        mark_reachable_application(
+            store,
+            &patch.application,
+            &mut reachable_applications,
+            &mut reachable_actions,
+            &mut reachable_changes,
+        )?;
     }
 
     let mut orphan_evidence = Vec::new();
@@ -705,8 +727,17 @@ pub(crate) fn run_gc(
         }
     }
 
-    let orphan_count =
-        orphan_evidence.len() + orphan_candidate_indexes.len() + orphan_patch_indexes.len();
+    let orphan_applications =
+        orphan_object_ids(store.list_application_objects()?, &reachable_applications);
+    let orphan_actions = orphan_object_ids(store.list_action_objects()?, &reachable_actions);
+    let orphan_changes = orphan_object_ids(store.list_change_objects()?, &reachable_changes);
+
+    let orphan_count = orphan_evidence.len()
+        + orphan_candidate_indexes.len()
+        + orphan_patch_indexes.len()
+        + orphan_applications.len()
+        + orphan_actions.len()
+        + orphan_changes.len();
     if apply {
         for id in &orphan_evidence {
             remove_gc_file(&store.paths().object_evidence().join(format!("{id}.json")))?;
@@ -727,14 +758,33 @@ pub(crate) fn run_gc(
                     .join(format!("{id}.json")),
             )?;
         }
+        for id in &orphan_applications {
+            remove_gc_file(
+                &store
+                    .paths()
+                    .object_applications()
+                    .join(format!("{id}.json")),
+            )?;
+        }
+        for id in &orphan_actions {
+            remove_gc_file(&store.paths().object_actions().join(format!("{id}.json")))?;
+        }
+        for id in &orphan_changes {
+            remove_gc_file(&store.paths().object_changes().join(format!("{id}.json")))?;
+        }
     }
 
     Ok(CommandEnvelope {
         view: Some(gc_workspace_view(
             apply,
-            orphan_evidence.len(),
-            orphan_candidate_indexes.len(),
-            orphan_patch_indexes.len(),
+            GcWorkspaceCounts {
+                evidence_bodies: orphan_evidence.len(),
+                candidate_evidence_indexes: orphan_candidate_indexes.len(),
+                patch_evidence_indexes: orphan_patch_indexes.len(),
+                applications: orphan_applications.len(),
+                actions: orphan_actions.len(),
+                changes: orphan_changes.len(),
+            },
             registry_report,
         )),
         registry_changed: apply && registry_stale_count > 0,
@@ -766,26 +816,71 @@ fn gc_registry_only_view(apply: bool, registry_report: RegistryGcReport) -> Comm
     })
 }
 
-fn gc_workspace_view(
-    apply: bool,
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct GcWorkspaceCounts {
     evidence_bodies: usize,
     candidate_evidence_indexes: usize,
     patch_evidence_indexes: usize,
+    applications: usize,
+    actions: usize,
+    changes: usize,
+}
+
+impl GcWorkspaceCounts {
+    fn total(self) -> usize {
+        self.evidence_bodies
+            + self.candidate_evidence_indexes
+            + self.patch_evidence_indexes
+            + self.applications
+            + self.actions
+            + self.changes
+    }
+}
+
+fn gc_workspace_view(
+    apply: bool,
+    counts: GcWorkspaceCounts,
     registry_report: RegistryGcReport,
 ) -> CommandView {
-    let orphan_objects = evidence_bodies + candidate_evidence_indexes + patch_evidence_indexes;
+    let orphan_objects = counts.total();
     CommandView::Gc(GcView {
         dry_run: !apply,
         workspace: GcWorkspaceView::Workspace {
             orphan_objects_before: orphan_objects,
-            orphan_evidence_bodies: evidence_bodies,
-            orphan_candidate_evidence_indexes: candidate_evidence_indexes,
-            orphan_patch_evidence_indexes: patch_evidence_indexes,
+            orphan_evidence_bodies: counts.evidence_bodies,
+            orphan_candidate_evidence_indexes: counts.candidate_evidence_indexes,
+            orphan_patch_evidence_indexes: counts.patch_evidence_indexes,
+            orphan_applications: counts.applications,
+            orphan_actions: counts.actions,
+            orphan_changes: counts.changes,
             orphan_objects_selected: orphan_objects,
         },
         registry: Some(registry_report.into_view()),
         apply_hint: gc_apply_hint(apply),
     })
+}
+
+fn mark_reachable_application(
+    store: &GraftStore,
+    application: &ApplicationRef,
+    applications: &mut BTreeSet<String>,
+    actions: &mut BTreeSet<String>,
+    changes: &mut BTreeSet<String>,
+) -> Result<()> {
+    let ApplicationRef::Stored(application_id) = application;
+    applications.insert(application_id.to_string());
+    let resolved = store.resolve_application(application)?;
+    actions.insert(resolved.record.action.to_string());
+    changes.insert(resolved.record.change.to_string());
+    Ok(())
+}
+
+fn orphan_object_ids<T>(objects: Vec<(String, T)>, reachable: &BTreeSet<String>) -> Vec<String> {
+    objects
+        .into_iter()
+        .map(|(id, _)| id)
+        .filter(|id| !reachable.contains(id))
+        .collect()
 }
 
 fn gc_apply_hint(apply: bool) -> Option<String> {

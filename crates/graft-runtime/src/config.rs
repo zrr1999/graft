@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use graft_core::{PropertyRef, PropertySpec};
+use graft_core::{Constraint, PropertyRef, PropertySpec};
 
 use crate::roto_properties::load_roto_property_specs;
 use graft_store::GraftStore;
@@ -36,7 +36,7 @@ impl GraftConfig {
             );
         }
         self.validate_repos()?;
-        self.validate_property_scopes()
+        self.validate_property_names()
     }
 
     fn validate_repos(&self) -> Result<()> {
@@ -55,20 +55,17 @@ impl GraftConfig {
         Ok(())
     }
 
-    fn validate_property_scopes(&self) -> Result<()> {
-        validate_property_scope_map(
-            self,
+    fn validate_property_names(&self) -> Result<()> {
+        validate_required_property_names(
             "admission.required_properties",
             &self.admission.required_properties,
         )?;
-        validate_property_scope_map(
-            self,
+        validate_required_property_names(
             "promotion.required_properties",
             &self.promotion.required_properties,
         )?;
         for (target_id, target) in &self.promote_targets {
-            validate_property_scope_map(
-                self,
+            validate_required_property_names(
                 &format!("promote_targets.{target_id}.required_properties"),
                 &target.required_properties,
             )?;
@@ -125,14 +122,44 @@ pub(crate) struct RepoConfig {
 #[serde(deny_unknown_fields)]
 pub(crate) struct AdmissionConfig {
     #[serde(default)]
-    pub(crate) required_properties: BTreeMap<String, Vec<String>>,
+    pub(crate) required_properties: RequiredPropertiesConfig,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PromotionConfig {
     #[serde(default)]
-    pub(crate) required_properties: BTreeMap<String, Vec<String>>,
+    pub(crate) required_properties: RequiredPropertiesConfig,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum RequiredPropertiesConfig {
+    Expr(ConstraintConfig),
+    Names(Vec<String>),
+}
+
+impl Default for RequiredPropertiesConfig {
+    fn default() -> Self {
+        Self::Names(Vec::new())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum ConstraintTermConfig {
+    Name(String),
+    Expr(Box<ConstraintConfig>),
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ConstraintConfig {
+    pub(crate) primitive: Option<String>,
+    pub(crate) all_of: Option<Vec<ConstraintTermConfig>>,
+    pub(crate) any_of: Option<Vec<ConstraintTermConfig>>,
+    pub(crate) both: Option<Vec<ConstraintTermConfig>>,
+    pub(crate) either: Option<Vec<ConstraintTermConfig>>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -158,7 +185,7 @@ pub(crate) struct PromoteTargetConfig {
     pub(crate) path: PathBuf,
     pub(crate) branch: Option<String>,
     #[serde(default)]
-    pub(crate) required_properties: BTreeMap<String, Vec<String>>,
+    pub(crate) required_properties: RequiredPropertiesConfig,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -307,7 +334,7 @@ pub(crate) fn validate_property_requires_graph(
             }
             if !defs.contains_key(required) {
                 bail!(
-                    "[E_PROPERTY_REQUIRES_MISSING] property `{name}` requires unknown property `{required}`"
+                    "[E_PROPERTY_REQUIRES_UNKNOWN] property `{name}` requires unknown property `{required}`"
                 );
             }
         }
@@ -548,17 +575,140 @@ fn validate_repo_id(repo_id: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_property_scope_map(
-    _config: &GraftConfig,
-    label: &str,
-    properties: &BTreeMap<String, Vec<String>>,
-) -> Result<()> {
-    for scope in properties.keys() {
-        if scope == "workspace" {
-            continue;
-        }
+pub(crate) fn required_properties_constraint(
+    config: &GraftConfig,
+    required: &RequiredPropertiesConfig,
+) -> Result<Constraint> {
+    match required {
+        RequiredPropertiesConfig::Names(names) => names
+            .iter()
+            .map(|name| constraint_primitive(config, name))
+            .collect::<Result<Vec<_>>>()
+            .map(Constraint::all_of),
+        RequiredPropertiesConfig::Expr(expr) => constraint_expr(config, expr),
+    }
+}
+
+fn constraint_expr(config: &GraftConfig, expr: &ConstraintConfig) -> Result<Constraint> {
+    let present = [
+        expr.primitive.is_some(),
+        expr.all_of.is_some(),
+        expr.any_of.is_some(),
+        expr.both.is_some(),
+        expr.either.is_some(),
+    ]
+    .into_iter()
+    .filter(|present| *present)
+    .count();
+    if present == 0 {
+        return Ok(Constraint::Top);
+    }
+    if present != 1 {
         bail!(
-            "[E_UNSUPPORTED_PROPERTY_SCOPE] {label} uses scope `{scope}`, but property requirements are whole-state only; use workspace = [...] and have the property inspect worktrees/<repo-id> when needed"
+            "[E_INVALID_CONSTRAINT] constraint expression must set exactly one of primitive/all_of/any_of/both/either"
+        );
+    }
+    if let Some(primitive) = &expr.primitive {
+        return constraint_primitive(config, primitive);
+    }
+    if let Some(items) = &expr.all_of {
+        return items
+            .iter()
+            .map(|item| constraint_term(config, item))
+            .collect::<Result<Vec<_>>>()
+            .map(Constraint::all_of);
+    }
+    if let Some(items) = &expr.any_of {
+        return items
+            .iter()
+            .map(|item| constraint_term(config, item))
+            .collect::<Result<Vec<_>>>()
+            .map(Constraint::any_of);
+    }
+    if let Some(items) = &expr.both {
+        if items.len() != 2 {
+            bail!("[E_INVALID_CONSTRAINT] both expects exactly two terms");
+        }
+        return Ok(Constraint::all_of(vec![
+            constraint_term(config, &items[0])?,
+            constraint_term(config, &items[1])?,
+        ]));
+    }
+    if let Some(items) = &expr.either {
+        if items.len() != 2 {
+            bail!("[E_INVALID_CONSTRAINT] either expects exactly two terms");
+        }
+        return Ok(Constraint::any_of(vec![
+            constraint_term(config, &items[0])?,
+            constraint_term(config, &items[1])?,
+        ]));
+    }
+    unreachable!()
+}
+
+fn constraint_term(config: &GraftConfig, term: &ConstraintTermConfig) -> Result<Constraint> {
+    match term {
+        ConstraintTermConfig::Name(name) => constraint_primitive(config, name),
+        ConstraintTermConfig::Expr(expr) => constraint_expr(config, expr),
+    }
+}
+
+fn constraint_primitive(config: &GraftConfig, value: &str) -> Result<Constraint> {
+    validate_property_name("property requirement", value)?;
+    Ok(Constraint::Primitive {
+        property: resolve_property(config, value)?,
+    })
+}
+
+fn validate_required_property_names(
+    label: &str,
+    properties: &RequiredPropertiesConfig,
+) -> Result<()> {
+    match properties {
+        RequiredPropertiesConfig::Names(names) => {
+            for name in names {
+                validate_property_name(label, name)?;
+            }
+        }
+        RequiredPropertiesConfig::Expr(expr) => {
+            validate_constraint_expr_property_names(label, expr)?
+        }
+    }
+    Ok(())
+}
+
+fn validate_constraint_expr_property_names(label: &str, expr: &ConstraintConfig) -> Result<()> {
+    for item in expr
+        .all_of
+        .iter()
+        .chain(expr.any_of.iter())
+        .chain(expr.both.iter())
+        .chain(expr.either.iter())
+        .flatten()
+    {
+        validate_constraint_term_property_names(label, item)?;
+    }
+    if let Some(primitive) = &expr.primitive {
+        validate_property_name(label, primitive)?;
+    }
+    Ok(())
+}
+
+fn validate_constraint_term_property_names(label: &str, term: &ConstraintTermConfig) -> Result<()> {
+    match term {
+        ConstraintTermConfig::Name(name) => validate_property_name(label, name)?,
+        ConstraintTermConfig::Expr(expr) => validate_constraint_expr_property_names(label, expr)?,
+    }
+    Ok(())
+}
+
+fn validate_property_name(label: &str, value: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        bail!("[E_INVALID_PROPERTY] {label} contains an empty property name");
+    }
+    if value.contains(':') {
+        bail!(
+            "[E_SCOPED_PROPERTY_UNSUPPORTED] {label} uses `{value}`, but property requirements must be bare names; properties are whole-workspace by definition"
         );
     }
     Ok(())
@@ -646,6 +796,82 @@ mod tests {
             severity: Severity::Blocking,
             source_ref: None,
         }
+    }
+
+    fn config_with_properties(text: &str, names: &[&str]) -> GraftConfig {
+        let mut config = parse_config(text);
+        for name in names {
+            config
+                .properties
+                .insert((*name).to_string(), test_property_spec(name, &[]));
+        }
+        config
+    }
+
+    #[test]
+    fn required_properties_flat_list_lowers_to_all_of_constraint() {
+        let config = config_with_properties(
+            r#"
+[admission]
+required_properties = ["fmt_clean", "tests_pass"]
+"#,
+            &["fmt_clean", "tests_pass"],
+        );
+
+        let constraint =
+            required_properties_constraint(&config, &config.admission.required_properties).unwrap();
+
+        assert_eq!(
+            constraint,
+            Constraint::all_of(vec![
+                Constraint::primitive(resolve_property(&config, "fmt_clean").unwrap()),
+                Constraint::primitive(resolve_property(&config, "tests_pass").unwrap()),
+            ])
+        );
+    }
+
+    #[test]
+    fn required_properties_tagged_all_of_lowers_to_both_constraint() {
+        let config = config_with_properties(
+            r#"
+[admission.required_properties]
+all_of = ["fmt_clean", "tests_pass"]
+"#,
+            &["fmt_clean", "tests_pass"],
+        );
+
+        let constraint =
+            required_properties_constraint(&config, &config.admission.required_properties).unwrap();
+
+        assert_eq!(
+            constraint,
+            Constraint::all_of(vec![
+                Constraint::primitive(resolve_property(&config, "fmt_clean").unwrap(),),
+                Constraint::primitive(resolve_property(&config, "tests_pass").unwrap(),),
+            ])
+        );
+    }
+
+    #[test]
+    fn required_properties_tagged_any_of_lowers_to_either_constraint() {
+        let config = config_with_properties(
+            r#"
+[admission.required_properties]
+any_of = ["fast_check", "slow_check"]
+"#,
+            &["fast_check", "slow_check"],
+        );
+
+        let constraint =
+            required_properties_constraint(&config, &config.admission.required_properties).unwrap();
+
+        assert_eq!(
+            constraint,
+            Constraint::any_of(vec![
+                Constraint::primitive(resolve_property(&config, "fast_check").unwrap()),
+                Constraint::primitive(resolve_property(&config, "slow_check").unwrap()),
+            ])
+        );
     }
 
     #[test]
@@ -841,7 +1067,7 @@ fn cargo_tests_pass(app: Application) -> Property {
             .unwrap_err()
             .to_string();
 
-        assert!(error.contains("[E_PROPERTY_REQUIRES_MISSING]"), "{error}");
+        assert!(error.contains("[E_PROPERTY_REQUIRES_UNKNOWN]"), "{error}");
         assert!(error.contains("cargo_tests_pass"), "{error}");
         assert!(error.contains("no_generated_artifacts"), "{error}");
     }
@@ -984,27 +1210,6 @@ url = "https://example.test/bad.git"
                 .unwrap_err()
                 .to_string()
                 .contains("invalid repo id")
-        );
-    }
-
-    #[test]
-    fn property_scope_map_rejects_repo_keys_even_when_repo_exists() {
-        let config: GraftConfig = toml::from_str(
-            r#"
-[repos.C]
-url = "https://example.test/C.git"
-
-[admission.required_properties]
-C = ["cargo_tests_pass"]
-"#,
-        )
-        .unwrap();
-
-        let error = config.validate().unwrap_err().to_string();
-        assert!(error.contains("[E_UNSUPPORTED_PROPERTY_SCOPE]"), "{error}");
-        assert_eq!(
-            config.repos.get("C").map(|repo| repo.url.as_str()),
-            Some("https://example.test/C.git")
         );
     }
 

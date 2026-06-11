@@ -32,7 +32,7 @@ for required in \
   'scratch is daemon-backed draft state' \
   'graft patch from-scratch' \
   'admit generates a public patch' \
-  'graft materialize <state-ref>' \
+  'graft patch materialize <patch-id>' \
   'repo add/sync/lock/update' \
   'bundle import' \
   'workspace gc --apply' \

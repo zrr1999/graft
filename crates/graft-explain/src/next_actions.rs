@@ -26,10 +26,10 @@ pub struct CandidateContext {
     pub unknown: usize,
     /// Number of evidence records with `EvidenceResult::Skipped`.
     pub skipped: usize,
-    /// Names of expected properties declared on the candidate. Surfaced in
-    /// the recommended `admit --require <name>` invocation when the only
-    /// passing property is unambiguous.
-    pub expected_properties: Vec<String>,
+    /// Property primitives present in the candidate constraint. Surfaced in the
+    /// recommended `admit --require <name>` invocation when the only
+    /// passing primitive is unambiguous.
+    pub constraint_primitives: Vec<String>,
 }
 
 impl CandidateContext {
@@ -42,8 +42,8 @@ impl CandidateContext {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PatchContext {
     pub id: String,
-    /// Names of properties admitted with the patch.
-    pub properties: Vec<String>,
+    /// Property primitives present in the admitted patch constraint.
+    pub constraint_primitives: Vec<String>,
     /// True when at least one materialization relation exists (the patch has
     /// produced a real Git object).
     pub materialized: bool,
@@ -56,26 +56,26 @@ pub fn next_actions(ctx: &CandidateContext) -> Vec<NextAction> {
     let mut out = Vec::new();
 
     if ctx.total_evidence() == 0 {
-        // Stage 1: drafted, no evidence yet. With no expected property, core
-        // patch integrity is the only default gate, so admission is available.
-        if ctx.expected_properties.is_empty() {
+        // Stage 1: drafted, no evidence yet. With no constraint primitive,
+        // application core integrity is the only default gate, so admission is available.
+        if ctx.constraint_primitives.is_empty() {
             out.push(NextAction::new(
                 "admit",
-                format!("graft admit {}", ctx.id),
+                format!("graft patch admit {}", ctx.id),
                 NextActionKind::Recommended,
-                "no property evidence is required; Graft checks patch integrity at admission",
+                "no property evidence is required; Graft checks application core integrity at admission",
             ));
         } else {
             out.push(NextAction::new(
                 "validate",
-                format!("graft validate {}", ctx.id),
+                format!("graft patch validate {}", ctx.id),
                 NextActionKind::Recommended,
                 "candidate has no evidence yet; produce some by running validators",
             ));
         }
         out.push(NextAction::new(
             "show.change",
-            format!("graft show {} --change", ctx.id),
+            format!("graft patch show {} --change", ctx.id),
             NextActionKind::Optional,
             "review the captured file changes before validating",
         ));
@@ -86,13 +86,13 @@ pub fn next_actions(ctx: &CandidateContext) -> Vec<NextAction> {
         // Stage 2: at least one failed evidence — repair path.
         out.push(NextAction::new(
             "amend-and-revalidate",
-            format!("graft validate {}", ctx.id),
+            format!("graft patch validate {}", ctx.id),
             NextActionKind::Recommended,
             "amend the worktree to address failed evidence, then revalidate",
         ));
         out.push(NextAction::new(
             "show.evidence",
-            format!("graft show {} --evidence", ctx.id),
+            format!("graft patch show {} --evidence", ctx.id),
             NextActionKind::Optional,
             "inspect every evidence record to see which property failed and why",
         ));
@@ -103,13 +103,13 @@ pub fn next_actions(ctx: &CandidateContext) -> Vec<NextAction> {
         // Stage 3: only unknowns.
         out.push(NextAction::new(
             "resolve-unknown",
-            format!("graft validate {}", ctx.id),
+            format!("graft patch validate {}", ctx.id),
             NextActionKind::Recommended,
             "evidence is unknown; resolve the cause (see V003) and revalidate",
         ));
         out.push(NextAction::new(
             "show.evidence",
-            format!("graft show {} --evidence", ctx.id),
+            format!("graft patch show {} --evidence", ctx.id),
             NextActionKind::Optional,
             "inspect each unknown reason; the `[Vnnn]` prefix tells you which",
         ));
@@ -118,9 +118,9 @@ pub fn next_actions(ctx: &CandidateContext) -> Vec<NextAction> {
 
     // Stage 4: at least one passed evidence; admission is on the table.
     let admit = if let Some(name) = single_decisive_property(ctx) {
-        format!("graft admit {} --require {name}", ctx.id)
+        format!("graft patch admit {} --require {name}", ctx.id)
     } else {
-        format!("graft admit {}", ctx.id)
+        format!("graft patch admit {}", ctx.id)
     };
     out.push(NextAction::new(
         "admit",
@@ -131,14 +131,14 @@ pub fn next_actions(ctx: &CandidateContext) -> Vec<NextAction> {
     if ctx.unknown > 0 {
         out.push(NextAction::new(
             "validate-additional",
-            format!("graft validate {} --expect <Property>", ctx.id),
+            format!("graft patch validate {} --expect <Property>", ctx.id),
             NextActionKind::Optional,
             "some properties are still unknown; add `--expect` to revalidate them",
         ));
     } else {
         out.push(NextAction::new(
             "validate-additional",
-            format!("graft validate {} --expect <Property>", ctx.id),
+            format!("graft patch validate {} --expect <Property>", ctx.id),
             NextActionKind::Optional,
             "tighten the candidate by validating an additional property",
         ));
@@ -154,20 +154,20 @@ pub fn next_actions_patch(ctx: &PatchContext) -> Vec<NextAction> {
         // Stage 5: admitted but not yet materialized.
         out.push(NextAction::new(
             "materialize.dry-run",
-            format!("graft materialize {} --dry-run", ctx.id),
+            format!("graft patch materialize {} --dry-run", ctx.id),
             NextActionKind::Recommended,
             "preview the isolated state inspection output",
         ));
         out.push(NextAction::new(
             "materialize.inspect",
-            format!("graft materialize {}", ctx.id),
+            format!("graft patch materialize {}", ctx.id),
             NextActionKind::Optional,
             "write the isolated state inspection output under .worktrees/",
         ));
-        if let Some(prop) = ctx.properties.first() {
+        if let Some(prop) = ctx.constraint_primitives.first() {
             out.push(NextAction::new(
                 "search.same-property",
-                format!("graft search --property {prop}"),
+                format!("graft patch search --property {prop}"),
                 NextActionKind::Optional,
                 "find sibling patches admitted with the same property",
             ));
@@ -179,13 +179,13 @@ pub fn next_actions_patch(ctx: &PatchContext) -> Vec<NextAction> {
         // Stage 6: materialized but not promoted.
         out.push(NextAction::new(
             "promote.dry-run",
-            format!("graft promote {} --to <branch>", ctx.id),
+            format!("graft patch promote {} --to <branch>", ctx.id),
             NextActionKind::Recommended,
             "draft a promotion plan; promote is the only command that mutates Git refs",
         ));
         out.push(NextAction::new(
             "promote.apply",
-            format!("graft promote {} --to <branch> --yes", ctx.id),
+            format!("graft patch promote {} --to <branch> --yes", ctx.id),
             NextActionKind::Dangerous,
             "apply the promotion now; this updates a real Git ref",
         ));
@@ -196,15 +196,18 @@ pub fn next_actions_patch(ctx: &PatchContext) -> Vec<NextAction> {
     out.push(NextAction::new(
         "search.related",
         format!(
-            "graft search --property {}",
-            ctx.properties.first().map(String::as_str).unwrap_or("<P>"),
+            "graft patch search --property {}",
+            ctx.constraint_primitives
+                .first()
+                .map(String::as_str)
+                .unwrap_or("<P>"),
         ),
         NextActionKind::Optional,
         "find related patches admitted with the same property",
     ));
     out.push(NextAction::new(
         "lifecycle.complete",
-        format!("graft show {}", ctx.id),
+        format!("graft patch show {}", ctx.id),
         NextActionKind::Terminal,
         "patch has been admitted, materialized, and promoted; lifecycle complete",
     ));
@@ -212,12 +215,12 @@ pub fn next_actions_patch(ctx: &PatchContext) -> Vec<NextAction> {
 }
 
 /// When a candidate's evidence shows exactly one decisively-passing property
-/// (and no failures), surface it as the `--require` argument in the
+/// primitive (and no failures), surface it as the `--require` argument in the
 /// recommended `admit` command. This lets users run a tighter admit without
 /// having to type the property name from memory.
 fn single_decisive_property(ctx: &CandidateContext) -> Option<&str> {
-    if ctx.failed == 0 && ctx.passed == 1 && ctx.expected_properties.len() == 1 {
-        ctx.expected_properties.first().map(|s| s.as_str())
+    if ctx.failed == 0 && ctx.passed == 1 && ctx.constraint_primitives.len() == 1 {
+        ctx.constraint_primitives.first().map(|s| s.as_str())
     } else {
         None
     }
@@ -234,31 +237,39 @@ mod tests {
             failed: 0,
             unknown: 0,
             skipped: 0,
-            expected_properties: vec![],
+            constraint_primitives: vec![],
         }
     }
 
     #[test]
-    fn drafted_candidate_without_expected_properties_recommends_admit() {
+    fn drafted_candidate_without_constraint_primitives_recommends_admit() {
         let ctx = empty_candidate();
         let actions = next_actions(&ctx);
         assert_eq!(actions[0].id, "admit");
         assert_eq!(actions[0].kind, NextActionKind::Recommended);
-        assert!(actions[0].label.contains("graft admit candidate:demo"));
+        assert!(
+            actions[0]
+                .label
+                .contains("graft patch admit candidate:demo")
+        );
         // Must include an Optional for --change review.
         assert!(actions.iter().any(|a| a.kind == NextActionKind::Optional));
     }
 
     #[test]
-    fn drafted_candidate_with_expected_properties_recommends_validate() {
+    fn drafted_candidate_with_constraint_primitives_recommends_validate() {
         let ctx = CandidateContext {
-            expected_properties: vec!["ReviewPolicy".into()],
+            constraint_primitives: vec!["ReviewPolicy".into()],
             ..empty_candidate()
         };
         let actions = next_actions(&ctx);
         assert_eq!(actions[0].id, "validate");
         assert_eq!(actions[0].kind, NextActionKind::Recommended);
-        assert!(actions[0].label.contains("graft validate candidate:demo"));
+        assert!(
+            actions[0]
+                .label
+                .contains("graft patch validate candidate:demo")
+        );
     }
 
     #[test]
@@ -296,7 +307,7 @@ mod tests {
     fn passed_evidence_recommends_admit_with_optional_validate_more() {
         let ctx = CandidateContext {
             passed: 1,
-            expected_properties: vec!["ReviewPolicy".into()],
+            constraint_primitives: vec!["ReviewPolicy".into()],
             ..empty_candidate()
         };
         let actions = next_actions(&ctx);
@@ -310,7 +321,7 @@ mod tests {
     fn admit_recommendation_drops_require_when_property_is_ambiguous() {
         let ctx = CandidateContext {
             passed: 2,
-            expected_properties: vec!["ReviewPolicy".into(), "TestsPass".into()],
+            constraint_primitives: vec!["ReviewPolicy".into(), "TestsPass".into()],
             ..empty_candidate()
         };
         let actions = next_actions(&ctx);
@@ -322,7 +333,7 @@ mod tests {
     fn admitted_patch_recommends_dry_run_materialize() {
         let ctx = PatchContext {
             id: "patch:demo".into(),
-            properties: vec!["ReviewPolicy".into()],
+            constraint_primitives: vec!["ReviewPolicy".into()],
             materialized: false,
             promoted: false,
         };
@@ -339,7 +350,7 @@ mod tests {
     fn materialized_patch_recommends_promote_dry_run_with_dangerous_apply() {
         let ctx = PatchContext {
             id: "patch:demo".into(),
-            properties: vec!["ReviewPolicy".into()],
+            constraint_primitives: vec!["ReviewPolicy".into()],
             materialized: true,
             promoted: false,
         };
@@ -356,7 +367,7 @@ mod tests {
     fn promoted_patch_is_terminal() {
         let ctx = PatchContext {
             id: "patch:demo".into(),
-            properties: vec!["ReviewPolicy".into()],
+            constraint_primitives: vec!["ReviewPolicy".into()],
             materialized: true,
             promoted: true,
         };
@@ -374,7 +385,7 @@ mod tests {
         let _ = next_actions(&empty_candidate());
         let _ = next_actions_patch(&PatchContext {
             id: "patch:demo".into(),
-            properties: vec![],
+            constraint_primitives: vec![],
             materialized: false,
             promoted: false,
         });

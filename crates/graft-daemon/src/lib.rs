@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use graft_client::{WireRequest, WireResponse, parse_frame};
-use graft_core::{ScopedPropertyRef, ScratchId};
+use graft_core::{PropertyRef, ScratchId};
 use graft_scratch::{ScratchEngine, wire};
 use graft_store::{GraftStore, RegistryStore, normalize_workspace_path};
 use serde_json::{Value, json};
@@ -78,7 +78,7 @@ const SCRATCH_CAPTURE_FIELDS: &[ParamField] = &[
 ];
 const CANDIDATE_FROM_SCRATCH_FIELDS: &[ParamField] = &[
     required("scratch"),
-    optional("expected"),
+    optional("constraint"),
     optional("producer"),
     optional("message"),
 ];
@@ -494,14 +494,19 @@ fn candidate_from_scratch_response(
     deprecated: Option<&str>,
 ) -> (WireResponse, bool) {
     let scratch = required_str(params, "scratch").map(ScratchId::new);
-    let expected = expected_properties(engine, params);
+    let constraint_primitives = constraint_primitives(engine, params);
     let producer =
         optional_non_blank_str(params, "producer").map(|value| value.unwrap_or("graftd"));
     let message =
         optional_non_blank_str(params, "message").map(|value| value.map(ToString::to_string));
-    match (scratch, expected, producer, message) {
-        (Ok(scratch), Ok(expected), Ok(producer), Ok(message)) => {
-            match engine.candidate_from_scratch(&scratch, expected, producer.to_string(), message) {
+    match (scratch, constraint_primitives, producer, message) {
+        (Ok(scratch), Ok(constraint_primitives), Ok(producer), Ok(message)) => {
+            match engine.candidate_from_scratch(
+                &scratch,
+                constraint_primitives,
+                producer.to_string(),
+                message,
+            ) {
                 Ok(result) => {
                     let mut payload = json!({
                         "scratch": result.scratch,
@@ -559,16 +564,16 @@ fn op_field_allowed(spec: OpSpec, field: &str) -> bool {
         || spec.routing_fields.iter().any(|route| route.name == field)
 }
 
-fn expected_properties(
+fn constraint_primitives(
     engine: &ScratchEngine,
     params: &Value,
-) -> HandlerResult<Vec<ScopedPropertyRef>> {
+) -> HandlerResult<Vec<PropertyRef>> {
     let names = params
-        .get("expected")
+        .get("constraint")
         .cloned()
         .map(|value| serde_json::from_value::<Vec<String>>(value).map_err(bad_params))
         .unwrap_or_else(|| Ok(Vec::new()))?;
-    graft_runtime::resolve_candidate_expected_properties(engine.store(), &names)
+    graft_runtime::resolve_candidate_constraint_primitives(engine.store(), &names)
         .map_err(|error| Box::new(WireResponse::error("", "E_BAD_PARAMS", error.to_string())))
 }
 
@@ -642,7 +647,7 @@ fn bad_field_type(field: &str, expected: &str) -> Box<WireResponse> {
 mod tests {
     use super::*;
     use graft_client::encode_response;
-    use graft_core::{TreeEntry, TreeSnapshot};
+    use graft_core::{Constraint, TreeEntry, TreeSnapshot};
     use graft_store::{
         DEFAULT_WORKSPACE_ID, GraftStore, RegistryStore, VirtualBaseRef, WorkspaceKind,
     };
@@ -1687,7 +1692,7 @@ mod tests {
             candidate.provenance.message.as_deref(),
             Some("demo candidate")
         );
-        assert!(candidate.expected.is_empty());
+        assert_eq!(candidate.constraint, Constraint::Top);
         assert_eq!(
             engine
                 .store()

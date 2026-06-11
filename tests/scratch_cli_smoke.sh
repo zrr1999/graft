@@ -25,7 +25,7 @@ seed_write=$("$GRAFT" --cwd "$PROJECT/nested" scratch write --base graft:empty h
 seed_scratch=$(grep -oE 'scratch:[0-9a-f]+' <<<"$seed_write" | tail -n1)
 [[ -n $seed_scratch ]] || { echo "FAIL: no seed scratch"; echo "$seed_write"; exit 1; }
 create=$("$GRAFT" --cwd "$PROJECT/nested" candidate from-scratch "$seed_scratch" --message scratch-base)
-candidate=$(grep -oE 'candidate:[0-9a-f]+' <<<"$create" | head -n1)
+candidate=$(first_graft_id candidate "$create")
 [[ -n $candidate ]] || { echo "FAIL: no base candidate"; echo "$create"; exit 1; }
 "$GRAFTD" start --cwd "$PROJECT" --socket "$SOCKET"
 [[ -S "$SOCKET" ]] || { echo "FAIL: explicit global graftd start did not create socket"; exit 1; }
@@ -64,7 +64,7 @@ diff=$("$GRAFT" --cwd "$PROJECT" scratch diff "$scratch3" "$scratch4")
 grep -q 'bye.txt' <<<"$diff" || { echo "FAIL: scratch diff missing changed path"; echo "$diff"; exit 1; }
 
 pin=$("$GRAFT" --cwd "$PROJECT" scratch pin "$scratch4")
-lease=$(grep -oE 'lease_[0-9a-f]+' <<<"$pin" | head -n1)
+lease=$(first_lease_id "$pin")
 [[ -n $lease ]] || { echo "FAIL: no lease"; echo "$pin"; exit 1; }
 if "$GRAFT" --cwd "$PROJECT" scratch drop "$scratch4" >/tmp/graft-scratch-drop-pinned.out 2>&1; then
   echo "FAIL: dropped pinned scratch"; exit 1
@@ -75,7 +75,7 @@ grep -q 'E_SCRATCH_PINNED' /tmp/graft-scratch-drop-pinned.out || {
 "$GRAFT" --cwd "$PROJECT" scratch unpin "$lease" >/dev/null
 
 candidate_out=$("$GRAFT" --cwd "$PROJECT" candidate from-scratch "$scratch4" --message scratch-cli-final)
-final_candidate=$(grep -oE 'candidate:[0-9a-f]+' <<<"$candidate_out" | head -n1)
+final_candidate=$(first_graft_id candidate "$candidate_out")
 [[ -n $final_candidate ]] || { echo "FAIL: no final candidate from scratch"; echo "$candidate_out"; exit 1; }
 
 "$GRAFTD" stop --socket "$SOCKET" >/dev/null || true

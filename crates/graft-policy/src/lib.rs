@@ -1,12 +1,90 @@
-use graft_core::{EvidenceRecord, PropertyRef};
-use graft_explain::diagnostics::{a001_missing_required_evidence, a002_failed_required_evidence};
+use graft_core::{ApplicationRef, Constraint, EvidenceId, EvidenceRecord, PropertyRef};
+use graft_explain::diagnostics::{
+    a001_missing_required_evidence_at, a002_failed_required_evidence_at,
+};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConstraintFailure {
+    Missing {
+        primitive: PropertyRef,
+    },
+    NotPassed {
+        primitive: PropertyRef,
+        evidence: EvidenceId,
+    },
+    BothBranch {
+        branch_index: usize,
+        inner: Box<ConstraintFailure>,
+    },
+    EitherExhausted {
+        branches: Vec<ConstraintFailure>,
+    },
+    BottomReached,
+}
+
+impl ConstraintFailure {
+    pub fn first_primitive_name(&self) -> Option<&str> {
+        match self {
+            Self::Missing { primitive } | Self::NotPassed { primitive, .. } => {
+                Some(&primitive.name)
+            }
+            Self::BothBranch { inner, .. } => inner.first_primitive_name(),
+            Self::EitherExhausted { branches } => {
+                branches.iter().find_map(Self::first_primitive_name)
+            }
+            Self::BottomReached => None,
+        }
+    }
+
+    pub fn path(&self) -> String {
+        let mut segments = Vec::new();
+        self.push_path_segments(&mut segments);
+        segments.join("/")
+    }
+
+    fn push_path_segments(&self, segments: &mut Vec<String>) {
+        match self {
+            Self::Missing { primitive } | Self::NotPassed { primitive, .. } => {
+                segments.push(format!("primitive {}", primitive.name));
+            }
+            Self::BothBranch {
+                branch_index,
+                inner,
+            } => {
+                segments.push("all_of".to_string());
+                segments.push(format!("[{branch_index}]"));
+                inner.push_path_segments(segments);
+            }
+            Self::EitherExhausted { .. } => {
+                segments.push("any_of".to_string());
+            }
+            Self::BottomReached => segments.push("bottom".to_string()),
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum PolicyError {
-    #[error("{}", a001_missing_required_evidence(property).format_reason())]
-    MissingEvidence { property: String },
-    #[error("{}", a002_failed_required_evidence(property).format_reason())]
-    EvidenceNotPassed { property: String },
+    #[error("{}", a001_missing_required_evidence_at(property, path).format_reason())]
+    MissingEvidence { property: String, path: String },
+    #[error("{}", a002_failed_required_evidence_at(property, evidence, path).format_reason())]
+    EvidenceNotPassed {
+        property: String,
+        evidence: String,
+        path: String,
+    },
+    #[error(
+        "[E_CONSTRAINT_UNMET] / [E_ADMISSION_UNMET] constraint is bottom and can never be satisfied @ Constraint failed at: bottom"
+    )]
+    BottomReached,
+    #[error(
+        "[E_CONSTRAINT_UNMET] / [E_ADMISSION_UNMET] constraint was not satisfied @ Constraint failed at: {path}; {detail}"
+    )]
+    ConstraintUnsatisfied {
+        path: String,
+        detail: String,
+        failure: ConstraintFailure,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, PolicyError>;
@@ -16,95 +94,298 @@ pub struct AdmissionDecision {
     pub accepted: bool,
 }
 
-pub fn require_passed_evidence(
-    required: &[PropertyRef],
+pub fn satisfies(
+    application: &ApplicationRef,
+    constraint: &Constraint,
     evidence: &[EvidenceRecord],
 ) -> Result<AdmissionDecision> {
-    for property in required {
-        let mut matching = evidence
-            .iter()
-            .filter(|record| record.property == property.id);
-        let Some(first) = matching.next() else {
-            return Err(PolicyError::MissingEvidence {
-                property: property.name.clone(),
-            });
-        };
-        if !first.result.satisfies_requirement()
-            && !matching.any(|record| record.result.satisfies_requirement())
-        {
-            return Err(PolicyError::EvidenceNotPassed {
-                property: property.name.clone(),
-            });
+    satisfies_subject(application.as_subject(), constraint, evidence)
+}
+
+pub fn satisfies_subject(
+    subject: &str,
+    constraint: &Constraint,
+    evidence: &[EvidenceRecord],
+) -> Result<AdmissionDecision> {
+    match evaluate(subject, constraint, evidence) {
+        Ok(()) => Ok(AdmissionDecision { accepted: true }),
+        Err(failure) => Err(policy_error_from_failure(failure)),
+    }
+}
+
+fn policy_error_from_failure(failure: ConstraintFailure) -> PolicyError {
+    match failure {
+        ConstraintFailure::Missing { primitive } => PolicyError::MissingEvidence {
+            property: primitive.name.clone(),
+            path: format!("primitive {}", primitive.name),
+        },
+        ConstraintFailure::NotPassed {
+            primitive,
+            evidence,
+        } => PolicyError::EvidenceNotPassed {
+            property: primitive.name.clone(),
+            evidence: evidence.to_string(),
+            path: format!("primitive {}", primitive.name),
+        },
+        ConstraintFailure::BothBranch {
+            branch_index,
+            inner,
+        } => match policy_error_from_failure(*inner) {
+            PolicyError::MissingEvidence { property, path } => PolicyError::MissingEvidence {
+                property,
+                path: format!("all_of/[{branch_index}]/{path}"),
+            },
+            PolicyError::EvidenceNotPassed {
+                property,
+                evidence,
+                path,
+            } => PolicyError::EvidenceNotPassed {
+                property,
+                evidence,
+                path: format!("all_of/[{branch_index}]/{path}"),
+            },
+            PolicyError::BottomReached => PolicyError::ConstraintUnsatisfied {
+                path: format!("all_of/[{branch_index}]/bottom"),
+                detail: "bottom branch can never be satisfied".to_string(),
+                failure: ConstraintFailure::BottomReached,
+            },
+            PolicyError::ConstraintUnsatisfied {
+                path,
+                detail,
+                failure,
+            } => PolicyError::ConstraintUnsatisfied {
+                path: format!("all_of/[{branch_index}]/{path}"),
+                detail,
+                failure,
+            },
+        },
+        ConstraintFailure::EitherExhausted { branches } => PolicyError::ConstraintUnsatisfied {
+            path: "any_of".to_string(),
+            detail: format!("no branch satisfied; failures: {:?}", branches),
+            failure: ConstraintFailure::EitherExhausted { branches },
+        },
+        ConstraintFailure::BottomReached => PolicyError::BottomReached,
+    }
+}
+
+fn evaluate(
+    subject: &str,
+    constraint: &Constraint,
+    evidence: &[EvidenceRecord],
+) -> std::result::Result<(), ConstraintFailure> {
+    match constraint {
+        Constraint::Top => Ok(()),
+        Constraint::Bottom => Err(ConstraintFailure::BottomReached),
+        Constraint::Primitive { property } => evaluate_primitive(subject, property, evidence),
+        Constraint::Both { left, right } => {
+            evaluate(subject, left, evidence).map_err(|inner| ConstraintFailure::BothBranch {
+                branch_index: 0,
+                inner: Box::new(inner),
+            })?;
+            evaluate(subject, right, evidence).map_err(|inner| ConstraintFailure::BothBranch {
+                branch_index: 1,
+                inner: Box::new(inner),
+            })
+        }
+        Constraint::Either { left, right } => {
+            let left_failure = match evaluate(subject, left, evidence) {
+                Ok(()) => return Ok(()),
+                Err(failure) => failure,
+            };
+            let right_failure = match evaluate(subject, right, evidence) {
+                Ok(()) => return Ok(()),
+                Err(failure) => failure,
+            };
+            Err(ConstraintFailure::EitherExhausted {
+                branches: vec![left_failure, right_failure],
+            })
         }
     }
-    Ok(AdmissionDecision { accepted: true })
+}
+
+fn evaluate_primitive(
+    subject: &str,
+    primitive: &PropertyRef,
+    evidence: &[EvidenceRecord],
+) -> std::result::Result<(), ConstraintFailure> {
+    let mut matching = evidence
+        .iter()
+        .filter(|record| record.subject == subject && record.property == primitive.id);
+    let Some(first) = matching.next() else {
+        return Err(ConstraintFailure::Missing {
+            primitive: primitive.clone(),
+        });
+    };
+    if first.result.satisfies_requirement()
+        || matching.any(|record| record.result.satisfies_requirement())
+    {
+        Ok(())
+    } else {
+        Err(ConstraintFailure::NotPassed {
+            primitive: primitive.clone(),
+            evidence: first.id.clone(),
+        })
+    }
+}
+
+trait ApplicationSubject {
+    fn as_subject(&self) -> &str;
+}
+
+impl ApplicationSubject for ApplicationRef {
+    fn as_subject(&self) -> &str {
+        match self {
+            ApplicationRef::Stored(id) => id.as_str(),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use graft_core::PropertyId;
+    use graft_core::{ApplicationId, PropertyId, PropertyRef};
 
     fn property(name: &str) -> PropertyRef {
         PropertyRef::new(PropertyId::new(format!("property:{name}")), name)
     }
 
+    fn primitive(name: &str) -> Constraint {
+        Constraint::primitive(property(name))
+    }
+
+    fn application() -> ApplicationRef {
+        ApplicationRef::Stored(ApplicationId::new("application:demo"))
+    }
+
+    fn passed(name: &str) -> EvidenceRecord {
+        let property = property(name);
+        EvidenceRecord::passed("application:demo", property.id.clone(), "test-verifier").unwrap()
+    }
+
+    fn failed(name: &str) -> EvidenceRecord {
+        let property = property(name);
+        EvidenceRecord::failed(
+            "application:demo",
+            property.id.clone(),
+            "test-verifier",
+            "test failed",
+        )
+        .unwrap()
+    }
+
     #[test]
-    fn passed_evidence_satisfies_policy() {
-        let property = property("TestsPass");
-        let evidence =
-            EvidenceRecord::passed("candidate:demo", property.id.clone(), "test-verifier").unwrap();
-        let decision = require_passed_evidence(&[property], &[evidence]).unwrap();
+    fn top_is_always_satisfied() {
+        let decision = satisfies(&application(), &Constraint::Top, &[]).unwrap();
         assert!(decision.accepted);
     }
 
     #[test]
-    fn passed_evidence_satisfies_policy_even_after_failed_attempt() {
-        let property = property("TestsPass");
-        let evidence = vec![
-            EvidenceRecord::failed(
-                "candidate:demo",
-                property.id.clone(),
-                "test-verifier",
-                "first run failed",
-            )
-            .unwrap(),
-            EvidenceRecord::passed("candidate:demo", property.id.clone(), "test-verifier").unwrap(),
-        ];
+    fn bottom_is_never_satisfied() {
+        let err = satisfies(&application(), &Constraint::Bottom, &[]).unwrap_err();
+        assert!(matches!(err, PolicyError::BottomReached));
+    }
 
-        let decision = require_passed_evidence(&[property], &evidence).unwrap();
+    #[test]
+    fn passed_primitive_satisfies_policy_even_after_failed_attempt() {
+        let evidence = vec![failed("TestsPass"), passed("TestsPass")];
+
+        let decision = satisfies(&application(), &primitive("TestsPass"), &evidence).unwrap();
 
         assert!(decision.accepted);
     }
 
     #[test]
-    fn failed_evidence_without_a_pass_does_not_satisfy_policy() {
-        let property = property("TestsPass");
-        let evidence = vec![
-            EvidenceRecord::failed(
-                "candidate:demo",
-                property.id.clone(),
-                "test-verifier",
-                "test failed",
-            )
-            .unwrap(),
-        ];
+    fn failed_primitive_without_a_pass_does_not_satisfy_policy() {
+        let evidence = vec![failed("TestsPass")];
 
-        let err = require_passed_evidence(&[property], &evidence).unwrap_err();
+        let err = satisfies(&application(), &primitive("TestsPass"), &evidence).unwrap_err();
 
         assert!(matches!(err, PolicyError::EvidenceNotPassed { .. }));
     }
 
     #[test]
-    fn evidence_for_different_property_id_does_not_satisfy_requirement() {
-        let required = property("TestsPass");
-        let old_property = property("TestsPassOld");
+    fn primitive_requires_matching_application_subject() {
+        let property = property("TestsPass");
         let evidence = vec![
-            EvidenceRecord::passed("candidate:demo", old_property.id, "test-verifier").unwrap(),
+            EvidenceRecord::passed("candidate:demo", property.id.clone(), "test-verifier").unwrap(),
         ];
 
-        let err = require_passed_evidence(&[required], &evidence).unwrap_err();
+        let err = satisfies(&application(), &primitive("TestsPass"), &evidence).unwrap_err();
 
         assert!(matches!(err, PolicyError::MissingEvidence { .. }));
+    }
+
+    #[test]
+    fn both_short_circuits_on_first_missing_branch() {
+        let constraint = Constraint::all_of(vec![primitive("TestsPass"), primitive("FormatPass")]);
+        let err = satisfies(&application(), &constraint, &[]).unwrap_err();
+        let rendered = err.to_string();
+
+        assert!(matches!(err, PolicyError::MissingEvidence { .. }));
+        assert!(rendered.starts_with("[A001]"), "{rendered}");
+        assert!(
+            rendered.contains("Constraint failed at: all_of/[0]/primitive TestsPass"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn nested_failed_primitive_reports_evidence_id_and_path() {
+        let constraint = Constraint::all_of(vec![primitive("TestsPass"), primitive("FormatPass")]);
+        let failed = failed("FormatPass");
+        let evidence_id = failed.id.to_string();
+        let err =
+            satisfies(&application(), &constraint, &[passed("TestsPass"), failed]).unwrap_err();
+        let rendered = err.to_string();
+
+        assert!(matches!(err, PolicyError::EvidenceNotPassed { .. }));
+        assert!(rendered.starts_with("[A002]"), "{rendered}");
+        assert!(rendered.contains(&evidence_id), "{rendered}");
+        assert!(
+            rendered.contains("Constraint failed at: all_of/[1]/primitive FormatPass"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn either_succeeds_when_any_branch_passes() {
+        let constraint = Constraint::any_of(vec![Constraint::Bottom, primitive("TestsPass")]);
+        let decision = satisfies(&application(), &constraint, &[passed("TestsPass")]).unwrap();
+
+        assert!(decision.accepted);
+    }
+
+    #[test]
+    fn either_reports_all_branch_failures() {
+        let constraint = Constraint::any_of(vec![Constraint::Bottom, primitive("TestsPass")]);
+        let err = satisfies(&application(), &constraint, &[]).unwrap_err();
+        let rendered = err.to_string();
+
+        let PolicyError::ConstraintUnsatisfied { failure, path, .. } = err else {
+            panic!("expected structured constraint failure");
+        };
+        assert_eq!(path, "any_of");
+        assert!(
+            matches!(failure, ConstraintFailure::EitherExhausted { branches } if branches.len() == 2)
+        );
+        assert!(rendered.starts_with("[E_CONSTRAINT_UNMET]"), "{rendered}");
+        assert!(rendered.contains("[E_ADMISSION_UNMET]"), "{rendered}");
+        assert!(
+            rendered.contains("Constraint failed at: any_of"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn nested_lattice_constraint_satisfies() {
+        let constraint = Constraint::all_of(vec![
+            primitive("TestsPass"),
+            Constraint::any_of(vec![Constraint::Bottom, primitive("FormatPass")]),
+        ]);
+        let evidence = vec![passed("TestsPass"), passed("FormatPass")];
+
+        let decision = satisfies(&application(), &constraint, &evidence).unwrap();
+
+        assert!(decision.accepted);
     }
 }

@@ -9,6 +9,7 @@ license.workspace = true
 
 [dependencies]
 graft-core = { path = "../graft-core" }
+graft-policy = { path = "../graft-policy" }
 thiserror.workspace = true
 
 [dev-dependencies]

@@ -42,8 +42,8 @@ scratch_b_out=$("$GRAFT" scratch write --from "$scratch_a" worktrees/B/value.txt
 scratch_b=$(grep -oE 'scratch:[0-9a-f]+' <<<"$scratch_b_out" | tail -n1)
 [[ -n $scratch_b ]] || { echo "FAIL: scratch B write did not return scratch id"; echo "$scratch_b_out"; exit 1; }
 
-candidate_out=$("$GRAFT" patch from-scratch "$scratch_b" --expect workspace:repo_outputs_match --message cross-repo-property)
-candidate=$(grep -oE 'candidate:[0-9a-f]+' <<<"$candidate_out" | head -n1)
+candidate_out=$("$GRAFT" patch from-scratch "$scratch_b" --expect repo_outputs_match --message cross-repo-property)
+candidate=$(first_graft_id candidate "$candidate_out")
 [[ -n $candidate ]] || { echo "FAIL: patch from-scratch did not return candidate id"; echo "$candidate_out"; exit 1; }
 
 validate_out=$("$GRAFT" patch validate "$candidate")
@@ -51,8 +51,8 @@ grep -q 'validation completed' <<<"$validate_out" || { echo "FAIL: cross-repo pr
 grep -q 'repo_outputs_match' <<<"$validate_out" || { echo "FAIL: cross-repo property evidence missing"; echo "$validate_out"; exit 1; }
 grep -q 'passed' <<<"$validate_out" || { echo "FAIL: cross-repo property did not pass"; echo "$validate_out"; exit 1; }
 
-admit_out=$("$GRAFT" patch admit "$candidate" --require workspace:repo_outputs_match)
-patch=$(grep -oE 'patch:[0-9a-f]+' <<<"$admit_out" | head -n1)
+admit_out=$("$GRAFT" patch admit "$candidate" --require repo_outputs_match)
+patch=$(first_graft_id patch "$admit_out")
 [[ -n $patch ]] || { echo "FAIL: admit did not return patch id"; echo "$admit_out"; exit 1; }
 
 if "$GRAFT" patch validate "$patch" --expect A:repo_outputs_match >/tmp/graft-repo-scope-property.out 2>&1; then
@@ -60,8 +60,8 @@ if "$GRAFT" patch validate "$patch" --expect A:repo_outputs_match >/tmp/graft-re
   cat /tmp/graft-repo-scope-property.out
   exit 1
 fi
-grep -Fq '[E_UNSUPPORTED_PROPERTY_SCOPE]' /tmp/graft-repo-scope-property.out || {
-  echo "FAIL: repo-prefixed property rejection did not explain whole-state scope"
+grep -Fq '[E_SCOPED_PROPERTY_UNSUPPORTED]' /tmp/graft-repo-scope-property.out || {
+  echo "FAIL: repo-prefixed property rejection did not explain bare-name whole-state scope"
   cat /tmp/graft-repo-scope-property.out
   exit 1
 }

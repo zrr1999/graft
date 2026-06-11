@@ -1,22 +1,26 @@
 mod candidate;
 mod config;
 mod daemon_client;
+mod daemon_wire;
+mod presentation;
+mod promotion;
 mod property;
 mod registry;
 mod repo;
 mod requirements;
 mod roto_properties;
+mod routing;
 mod scratch;
+mod state_runtime;
 mod validation;
 mod view;
 mod workspace;
 
 use std::fs;
 use std::io::{self, Write};
-use std::path::Component;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::process::Command as ProcessCommand;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use candidate::{CandidateCommand, run_candidate_command};
@@ -24,43 +28,59 @@ use clap::{Parser, Subcommand, ValueEnum};
 #[cfg(test)]
 use config::write_property_lock;
 use config::{GraftConfig, load_graft_config, load_property_defs};
-use daemon_client::workspace_root_wire_string;
-use graft_client::{daemon_socket_path, request_result_or_spawn};
-use graft_core::{
-    ApplicationRef, Change, EvidenceRecord, EvidenceResult, FileChangeKind, GraftCandidate,
-    PatchRecord, PatchRelation, PatchRelationKind, PromotionRecord, PropertyId, Provenance,
-    ScopedPropertyRef, StateId, TreeEntry, TreeSnapshot, application_from_change, candidate_id,
-    patch_id, promotion_id, relation_id,
+#[cfg(test)]
+use daemon_wire::result_to_envelope;
+use daemon_wire::{
+    run_via_daemon, run_via_daemon_with_argv, run_workspace_registry_write_via_daemon,
 };
-use graft_explain::NextAction;
+use graft_core::{
+    AdmissionSummary, ApplicationRef, Change, EvidenceRecord, EvidenceResult, FileChangeKind,
+    GraftCandidate, PatchRecord, PatchRelation, PatchRelationKind, PromotionRecord, PropertyId,
+    PropertyRef, Provenance, StateId, TreeEntry, TreeSnapshot, application_from_change,
+    candidate_id, patch_id, promotion_id, relation_id,
+};
 use graft_promote::GixBackend;
 use graft_store::{
     DEFAULT_WORKSPACE_ID, GraftStore, RegistryStore, ResolvedApplication, StoreError,
-    WorkspaceDiscovery, default_workspace_root, normalize_workspace_path,
+    WorkspaceDiscovery, normalize_workspace_path,
 };
 #[cfg(test)]
 use graft_store::{WorkspaceKind, local_workspace_id_for_root};
 use graft_sync::{DivergencePolicy as SyncDivergencePolicy, GraftSyncTransport, SyncOptions};
+use presentation::{
+    change_view_for_application, evidence_view, next_actions_for_candidate, next_search_actions,
+    promotion_view, state_label, summarize_candidate, summarize_candidate_with_evidence,
+    summarize_patch_with_evidence,
+};
+#[cfg(test)]
+use promotion::materialize_ref_name;
+use promotion::{
+    ensure_materialized_commit, git_ref_component_for_patch_id, promote_next_action,
+    target_snapshot_for_patch, validate_promote_ref_args,
+};
 use property::{PropertyCommand, run_property_command};
 use registry::{RegistryCommand, run_registry_command};
-use repo::{
-    RepoCommand, base_snapshot_for_state, materialized_snapshot_for_state, resolve_base_state,
-    run_repo_command,
-};
+use repo::{RepoCommand, base_snapshot_for_state, resolve_base_state, run_repo_command};
 use requirements::{
-    admission_required_scoped_properties, needs_revalidation_or, promotion_requirement_plan,
-    property_label, property_matches_request, property_refs_for_scoped,
-    resolve_scoped_property_ref, scoped_property_label,
+    admission_required_constraint, constraint_from_properties, constraint_primitives,
+    needs_revalidation_or, promotion_requirement_plan, promotion_requirement_plan_with_target,
+    property_label, property_matches_request, resolve_property_ref,
+    validation_constraint_with_base,
+};
+use routing::{
+    DaemonCliExecRouter, PatchCommandRoute, TopLevelRoute, command_is_gc,
+    command_skips_workspace_init_check, command_uses_cwd_directly, route_patch_command,
+    route_top_level_command,
 };
 use scratch::{ScratchCommand, run_scratch_command, run_scratch_status};
+#[cfg(test)]
+use state_runtime::materialize_worktree_path;
+use state_runtime::{materialize_state, object_diff_summary, run_in_state};
 use time::OffsetDateTime;
 use validation::{
     ensure_change_integrity, evidence_for_current_verifiers, validate_candidate, validate_patch,
 };
-use view::{
-    CandidateSummary, ChangeView, CommandEnvelope, CommandView, EvidenceCounts, EvidenceView,
-    PatchSummary, PromotionView, RunView, print_human,
-};
+use view::{CandidateSummary, CommandEnvelope, PatchSummary, print_human};
 use workspace::{
     gc_apply_daemon_argv, init_workspace_files, modernize_legacy_gc_apply_message,
     run_attach_command, run_detach_command, run_doctor_command, run_gc, run_init_command,
@@ -204,7 +224,7 @@ enum Command {
     Candidates {
         #[arg(
             long,
-            help = "Show only candidates whose expected list contains this property"
+            help = "Show only candidates whose constraint contains this property primitive"
         )]
         property: Option<String>,
         #[arg(long, help = "Show only candidates with at least one failed evidence")]
@@ -232,9 +252,9 @@ enum Command {
         id: String,
         #[arg(
             long = "expect",
-            help = "Validate this whole-state property, for example workspace:tests_pass (repeatable)"
+            help = "Validate this whole-state property, for example tests_pass (repeatable; repeats compose as all_of)"
         )]
-        expected: Vec<String>,
+        constraint_primitives: Vec<String>,
     },
     /// Admit a candidate into the registry once required evidence is present
     #[command(hide = true)]
@@ -243,7 +263,7 @@ enum Command {
         id: String,
         #[arg(
             long = "require",
-            help = "Add a one-shot admission requirement like workspace:tests_pass; repeats append to [admission.required_properties] and candidate expectations"
+            help = "Add a one-shot admission requirement like tests_pass; append to [admission.required_properties] plus candidate constraints as all_of"
         )]
         required: Vec<String>,
     },
@@ -291,9 +311,9 @@ enum Command {
         second: String,
         #[arg(
             long = "expect",
-            help = "Whole-state property the composed candidate should later satisfy"
+            help = "Whole-state property the composed candidate should later satisfy (repeatable; repeats compose as all_of)"
         )]
-        expected: Vec<String>,
+        constraint_primitives: Vec<String>,
         #[arg(long, help = "Run validators on the composed candidate immediately")]
         validate: bool,
     },
@@ -310,9 +330,9 @@ enum Command {
         onto: String,
         #[arg(
             long = "expect",
-            help = "Whole-state property the migrated candidate should later satisfy"
+            help = "Whole-state property the migrated candidate should later satisfy (repeatable; repeats compose as all_of)"
         )]
-        expected: Vec<String>,
+        constraint_primitives: Vec<String>,
         #[arg(long, help = "Run validators on the migrated candidate immediately")]
         validate: bool,
     },
@@ -323,9 +343,9 @@ enum Command {
         id: String,
         #[arg(
             long = "expect",
-            help = "Whole-state property the revert candidate should later satisfy"
+            help = "Whole-state property the revert candidate should later satisfy (repeatable; repeats compose as all_of)"
         )]
-        expected: Vec<String>,
+        constraint_primitives: Vec<String>,
         #[arg(long, help = "Run validators on the revert candidate immediately")]
         validate: bool,
     },
@@ -348,6 +368,7 @@ enum Command {
         command: Vec<String>,
     },
     /// Materialize any state ref into an isolated inspection state
+    #[command(hide = true)]
     Materialize {
         /// State ref: graft:empty, tree:<id>, candidate:<id>, patch:<id>, or repo:<id>@<treeish>
         id: String,
@@ -376,6 +397,7 @@ enum Command {
         ref_name: Option<String>,
     },
     /// Promote an admitted patch target state to a Git branch, PR or release
+    #[command(hide = true)]
     Promote {
         /// Patch id to promote
         id: String,
@@ -390,7 +412,7 @@ enum Command {
         yes: bool,
         #[arg(
             long = "require",
-            help = "Property that must have passing evidence before promotion (repeatable)"
+            help = "Property that must have passing evidence before promotion (repeatable; repeats compose as all_of)"
         )]
         required: Vec<String>,
         #[arg(
@@ -521,7 +543,7 @@ enum PatchCommand {
         candidates: bool,
         #[arg(long, help = "List both admitted patches and unadmitted candidates")]
         all: bool,
-        #[arg(long, help = "Filter by property name or id")]
+        #[arg(long, help = "Filter by property primitive name or id")]
         property: Option<String>,
         #[arg(long, help = "Filter by provenance producer label")]
         producer: Option<String>,
@@ -546,9 +568,9 @@ enum PatchCommand {
         id: String,
         #[arg(
             long = "expect",
-            help = "Validate this whole-state property, for example workspace:tests_pass (repeatable)"
+            help = "Validate this whole-state property, for example tests_pass (repeatable; repeats compose as all_of)"
         )]
-        expected: Vec<String>,
+        constraint_primitives: Vec<String>,
     },
     /// Admit a candidate into the registry once required evidence is present
     Admit {
@@ -556,7 +578,7 @@ enum PatchCommand {
         id: String,
         #[arg(
             long = "require",
-            help = "Add a one-shot admission requirement like workspace:tests_pass; repeats append to [admission.required_properties] and candidate expectations"
+            help = "Add a one-shot admission requirement like tests_pass; append to [admission.required_properties] plus candidate constraints as all_of"
         )]
         required: Vec<String>,
     },
@@ -594,9 +616,9 @@ enum PatchCommand {
         second: String,
         #[arg(
             long = "expect",
-            help = "Whole-state property the composed candidate should later satisfy"
+            help = "Whole-state property the composed candidate should later satisfy (repeatable; repeats compose as all_of)"
         )]
-        expected: Vec<String>,
+        constraint_primitives: Vec<String>,
         #[arg(long, help = "Run validators on the composed candidate immediately")]
         validate: bool,
     },
@@ -612,9 +634,9 @@ enum PatchCommand {
         onto: String,
         #[arg(
             long = "expect",
-            help = "Whole-state property the migrated candidate should later satisfy"
+            help = "Whole-state property the migrated candidate should later satisfy (repeatable; repeats compose as all_of)"
         )]
-        expected: Vec<String>,
+        constraint_primitives: Vec<String>,
         #[arg(long, help = "Run validators on the migrated candidate immediately")]
         validate: bool,
     },
@@ -624,9 +646,9 @@ enum PatchCommand {
         id: String,
         #[arg(
             long = "expect",
-            help = "Whole-state property the revert candidate should later satisfy"
+            help = "Whole-state property the revert candidate should later satisfy (repeatable; repeats compose as all_of)"
         )]
-        expected: Vec<String>,
+        constraint_primitives: Vec<String>,
         #[arg(long, help = "Run validators on the revert candidate immediately")]
         validate: bool,
     },
@@ -673,7 +695,7 @@ enum PatchCommand {
         yes: bool,
         #[arg(
             long = "require",
-            help = "Property that must have passing evidence before promotion (repeatable)"
+            help = "Property that must have passing evidence before promotion (repeatable; repeats compose as all_of)"
         )]
         required: Vec<String>,
         #[arg(
@@ -701,7 +723,7 @@ enum CacheCommand {
     Search {
         #[arg(
             long,
-            help = "Match candidates whose expected list contains this property"
+            help = "Match candidates whose constraint contains this property primitive"
         )]
         property: Option<String>,
         #[arg(long, help = "Match candidates with at least one failed evidence")]
@@ -769,10 +791,10 @@ pub fn run_daemon_argv_to_value_for_workspace(
     )?)?)
 }
 
-pub fn resolve_candidate_expected_properties(
+pub fn resolve_candidate_constraint_primitives(
     store: &GraftStore,
     names: &[String],
-) -> Result<Vec<ScopedPropertyRef>> {
+) -> Result<Vec<PropertyRef>> {
     let config = load_graft_config(store)?;
     needs_revalidation_or(&config, names)
 }
@@ -804,33 +826,6 @@ fn prompt_yes_no_default_no(prompt: &str) -> Result<bool> {
     ))
 }
 
-fn command_gc_dry_run_derived_only(command: &Command) -> Option<bool> {
-    match command {
-        Command::Gc {
-            apply: false,
-            derived_only,
-        }
-        | Command::Workspace {
-            command:
-                WorkspaceCommand::Gc {
-                    apply: false,
-                    derived_only,
-                },
-        } => Some(*derived_only),
-        _ => None,
-    }
-}
-
-fn command_is_gc_apply(command: &Command) -> bool {
-    matches!(
-        command,
-        Command::Gc { apply: true, .. }
-            | Command::Workspace {
-                command: WorkspaceCommand::Gc { apply: true, .. },
-            }
-    )
-}
-
 fn run_gc_apply(cli: &Cli) -> Result<CommandEnvelope> {
     let derived_only = match &cli.command {
         Command::Gc {
@@ -855,218 +850,6 @@ fn run_gc_apply(cli: &Cli) -> Result<CommandEnvelope> {
             Ok(modernize_legacy_gc_apply_message(envelope, derived_only))
         }
         None => run_local(cli),
-    }
-}
-
-fn run_via_daemon(cli: &Cli) -> Result<CommandEnvelope> {
-    run_via_daemon_with_argv(cli, None)
-}
-
-fn run_workspace_registry_write_via_daemon(cli: &Cli) -> Result<CommandEnvelope> {
-    let socket = daemon_socket_path()?;
-    let (op, params) = workspace_registry_write_request(cli)?;
-    let daemon_anchor = default_workspace_root();
-    let result = request_result_or_spawn(&daemon_anchor, &socket, op, params)?;
-    result_to_envelope(result)
-}
-
-fn workspace_registry_write_request(cli: &Cli) -> Result<(&'static str, serde_json::Value)> {
-    let cwd = cwd_wire_string(&cli.cwd)?;
-    match &cli.command {
-        Command::Attach {
-            workspace,
-            status: false,
-        }
-        | Command::Workspace {
-            command:
-                WorkspaceCommand::Attach {
-                    workspace,
-                    status: false,
-                },
-        } => {
-            let mut params = serde_json::json!({ "cwd": cwd });
-            if let Some(workspace) = workspace {
-                params
-                    .as_object_mut()
-                    .expect("workspace_attach params are an object")
-                    .insert("workspace".to_string(), serde_json::json!(workspace));
-            }
-            Ok(("workspace_attach", params))
-        }
-        Command::Detach
-        | Command::Workspace {
-            command: WorkspaceCommand::Detach,
-        } => Ok(("workspace_detach", serde_json::json!({ "cwd": cwd }))),
-        _ => bail!("[E_INTERNAL] workspace registry write route received a non-registry command"),
-    }
-}
-
-fn cwd_wire_string(cwd: &Path) -> Result<&str> {
-    let cwd = cwd.to_str().ok_or_else(|| {
-        anyhow::anyhow!(
-            "[E_UNREPRESENTABLE_CWD] cwd contains non-UTF-8 bytes and cannot be encoded in the current daemon JSON wire protocol: {}",
-            cwd.display()
-        )
-    })?;
-    if cwd.trim().is_empty() {
-        bail!("[E_BAD_PARAMS] cwd must not be empty");
-    }
-    Ok(cwd)
-}
-
-fn run_via_daemon_with_argv(cli: &Cli, argv: Option<Vec<String>>) -> Result<CommandEnvelope> {
-    let location = WorkspaceDiscovery::from_env().discover(&cli.cwd)?;
-    let workspace_root = location.root().to_path_buf();
-    let store = GraftStore::open(&workspace_root);
-    ensure_workspace_initialized(&store)?;
-    let socket = daemon_socket_path()?;
-    let workspace_root_wire = workspace_root_wire_string(&workspace_root)?;
-    let argv = argv.unwrap_or_else(|| daemon_argv_with_workspace_root(&workspace_root));
-    let workspace_id = location
-        .id()
-        .ok_or_else(|| {
-            anyhow::anyhow!("[E_NO_WORKSPACE_ID] cli_exec requires a resolved workspace_id")
-        })?
-        .to_string();
-    let result = request_result_or_spawn(
-        &workspace_root,
-        &socket,
-        "cli_exec",
-        serde_json::json!({
-            "argv": argv,
-            "workspace_id": workspace_id,
-            "workspace_root": workspace_root_wire
-        }),
-    )?;
-    result_to_envelope(result)
-}
-
-fn result_to_envelope(result: serde_json::Value) -> Result<CommandEnvelope> {
-    serde_json::from_value(result)
-        .context("[E_BAD_DAEMON_RESPONSE] daemon result is not a command envelope")
-}
-
-fn command_uses_cli_exec(command: &Command) -> bool {
-    match command {
-        Command::Validate { .. }
-        | Command::Admit { .. }
-        | Command::Compose { .. }
-        | Command::Migrate { .. }
-        | Command::Revert { .. }
-        | Command::Promote { .. }
-        | Command::Sync { .. }
-        | Command::VerifyPending { .. }
-        | Command::Gc { apply: true, .. }
-        | Command::Registry {
-            command: RegistryCommand::Import { .. },
-        }
-        | Command::Bundle {
-            command: RegistryCommand::Import { .. },
-        } => true,
-        Command::Patch { command } => patch_command_uses_cli_exec(command),
-        Command::Workspace { command } => {
-            matches!(command, WorkspaceCommand::Gc { apply: true, .. })
-        }
-        Command::Repo {
-            command:
-                RepoCommand::Add { .. }
-                | RepoCommand::Sync { .. }
-                | RepoCommand::Lock { .. }
-                | RepoCommand::Update { .. },
-        } => true,
-        Command::Get { .. }
-        | Command::Scratch { .. }
-        | Command::Candidate { .. }
-        | Command::Property { .. }
-        | Command::Init { .. }
-        | Command::Attach { .. }
-        | Command::Detach
-        | Command::Ps
-        | Command::Doctor { .. }
-        | Command::Clone { .. }
-        | Command::Candidates { .. }
-        | Command::Show { .. }
-        | Command::Status
-        | Command::Run { .. }
-        | Command::Materialize { .. }
-        | Command::Diff { .. }
-        | Command::Discard
-        | Command::Incoming
-        | Command::Search { .. }
-        | Command::Repo {
-            command: RepoCommand::List,
-        }
-        | Command::Registry {
-            command: RegistryCommand::Export { .. },
-        }
-        | Command::Bundle {
-            command: RegistryCommand::Export { .. },
-        }
-        | Command::Cache { .. }
-        | Command::Evidence { .. }
-        | Command::Gc { apply: false, .. }
-        | Command::Explain { .. } => false,
-    }
-}
-
-fn command_is_workspace_registry_write(command: &Command) -> bool {
-    matches!(
-        command,
-        Command::Attach { status: false, .. }
-            | Command::Detach
-            | Command::Workspace {
-                command: WorkspaceCommand::Attach { status: false, .. } | WorkspaceCommand::Detach,
-            }
-    )
-}
-
-fn patch_command_uses_cli_exec(command: &PatchCommand) -> bool {
-    match route_patch_command(command) {
-        PatchCommandRoute::TopLevelAlias(command) => command_uses_cli_exec(&command),
-        PatchCommandRoute::List { .. }
-        | PatchCommandRoute::FromScratch(_)
-        | PatchCommandRoute::Show { .. }
-        | PatchCommandRoute::Incoming => false,
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TopLevelRoute {
-    Explain,
-    GcPrompt { derived_only: bool },
-    GcApply,
-    WorkspaceRegistryWrite,
-    CliExec,
-    Local,
-}
-
-fn route_top_level_command(command: &Command) -> TopLevelRoute {
-    if matches!(command, Command::Explain { .. }) {
-        TopLevelRoute::Explain
-    } else if let Some(derived_only) = command_gc_dry_run_derived_only(command) {
-        TopLevelRoute::GcPrompt { derived_only }
-    } else if command_is_gc_apply(command) {
-        TopLevelRoute::GcApply
-    } else if command_is_workspace_registry_write(command) {
-        TopLevelRoute::WorkspaceRegistryWrite
-    } else if command_uses_cli_exec(command) {
-        TopLevelRoute::CliExec
-    } else {
-        TopLevelRoute::Local
-    }
-}
-
-struct DaemonCliExecRouter;
-
-impl DaemonCliExecRouter {
-    fn ensure_supported(command: &Command) -> Result<()> {
-        if command_uses_cli_exec(command) {
-            Ok(())
-        } else {
-            bail!(
-                "[E_CLI_EXEC_UNSUPPORTED] cli_exec only accepts daemon-owned write commands; use the typed daemon op or local CLI path for this command"
-            )
-        }
     }
 }
 
@@ -1121,8 +904,8 @@ fn list_patch_summaries(
         let mut filtered = Vec::new();
         for patch in patches {
             let mut matched = false;
-            for expr in &patch.properties {
-                if property_matches_request(&config, expr, property)? {
+            for expr in constraint_primitives(&patch.constraint) {
+                if property_matches_request(&config, &expr, property)? {
                     matched = true;
                     break;
                 }
@@ -1164,8 +947,8 @@ fn list_candidate_summaries(
     for candidate in store.list_candidates()? {
         if let Some((property, config)) = property_filter.as_ref() {
             let mut matched = false;
-            for expr in &candidate.expected {
-                if property_matches_request(config, &expr.property, property)? {
+            for expr in constraint_primitives(&candidate.constraint) {
+                if property_matches_request(config, &expr, property)? {
                     matched = true;
                     break;
                 }
@@ -1247,47 +1030,6 @@ fn run_local(cli: &Cli) -> Result<CommandEnvelope> {
     run_local_with_workspace_id(cli, None)
 }
 
-fn command_uses_cwd_directly(command: &Command) -> bool {
-    matches!(
-        command,
-        Command::Init { .. }
-            | Command::Attach { .. }
-            | Command::Detach
-            | Command::Ps
-            | Command::Doctor { .. }
-            | Command::Clone { .. }
-            | Command::Get { .. }
-            | Command::Explain { .. }
-            | Command::Status
-            | Command::Workspace {
-                command: WorkspaceCommand::Init { .. }
-                    | WorkspaceCommand::Attach { .. }
-                    | WorkspaceCommand::Detach
-                    | WorkspaceCommand::Status
-                    | WorkspaceCommand::Ps
-                    | WorkspaceCommand::Doctor { .. },
-            }
-            | Command::Scratch {
-                command: ScratchCommand::Status,
-                ..
-            }
-    )
-}
-
-fn command_is_gc(command: &Command) -> bool {
-    matches!(
-        command,
-        Command::Gc { .. }
-            | Command::Workspace {
-                command: WorkspaceCommand::Gc { .. },
-            }
-    )
-}
-
-fn command_skips_workspace_init_check(command: &Command) -> bool {
-    command_uses_cwd_directly(command) || command_is_gc(command)
-}
-
 fn discover_optional_workspace_for_gc(cwd: &Path) -> Result<Option<(PathBuf, Option<String>)>> {
     match WorkspaceDiscovery::from_env().discover(cwd) {
         Ok(location) => Ok(Some((
@@ -1296,142 +1038,6 @@ fn discover_optional_workspace_for_gc(cwd: &Path) -> Result<Option<(PathBuf, Opt
         ))),
         Err(StoreError::NoWorkspace { .. }) => Ok(None),
         Err(error) => Err(error.into()),
-    }
-}
-
-enum PatchCommandRoute<'a> {
-    List {
-        candidates: bool,
-        all: bool,
-        property: &'a Option<String>,
-        producer: &'a Option<String>,
-    },
-    FromScratch(&'a crate::candidate::CandidateFromScratchArgs),
-    Show {
-        id: &'a str,
-        evidence: bool,
-        change: bool,
-    },
-    Incoming,
-    TopLevelAlias(Command),
-}
-
-fn route_patch_command(command: &PatchCommand) -> PatchCommandRoute<'_> {
-    match command {
-        PatchCommand::List {
-            candidates,
-            all,
-            property,
-            producer,
-        } => PatchCommandRoute::List {
-            candidates: *candidates,
-            all: *all,
-            property,
-            producer,
-        },
-        PatchCommand::FromScratch(args) => PatchCommandRoute::FromScratch(args),
-        PatchCommand::Show {
-            id,
-            evidence,
-            change,
-        } => PatchCommandRoute::Show {
-            id,
-            evidence: *evidence,
-            change: *change,
-        },
-        PatchCommand::Incoming => PatchCommandRoute::Incoming,
-        PatchCommand::Validate { id, expected } => {
-            PatchCommandRoute::TopLevelAlias(Command::Validate {
-                id: id.clone(),
-                expected: expected.clone(),
-            })
-        }
-        PatchCommand::Admit { id, required } => PatchCommandRoute::TopLevelAlias(Command::Admit {
-            id: id.clone(),
-            required: required.clone(),
-        }),
-        PatchCommand::Search {
-            property,
-            base,
-            producer,
-            has_evidence,
-        } => PatchCommandRoute::TopLevelAlias(Command::Search {
-            property: property.clone(),
-            base: base.clone(),
-            producer: producer.clone(),
-            has_evidence: has_evidence.clone(),
-        }),
-        PatchCommand::Diff { from, to } => PatchCommandRoute::TopLevelAlias(Command::Diff {
-            from: from.clone(),
-            to: to.clone(),
-        }),
-        PatchCommand::Compose {
-            first,
-            second,
-            expected,
-            validate,
-        } => PatchCommandRoute::TopLevelAlias(Command::Compose {
-            first: first.clone(),
-            second: second.clone(),
-            expected: expected.clone(),
-            validate: *validate,
-        }),
-        PatchCommand::Migrate {
-            id,
-            onto,
-            expected,
-            validate,
-        } => PatchCommandRoute::TopLevelAlias(Command::Migrate {
-            id: id.clone(),
-            onto: onto.clone(),
-            expected: expected.clone(),
-            validate: *validate,
-        }),
-        PatchCommand::Revert {
-            id,
-            expected,
-            validate,
-        } => PatchCommandRoute::TopLevelAlias(Command::Revert {
-            id: id.clone(),
-            expected: expected.clone(),
-            validate: *validate,
-        }),
-        PatchCommand::Materialize {
-            id,
-            dry_run,
-            discard,
-            as_commit,
-            ref_name,
-        } => PatchCommandRoute::TopLevelAlias(Command::Materialize {
-            id: id.clone(),
-            dry_run: *dry_run,
-            discard: *discard,
-            as_commit: *as_commit,
-            ref_name: ref_name.clone(),
-        }),
-        PatchCommand::Promote {
-            id,
-            to,
-            branch,
-            yes,
-            required,
-            pr,
-            release,
-            title,
-            body,
-            head,
-        } => PatchCommandRoute::TopLevelAlias(Command::Promote {
-            id: id.clone(),
-            to: to.clone(),
-            branch: branch.clone(),
-            yes: *yes,
-            required: required.clone(),
-            pr: *pr,
-            release: release.clone(),
-            title: title.clone(),
-            body: body.clone(),
-            head: head.clone(),
-        }),
     }
 }
 
@@ -1631,12 +1237,27 @@ impl LocalCommandRouter<'_> {
                 let config = load_graft_config(store)?;
                 run_in_state(store, &config, state, cwd.as_deref(), command)
             }
-            Command::Validate { id, expected } => match record_ref_kind(id)? {
+            Command::Validate {
+                id,
+                constraint_primitives,
+            } => match record_ref_kind(id)? {
                 RecordRefKind::Candidate => {
                     let candidate = store
                         .read_candidate(id)
                         .with_context(|| format!("read candidate record {id}"))?;
-                    let evidence_records = validate_candidate(store, &candidate, expected)?;
+                    let config = load_graft_config(store)?;
+                    let validation_constraint = validation_constraint_with_base(
+                        &config,
+                        constraint_primitives,
+                        &candidate.constraint,
+                    )?;
+                    let evidence_records =
+                        validate_candidate(store, &candidate, constraint_primitives)?;
+                    let _ = graft_validate::validate_constraint(
+                        &graft_validate::ValidationSubject::new(id.clone()),
+                        &validation_constraint,
+                        &evidence_records,
+                    );
                     Ok(CommandEnvelope {
                         message: Some(format!("validation completed for {id}; registry unchanged")),
                         candidate_id: Some(id.clone()),
@@ -1654,7 +1275,18 @@ impl LocalCommandRouter<'_> {
                     let patch = store
                         .read_patch(id)
                         .with_context(|| format!("read patch record {id}"))?;
-                    let evidence_records = validate_patch(store, &patch, expected)?;
+                    let config = load_graft_config(store)?;
+                    let validation_constraint = validation_constraint_with_base(
+                        &config,
+                        constraint_primitives,
+                        &patch.constraint,
+                    )?;
+                    let evidence_records = validate_patch(store, &patch, constraint_primitives)?;
+                    let _ = graft_validate::validate_constraint(
+                        &graft_validate::ValidationSubject::new(id.clone()),
+                        &validation_constraint,
+                        &evidence_records,
+                    );
                     Ok(CommandEnvelope {
                         message: Some(format!("validation completed for admitted patch {id}")),
                         patch_id: Some(id.clone()),
@@ -1675,18 +1307,21 @@ impl LocalCommandRouter<'_> {
                 let evidence = store.candidate_evidence_records(id)?;
                 let config = load_graft_config(store)?;
                 ensure_change_integrity(store, &config, &candidate.application)?;
-                ensure_candidate_expected_properties_current(&config, &candidate)?;
-                let required_properties =
-                    admission_required_scoped_properties(&config, &candidate, required)?;
+                ensure_candidate_constraint_current(&config, &candidate)?;
+                let required_constraint =
+                    admission_required_constraint(&config, &candidate, required)?;
+                let required_properties = constraint_primitives(&required_constraint);
                 let current_evidence =
                     evidence_for_current_verifiers(&config, &required_properties, &evidence, id)?;
-                require_passed_scoped_evidence(&required_properties, &current_evidence, id)?;
+                graft_policy::satisfies_subject(id, &required_constraint, &current_evidence)?;
                 let mut patch = PatchRecord {
                     id: graft_core::PatchId::new("patch:pending"),
                     application: candidate.application.clone(),
-                    properties: property_refs_for_scoped(&required_properties),
+                    constraint: required_constraint.clone(),
                     provenance: candidate.provenance,
-                    admitted_at: OffsetDateTime::now_utc().to_string(),
+                    admission: AdmissionSummary {
+                        constraint: required_constraint,
+                    },
                 };
                 patch.id = patch_id(&patch)?;
                 store.write_patch(&patch)?;
@@ -1725,7 +1360,7 @@ impl LocalCommandRouter<'_> {
             }
             Command::Discard => {
                 bail!(
-                    "[E_OBSOLETE_CWD_VIEW] graft discard no longer writes cwd because cwd is not a managed Graft view.\n  fix: use `graft materialize <state-ref>` to inspect .worktrees/<state-slug>/, or `graft promote` to write an explicit external target."
+                    "[E_OBSOLETE_CWD_VIEW] graft discard no longer writes cwd because cwd is not a managed Graft view.\n  fix: use `graft patch materialize <patch-id>` to inspect .worktrees/<state-slug>/, or `graft patch promote` to write an explicit external target."
                 )
             }
             Command::Incoming => incoming_command(store),
@@ -1748,7 +1383,7 @@ impl LocalCommandRouter<'_> {
             Command::Compose {
                 first,
                 second,
-                expected,
+                constraint_primitives,
                 validate,
             } => {
                 store.init_storage()?;
@@ -1768,7 +1403,7 @@ impl LocalCommandRouter<'_> {
                 let (candidate, evidence) = write_candidate_from_change(
                     store,
                     change,
-                    needs_revalidation_or(&config, expected)?,
+                    needs_revalidation_or(&config, constraint_primitives)?,
                     "composer",
                     Some(format!("compose {first} {second}")),
                     *validate,
@@ -1789,7 +1424,7 @@ impl LocalCommandRouter<'_> {
             Command::Migrate {
                 id,
                 onto,
-                expected,
+                constraint_primitives,
                 validate,
             } => {
                 store.init_storage()?;
@@ -1818,7 +1453,7 @@ impl LocalCommandRouter<'_> {
                 let (candidate, evidence) = write_candidate_from_change(
                     store,
                     migrated,
-                    needs_revalidation_or(&config, expected)?,
+                    needs_revalidation_or(&config, constraint_primitives)?,
                     "migrator",
                     Some(format!("migrate {id} onto {onto}")),
                     *validate,
@@ -1838,7 +1473,7 @@ impl LocalCommandRouter<'_> {
             }
             Command::Revert {
                 id,
-                expected,
+                constraint_primitives,
                 validate,
             } => {
                 store.init_storage()?;
@@ -1851,7 +1486,7 @@ impl LocalCommandRouter<'_> {
                 let (candidate, evidence) = write_candidate_from_change(
                     store,
                     change,
-                    needs_revalidation_or(&config, expected)?,
+                    needs_revalidation_or(&config, constraint_primitives)?,
                     "reverter",
                     Some(format!("revert {id}")),
                     *validate,
@@ -1878,33 +1513,11 @@ impl LocalCommandRouter<'_> {
             } => {
                 if *as_commit || ref_name.is_some() {
                     bail!(
-                        "[E_MATERIALIZE_STATE_ONLY] graft materialize only writes an isolated inspection state under .worktrees/; use `graft promote` for Git refs, branches, PRs, or releases"
+                        "[E_MATERIALIZE_STATE_ONLY] graft patch materialize only writes an isolated inspection state under .worktrees/; use `graft patch promote` for Git refs, branches, PRs, or releases"
                     );
                 }
                 let config = load_graft_config(store)?;
-                let resolved = resolve_state_ref(store, &config, id)?;
-                let destination = materialize_worktree_path(store, &resolved.state);
-                if !dry_run {
-                    store.materialize_tree_snapshot(&resolved.snapshot, &destination)?;
-                }
-                Ok(CommandEnvelope {
-                    message: Some(if *dry_run {
-                        format!(
-                            "materialization dry-run for {id}: resolved {}; would write state into {}",
-                            state_label(&resolved.state),
-                            destination.display()
-                        )
-                    } else {
-                        format!(
-                            "materialized {id}: resolved {} into {}",
-                            state_label(&resolved.state),
-                            destination.display()
-                        )
-                    }),
-                    registry_changed: false,
-                    git_changed: false,
-                    ..CommandEnvelope::ok()
-                })
+                materialize_state(store, &config, id, *dry_run)
             }
             Command::Promote {
                 id,
@@ -1928,15 +1541,14 @@ impl LocalCommandRouter<'_> {
                 let evidence = store.registry_evidence_for_subject(id)?;
                 let config = load_graft_config(store)?;
                 ensure_change_integrity(store, &config, &patch.application)?;
-                let requirement_plan = promotion_requirement_plan(&config, required)?;
-                let mut required_properties = requirement_plan.properties.clone();
                 let configured_target = config.promote_targets.get(to);
-                if let Some(target) = configured_target {
-                    required_properties.extend(crate::requirements::scoped_properties_from_map(
-                        &config,
-                        &target.required_properties,
-                    )?);
-                }
+                let requirement_plan = promotion_requirement_plan_with_target(
+                    &config,
+                    required,
+                    configured_target.map(|target| &target.required_properties),
+                )?;
+                let required_constraint = requirement_plan.constraint.clone();
+                let required_properties = requirement_plan.properties.clone();
                 if *yes {
                     let current_evidence = evidence_for_current_verifiers(
                         &config,
@@ -1944,7 +1556,7 @@ impl LocalCommandRouter<'_> {
                         &evidence,
                         id,
                     )?;
-                    require_passed_scoped_evidence(&required_properties, &current_evidence, id)?;
+                    graft_policy::satisfies_subject(id, &required_constraint, &current_evidence)?;
                     let git = GixBackend;
                     if let Some(target_config) = configured_target {
                         let snapshot = target_snapshot_for_patch(store, &config, &patch)?;
@@ -1957,7 +1569,7 @@ impl LocalCommandRouter<'_> {
                             &target_path,
                             &snapshot,
                             store.paths().object_blobs(),
-                            &format!("graft promote {id} to {to}"),
+                            &format!("graft patch promote {id} to {to}"),
                             None,
                         )?;
                         let promoted_ref =
@@ -2005,7 +1617,8 @@ impl LocalCommandRouter<'_> {
                             &head_branch,
                             to,
                             title.as_deref().unwrap_or(&format!("Graft {id}")),
-                            body.as_deref().unwrap_or("Created by graft promote --pr"),
+                            body.as_deref()
+                                .unwrap_or("Created by graft patch promote --pr"),
                         )?;
                         (
                             format!("opened pull request {}", pr.url),
@@ -2155,8 +1768,8 @@ impl LocalCommandRouter<'_> {
                         let evidence = store.cached_evidence_for_subject(candidate.id.as_str())?;
                         if let Some((property, config)) = property_filter.as_ref() {
                             let mut matched = false;
-                            for expr in &candidate.expected {
-                                if property_matches_request(config, &expr.property, property)? {
+                            for expr in constraint_primitives(&candidate.constraint) {
+                                if property_matches_request(config, &expr, property)? {
                                     matched = true;
                                     break;
                                 }
@@ -2296,7 +1909,7 @@ fn clone_command(remote: &Path, dir: &Path) -> Result<CommandEnvelope> {
     write_default_sync_remote(&store, &remote)?;
     Ok(CommandEnvelope {
         message: Some(format!(
-            "cloned {} into {}; fetched {} files; cwd left empty; run graft incoming or graft materialize <patch>",
+            "cloned {} into {}; fetched {} files; cwd left empty; run graft patch incoming or graft patch materialize <patch>",
             remote.display(),
             dir.display(),
             report.fetched
@@ -2367,41 +1980,6 @@ fn normalize_sync_remote_path_from(base: &Path, remote: &Path) -> PathBuf {
     normalize_workspace_path(&remote)
 }
 
-fn daemon_argv_with_workspace_root(workspace_root: &Path) -> Vec<String> {
-    let mut raw = std::env::args()
-        .map(|arg| {
-            if arg.is_empty() {
-                "graft".to_string()
-            } else {
-                arg
-            }
-        })
-        .collect::<Vec<_>>();
-    if raw.is_empty() {
-        raw.push("graft".to_string());
-    }
-
-    let mut normalized = Vec::with_capacity(raw.len() + 2);
-    normalized.push(raw[0].clone());
-    let mut index = 1;
-    while index < raw.len() {
-        let arg = &raw[index];
-        if arg == "--cwd" {
-            index += 2;
-            continue;
-        }
-        if arg.starts_with("--cwd=") {
-            index += 1;
-            continue;
-        }
-        normalized.push(arg.clone());
-        index += 1;
-    }
-    normalized.insert(1, workspace_root.display().to_string());
-    normalized.insert(1, "--cwd".to_string());
-    normalized
-}
-
 pub(crate) fn ensure_workspace_initialized(store: &GraftStore) -> Result<()> {
     if store.is_initialized() {
         return Ok(());
@@ -2410,260 +1988,6 @@ pub(crate) fn ensure_workspace_initialized(store: &GraftStore) -> Result<()> {
         "[E_NO_CONFIG] graft.toml not found at {} — this directory is not a graft workspace.\n  fix: run `graft init` here, repair the registry route, or set GRAFT_WORKSPACE",
         store.paths().config().display(),
     );
-}
-
-#[derive(Clone, Debug)]
-struct ResolvedState {
-    input: String,
-    state: StateId,
-    snapshot: TreeSnapshot,
-}
-
-fn resolve_state_ref(
-    store: &GraftStore,
-    config: &GraftConfig,
-    reference: &str,
-) -> Result<ResolvedState> {
-    let state = resolve_base_state(store, config, reference)
-        .with_context(|| format!("resolve state ref `{reference}`"))?;
-    let snapshot = materialized_snapshot_for_state(store, config, &state)
-        .with_context(|| format!("materialize snapshot for state `{}`", state_label(&state)))?;
-    Ok(ResolvedState {
-        input: reference.to_string(),
-        state,
-        snapshot,
-    })
-}
-
-fn object_diff_summary(store: &GraftStore, from: &str, to: &str) -> Result<String> {
-    let config = load_graft_config(store)?;
-    let from_state = resolve_state_ref(store, &config, from)?;
-    let to_state = resolve_state_ref(store, &config, to)?;
-    let change = Change::from_snapshots(
-        from_state.state.clone(),
-        Some(&from_state.snapshot),
-        to_state.state.clone(),
-        &to_state.snapshot,
-    );
-    let summary = change.summary();
-    let mut lines = vec![format!(
-        "diff {} ({}) -> {} ({}): +{} ~{} -{}",
-        from_state.input,
-        state_label(&from_state.state),
-        to_state.input,
-        state_label(&to_state.state),
-        summary.added,
-        summary.modified,
-        summary.deleted
-    )];
-    if summary.added == 0 && summary.modified == 0 && summary.deleted == 0 {
-        lines.push("clean".to_string());
-    }
-    for file in change.endpoint_diff() {
-        lines.push(format!("{}\t{}", file_change_symbol(file.kind), file.path));
-    }
-    Ok(lines.join("\n"))
-}
-
-fn run_in_state(
-    store: &GraftStore,
-    config: &GraftConfig,
-    state_ref: &str,
-    cwd: Option<&Path>,
-    command: &[String],
-) -> Result<CommandEnvelope> {
-    let command = normalized_run_command(command)?;
-    let resolved = resolve_state_ref(store, config, state_ref)?;
-    let state_root = run_state_temp_root(store, &resolved.state)?;
-    let run_cwd_rel = normalize_run_cwd(cwd)?;
-    let run_cwd = state_root.join(&run_cwd_rel);
-    store.materialize_tree_snapshot(&resolved.snapshot, &state_root)?;
-    if !run_cwd.is_dir() {
-        let _ = fs::remove_dir_all(&state_root);
-        bail!(
-            "[E_RUN_CWD_NOT_FOUND] --cwd {} is not a directory inside materialized state {}",
-            run_cwd_display(&run_cwd_rel),
-            state_label(&resolved.state)
-        );
-    }
-    let output = match ProcessCommand::new(&command[0])
-        .args(&command[1..])
-        .current_dir(&run_cwd)
-        .output()
-    {
-        Ok(output) => output,
-        Err(error) => {
-            let _ = fs::remove_dir_all(&state_root);
-            return Err(error)
-                .with_context(|| format!("run `{}` in {}", command.join(" "), run_cwd.display()));
-        }
-    };
-    let _ = fs::remove_dir_all(&state_root);
-    Ok(CommandEnvelope {
-        view: Some(CommandView::Run(RunView {
-            state_ref: state_ref.to_string(),
-            resolved_state: state_label(&resolved.state),
-            cwd: run_cwd_display(&run_cwd_rel),
-            command,
-            exit_code: output.status.code().unwrap_or(-1),
-            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-        })),
-        ..CommandEnvelope::ok()
-    })
-}
-
-fn normalized_run_command(command: &[String]) -> Result<Vec<String>> {
-    let command = if command.first().is_some_and(|arg| arg == "--") {
-        &command[1..]
-    } else {
-        command
-    };
-    if command.is_empty() {
-        bail!("[E_RUN_COMMAND_REQUIRED] graft run requires a command after --");
-    }
-    Ok(command.to_vec())
-}
-
-fn normalize_run_cwd(cwd: Option<&Path>) -> Result<PathBuf> {
-    let Some(cwd) = cwd else {
-        return Ok(PathBuf::new());
-    };
-    if cwd.as_os_str().is_empty() {
-        bail!("[E_RUN_CWD_EMPTY] --cwd must not be empty");
-    }
-    if cwd.is_absolute() {
-        bail!("[E_RUN_CWD_OUTSIDE_STATE] --cwd must be relative to the materialized state root");
-    }
-    let mut normalized = PathBuf::new();
-    for component in cwd.components() {
-        match component {
-            Component::CurDir => {}
-            Component::Normal(value) => normalized.push(value),
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                bail!(
-                    "[E_RUN_CWD_OUTSIDE_STATE] --cwd {} escapes the materialized state root",
-                    cwd.display()
-                );
-            }
-        }
-    }
-    Ok(normalized)
-}
-
-fn run_cwd_display(path: &Path) -> String {
-    if path.as_os_str().is_empty() {
-        ".".to_string()
-    } else {
-        path.display().to_string()
-    }
-}
-
-fn run_state_temp_root(store: &GraftStore, state: &StateId) -> Result<PathBuf> {
-    let parent = store.paths().cache_tmp();
-    fs::create_dir_all(&parent)?;
-    let slug = filesystem_safe_state_slug(state);
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    for attempt in 0..100 {
-        let path = parent.join(format!("run-{slug}-{}-{attempt}", now));
-        if !path.exists() {
-            return Ok(path);
-        }
-    }
-    bail!(
-        "[E_RUN_TEMP_UNAVAILABLE] could not allocate temporary state directory under {}",
-        parent.display()
-    )
-}
-
-fn file_change_symbol(kind: FileChangeKind) -> &'static str {
-    match kind {
-        FileChangeKind::Added | FileChangeKind::Captured => "A",
-        FileChangeKind::Modified => "M",
-        FileChangeKind::Deleted => "D",
-        FileChangeKind::Unchanged => "=",
-    }
-}
-
-fn target_snapshot_for_patch(
-    store: &GraftStore,
-    config: &GraftConfig,
-    patch: &PatchRecord,
-) -> Result<graft_core::TreeSnapshot> {
-    let target_state = store
-        .resolve_application(&patch.application)?
-        .record
-        .target_state;
-    materialized_snapshot_for_state(store, config, &target_state).with_context(|| {
-        format!(
-            "materialize patch {} target state {}",
-            patch.id,
-            state_label(&target_state)
-        )
-    })
-}
-
-fn ensure_materialized_commit(
-    git: &GixBackend,
-    store: &GraftStore,
-    config: &GraftConfig,
-    cwd: &Path,
-    patch: &PatchRecord,
-    id: &str,
-) -> Result<String> {
-    let graft_ref = materialize_ref_name(id, None);
-    match git.try_resolve_ref(cwd, &graft_ref)? {
-        Some(commit_id) => Ok(commit_id),
-        None => {
-            let snapshot = target_snapshot_for_patch(store, config, patch)?;
-            Ok(git
-                .materialize_commit(
-                    cwd,
-                    &snapshot,
-                    store.paths().object_blobs(),
-                    &format!("graft promote {id}"),
-                    Some(&graft_ref),
-                )?
-                .commit_id)
-        }
-    }
-}
-
-fn promote_next_action(id: &str, to: &str, pr: bool, release: Option<&str>) -> NextAction {
-    let label = if pr {
-        format!("graft promote {id} --to {to} --pr --yes")
-    } else if let Some(tag) = release {
-        format!("graft promote {id} --to {to} --release {tag} --yes")
-    } else {
-        format!("graft promote {id} --to {to} --yes")
-    };
-    NextAction::new(
-        "promote.apply",
-        label,
-        graft_explain::NextActionKind::Dangerous,
-        "applying the promotion will mutate a real Git ref / PR / release",
-    )
-}
-
-fn materialize_ref_name(patch_id: &str, requested: Option<&str>) -> String {
-    match requested {
-        Some(name) if name.starts_with("refs/") => name.to_string(),
-        Some(name) => format!(
-            "refs/graft/patches/{}",
-            git_ref_component_for_patch_id(name)
-        ),
-        None => format!(
-            "refs/graft/patches/{}",
-            git_ref_component_for_patch_id(patch_id)
-        ),
-    }
-}
-
-fn git_ref_component_for_patch_id(id: &str) -> &str {
-    id.strip_prefix("patch:").unwrap_or(id)
 }
 
 fn property_id_matches(
@@ -2823,29 +2147,29 @@ fn build_concept_catalog(cwd: &Path) -> Vec<graft_explain::explain::ConceptDoc> 
     out
 }
 
-fn property_labels_or_core_only(properties: &[ScopedPropertyRef]) -> String {
+fn property_labels_or_core_only(properties: &[PropertyRef]) -> String {
     if properties.is_empty() {
         "none (core integrity only)".to_string()
     } else {
         properties
             .iter()
-            .map(scoped_property_label)
+            .map(property_label)
             .collect::<Vec<_>>()
             .join(", ")
     }
 }
 
-fn require_passed_scoped_evidence(
-    required: &[ScopedPropertyRef],
+#[cfg(test)]
+fn require_passed_evidence(
+    required: &[PropertyRef],
     evidence: &[EvidenceRecord],
     subject: &str,
 ) -> Result<()> {
     for property in required {
-        let evidence_subject = property.evidence_subject(subject);
-        let mut matching = evidence.iter().filter(|record| {
-            record.subject == evidence_subject && record.property == property.property.id
-        });
-        let label = property.label();
+        let mut matching = evidence
+            .iter()
+            .filter(|record| record.subject == subject && record.property == property.id);
+        let label = property_label(property);
         let Some(first) = matching.next() else {
             bail!(
                 "{}",
@@ -2977,7 +2301,7 @@ fn incoming_command(store: &GraftStore) -> Result<CommandEnvelope> {
             .unwrap_or(StateId::GraftTree("application:missing".to_string()));
         (
             state_label(&base_state),
-            patch.admitted_at.clone(),
+            patch.provenance.created_at.clone(),
             patch.id.to_string(),
         )
     });
@@ -3015,11 +2339,11 @@ fn incoming_command(store: &GraftStore) -> Result<CommandEnvelope> {
                 evidence_refs.len()
             )
         };
-        let properties = if patch.properties.is_empty() {
+        let patch_properties = constraint_primitives(&patch.constraint);
+        let properties = if patch_properties.is_empty() {
             "(no properties)".to_string()
         } else {
-            patch
-                .properties
+            patch_properties
                 .iter()
                 .map(property_label)
                 .collect::<Vec<_>>()
@@ -3060,8 +2384,8 @@ fn search_patches(
         let mut filtered = Vec::new();
         for patch in patches {
             let mut matched = false;
-            for expr in &patch.properties {
-                if property_matches_request(&config, expr, property)? {
+            for expr in constraint_primitives(&patch.constraint) {
+                if property_matches_request(&config, &expr, property)? {
                     matched = true;
                     break;
                 }
@@ -3085,15 +2409,14 @@ fn search_patches(
     }
     if let Some(property) = has_evidence {
         let config = load_graft_config(store)?;
-        let property = resolve_scoped_property_ref(&config, property)?;
+        let property = resolve_property_ref(&config, property)?;
         let mut filtered = Vec::new();
         for patch in patches {
             let evidence = store.registry_evidence_for_subject(patch.id.as_str())?;
-            let evidence_subject = property.evidence_subject(patch.id.as_str());
             let mut matched = false;
             for record in &evidence {
-                if record.subject == evidence_subject
-                    && record.property == property.property.id
+                if record.subject == patch.id.as_str()
+                    && record.property == property.id
                     && record.result.satisfies_requirement()
                 {
                     matched = true;
@@ -3120,23 +2443,23 @@ fn resolved_application(
     store.resolve_application(application).map_err(Into::into)
 }
 
-fn ensure_candidate_expected_properties_current(
+fn ensure_candidate_constraint_current(
     config: &GraftConfig,
     candidate: &GraftCandidate,
 ) -> Result<()> {
-    for expected in &candidate.expected {
-        let Some(current) = config.properties.get(&expected.property.name) else {
+    for primitive in constraint_primitives(&candidate.constraint) {
+        let Some(current) = config.properties.get(&primitive.name) else {
             bail!(
-                "[E_PROPERTY_DRIFT] candidate expected property `{}` no longer exists in properties.roto",
-                expected.label()
+                "[E_PROPERTY_DRIFT] candidate constraint primitive `{}` no longer exists in properties.roto",
+                property_label(&primitive)
             );
         };
         let current_id = current.property_id()?;
-        if current_id != expected.property.id {
+        if current_id != primitive.id {
             bail!(
-                "[E_PROPERTY_DRIFT] candidate expected property `{}` drifted: candidate has {}, current property resolves to {}",
-                expected.label(),
-                expected.property.id,
+                "[E_PROPERTY_DRIFT] candidate constraint primitive `{}` drifted: candidate has {}, current property resolves to {}",
+                property_label(&primitive),
+                primitive.id,
                 current_id
             );
         }
@@ -3147,7 +2470,7 @@ fn ensure_candidate_expected_properties_current(
 fn write_candidate_from_change(
     store: &GraftStore,
     change: Change,
-    expected: Vec<ScopedPropertyRef>,
+    constraint_primitives: Vec<PropertyRef>,
     producer: &str,
     message: Option<String>,
     validate: bool,
@@ -3158,7 +2481,7 @@ fn write_candidate_from_change(
     let mut candidate = GraftCandidate {
         id: graft_core::CandidateId::new("candidate:pending"),
         application,
-        expected,
+        constraint: constraint_from_properties(&constraint_primitives),
         provenance: Provenance::now(producer, message),
     };
     candidate.id = candidate_id(&candidate)?;
@@ -3409,195 +2732,6 @@ fn record_ref_kind(id: &str) -> Result<RecordRefKind> {
     )
 }
 
-fn summarize_candidate(store: &GraftStore, candidate: &GraftCandidate) -> Result<CandidateSummary> {
-    let evidence = store.cached_evidence_for_subject(candidate.id.as_str())?;
-    summarize_candidate_with_evidence(store, candidate, &evidence)
-}
-
-fn summarize_candidate_with_evidence(
-    store: &GraftStore,
-    candidate: &GraftCandidate,
-    evidence: &[EvidenceRecord],
-) -> Result<CandidateSummary> {
-    let resolved = resolved_application(store, &candidate.application)?;
-    Ok(CandidateSummary {
-        id: candidate.id.to_string(),
-        base_state: state_label(&resolved.record.base_state),
-        target_state: state_label(&resolved.record.target_state),
-        expected: candidate
-            .expected
-            .iter()
-            .map(scoped_property_label)
-            .collect(),
-        producer: candidate.provenance.producer.clone(),
-        message: candidate.provenance.message.clone(),
-        created_at: candidate.provenance.created_at.clone(),
-        evidence: EvidenceCounts::from_records(evidence),
-        change: change_view_for_application(store, &candidate.application)?,
-    })
-}
-
-fn summarize_patch_with_evidence(
-    store: &GraftStore,
-    patch: &PatchRecord,
-    evidence: &[EvidenceRecord],
-) -> Result<PatchSummary> {
-    let resolved = resolved_application(store, &patch.application)?;
-    Ok(PatchSummary {
-        id: patch.id.to_string(),
-        base_state: state_label(&resolved.record.base_state),
-        target_state: state_label(&resolved.record.target_state),
-        properties: patch.properties.iter().map(property_label).collect(),
-        producer: patch.provenance.producer.clone(),
-        message: patch.provenance.message.clone(),
-        admitted_at: patch.admitted_at.clone(),
-        evidence: EvidenceCounts::from_records(evidence),
-        change: change_view_for_application(store, &patch.application)?,
-    })
-}
-
-fn promotion_view(promotion: &PromotionRecord) -> PromotionView {
-    PromotionView {
-        id: promotion.id.to_string(),
-        patch_id: promotion.patch_id.to_string(),
-        target: promotion.target.clone(),
-        dry_run: promotion.dry_run,
-        status: promotion.status.clone(),
-        promoted_at: promotion.promoted_at.clone(),
-    }
-}
-
-fn change_view_for_application(
-    store: &GraftStore,
-    application: &ApplicationRef,
-) -> Result<Option<ChangeView>> {
-    let resolved = resolved_application(store, application)?;
-    let summary = resolved.change.summary();
-    Ok(Some(ChangeView {
-        id: Some(resolved.record.change.to_string()),
-        description: None,
-        files: summary.files,
-        added: summary.added,
-        modified: summary.modified,
-        deleted: summary.deleted,
-        unchanged: summary.unchanged,
-        captured: summary.captured,
-        target_bytes: summary.target_bytes,
-        sample_paths: resolved
-            .change
-            .changed_paths()
-            .into_iter()
-            .take(8)
-            .collect(),
-    }))
-}
-
-fn evidence_view(record: &EvidenceRecord) -> EvidenceView {
-    EvidenceView {
-        id: record.id.to_string(),
-        subject: record.subject.clone(),
-        property: record.property.to_string(),
-        verifier: record.verifier.clone(),
-        result: result_label(&record.result),
-        created_at: record.created_at.clone(),
-    }
-}
-
-fn result_label(result: &EvidenceResult) -> String {
-    match result {
-        EvidenceResult::Passed => "passed".to_string(),
-        EvidenceResult::Failed { reason } => format!("failed: {reason}"),
-        EvidenceResult::Unknown { reason } => format!("unknown: {reason}"),
-        EvidenceResult::Skipped { reason } => format!("skipped: {reason}"),
-    }
-}
-
-fn state_label(state: &StateId) -> String {
-    match state {
-        StateId::GitTree(value) => format!("git-tree:{value}"),
-        StateId::RepoTree(repo) => repo.display_ref(),
-        StateId::GraftTree(value) => format!("graft-tree:{value}"),
-    }
-}
-
-fn next_search_actions(patch: &PatchRecord) -> Vec<NextAction> {
-    next_actions_for_patch(patch, false, false)
-}
-
-fn next_actions_for_patch(
-    patch: &PatchRecord,
-    materialized: bool,
-    promoted: bool,
-) -> Vec<NextAction> {
-    let ctx = graft_explain::next_actions::PatchContext {
-        id: patch.id.to_string(),
-        properties: patch.properties.iter().map(property_label).collect(),
-        materialized,
-        promoted,
-    };
-    graft_explain::next_actions::next_actions_patch(&ctx)
-}
-
-fn next_actions_for_candidate(
-    candidate: &GraftCandidate,
-    evidence: &[EvidenceRecord],
-) -> Vec<NextAction> {
-    let counts = view::EvidenceCounts::from_records(evidence);
-    let ctx = graft_explain::next_actions::CandidateContext {
-        id: candidate.id.to_string(),
-        passed: counts.passed,
-        failed: counts.failed,
-        unknown: counts.unknown,
-        skipped: counts.skipped,
-        expected_properties: candidate
-            .expected
-            .iter()
-            .map(scoped_property_label)
-            .collect(),
-    };
-    graft_explain::next_actions::next_actions(&ctx)
-}
-
-fn materialize_worktree_path(store: &GraftStore, state: &StateId) -> PathBuf {
-    store
-        .paths()
-        .workspace_worktrees()
-        .join(filesystem_safe_state_slug(state))
-}
-
-fn filesystem_safe_state_slug(state: &StateId) -> String {
-    state_label(state)
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
-fn validate_promote_ref_args(
-    to: &str,
-    branch: Option<&str>,
-    release: Option<&str>,
-    head: Option<&str>,
-) -> Result<()> {
-    validate_optional_cli_ref_arg("--to", Some(to))?;
-    validate_optional_cli_ref_arg("--branch", branch)?;
-    validate_optional_cli_ref_arg("--release", release)?;
-    validate_optional_cli_ref_arg("--head", head)?;
-    Ok(())
-}
-
-fn validate_optional_cli_ref_arg(label: &str, value: Option<&str>) -> Result<()> {
-    if value.is_some_and(|value| value.trim().is_empty()) {
-        bail!("{label} must not be empty");
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3606,7 +2740,7 @@ mod tests {
         daemon_socket_run_dir, git_origin_url, git_origin_url_from_stdout, repo_id_for_url,
     };
     use clap::CommandFactory;
-    use graft_core::{PropertyRef, PropertyScope};
+    use graft_core::{Constraint, PropertyRef};
     use std::ffi::OsString;
     use std::sync::{Mutex, MutexGuard, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -3669,6 +2803,19 @@ mod tests {
         write_test_application(store, base_state, Some(base_snapshot), target_snapshot)
     }
 
+    fn corrupt_application_action_body(store: &GraftStore, application: &ApplicationRef) {
+        let ApplicationRef::Stored(application_id) = application;
+        let record = store.read_application(application_id.as_str()).unwrap();
+        fs::write(
+            store
+                .paths()
+                .object_actions()
+                .join(format!("{}.json", record.action)),
+            serde_json::to_vec(&graft_core::Action::Sequence { steps: Vec::new() }).unwrap(),
+        )
+        .unwrap();
+    }
+
     fn error_chain_text(error: anyhow::Error) -> String {
         error
             .chain()
@@ -3693,35 +2840,38 @@ mod tests {
         })
     }
 
-    fn scoped_test_property(name: &str) -> ScopedPropertyRef {
-        ScopedPropertyRef::new(
-            PropertyScope::Workspace,
-            PropertyRef::new(PropertyId::new(format!("property:{name}")), name),
-        )
+    fn test_property(name: &str) -> PropertyRef {
+        PropertyRef::new(PropertyId::new(format!("property:{name}")), name)
+    }
+
+    fn empty_admission() -> AdmissionSummary {
+        AdmissionSummary {
+            constraint: Constraint::Top,
+        }
     }
 
     #[test]
-    fn require_passed_scoped_evidence_reports_admission_diagnostics() {
-        let property = scoped_test_property("policy");
+    fn require_passed_evidence_reports_admission_diagnostics() {
+        let property = test_property("policy");
         let missing =
-            require_passed_scoped_evidence(std::slice::from_ref(&property), &[], "candidate:demo")
+            require_passed_evidence(std::slice::from_ref(&property), &[], "candidate:demo")
                 .unwrap_err()
                 .to_string();
         assert!(missing.starts_with("[A001]"), "{missing}");
-        assert!(missing.contains("workspace:policy"), "{missing}");
+        assert!(missing.contains("policy"), "{missing}");
 
         let failed = EvidenceRecord::failed(
-            property.evidence_subject("candidate:demo"),
-            property.property.id.clone(),
+            "candidate:demo",
+            property.id.clone(),
             "test",
             "policy failed",
         )
         .unwrap();
-        let failed_error = require_passed_scoped_evidence(&[property], &[failed], "candidate:demo")
+        let failed_error = require_passed_evidence(&[property], &[failed], "candidate:demo")
             .unwrap_err()
             .to_string();
         assert!(failed_error.starts_with("[A002]"), "{failed_error}");
-        assert!(failed_error.contains("workspace:policy"), "{failed_error}");
+        assert!(failed_error.contains("policy"), "{failed_error}");
     }
 
     #[test]
@@ -3757,6 +2907,8 @@ mod tests {
             "cache",
             "verify-pending",
             "discard",
+            "materialize",
+            "promote",
         ] {
             assert!(
                 !help_has_command_row(&help, hidden),
@@ -3886,6 +3038,18 @@ mod tests {
             Command::Registry {
                 command: RegistryCommand::Export { .. }
             }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["graft", "materialize", "patch:abc"])
+                .unwrap()
+                .command,
+            Command::Materialize { .. }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["graft", "promote", "patch:abc", "--to", "main"])
+                .unwrap()
+                .command,
+            Command::Promote { .. }
         ));
         assert!(matches!(
             Cli::try_parse_from(["graft", "explain", "agent-workflow"])
@@ -4479,9 +3643,9 @@ mod tests {
         let patch = PatchRecord {
             id: graft_core::PatchId::new("patch:admitted"),
             application: patch_application,
-            properties: Vec::new(),
+            constraint: Constraint::Top,
             provenance: Provenance::now("patch-producer", None),
-            admitted_at: "now".to_string(),
+            admission: empty_admission(),
         };
         store.write_patch(&patch).unwrap();
         let candidate_target = TreeSnapshot::new(vec![TreeEntry {
@@ -4499,7 +3663,7 @@ mod tests {
         let candidate = GraftCandidate {
             id: graft_core::CandidateId::new("candidate:queued"),
             application: candidate_application,
-            expected: Vec::new(),
+            constraint: Constraint::Top,
             provenance: Provenance::now("candidate-producer", None),
         };
         store.write_candidate(&candidate).unwrap();
@@ -4573,6 +3737,7 @@ mod tests {
         let import = run_local(&Cli {
             command: Command::Bundle {
                 command: RegistryCommand::Import {
+                    upgrade_from_v1: false,
                     path: bundle.clone(),
                 },
             },
@@ -4612,6 +3777,22 @@ mod tests {
         assert!(!config.properties.contains_key("Missing"));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bundle_import_help_documents_v1_upgrade_flag() {
+        let mut command = <RegistryCommand as clap::Subcommand>::augment_subcommands(
+            clap::Command::new("bundle"),
+        );
+        let help = command
+            .find_subcommand_mut("import")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+
+        assert!(help.contains("--upgrade-from-v1"), "{help}");
+        assert!(help.contains("legacy v1"), "{help}");
+        assert!(help.contains("v2 constraints"), "{help}");
     }
 
     #[test]
@@ -4856,13 +4037,15 @@ mod tests {
         let patch = PatchRecord {
             id: graft_core::PatchId::new("patch:registryexport"),
             application,
-            properties: vec![property.clone()],
+            constraint: Constraint::primitive(property.clone()),
             provenance: Provenance {
                 producer: "test".to_string(),
                 message: None,
                 created_at: "now".to_string(),
             },
-            admitted_at: "now".to_string(),
+            admission: AdmissionSummary {
+                constraint: Constraint::primitive(property.clone()),
+            },
         };
         source_store.write_patch(&patch).unwrap();
         let evidence =
@@ -4890,6 +4073,7 @@ mod tests {
         run_local(&Cli {
             command: Command::Registry {
                 command: RegistryCommand::Import {
+                    upgrade_from_v1: false,
                     path: bundle.clone(),
                 },
             },
@@ -4934,6 +4118,7 @@ mod tests {
         let error = run_local(&Cli {
             command: Command::Registry {
                 command: RegistryCommand::Import {
+                    upgrade_from_v1: false,
                     path: bundle.clone(),
                 },
             },
@@ -4968,6 +4153,7 @@ mod tests {
         let error = run_local(&Cli {
             command: Command::Registry {
                 command: RegistryCommand::Import {
+                    upgrade_from_v1: false,
                     path: bundle.clone(),
                 },
             },
@@ -4978,6 +4164,103 @@ mod tests {
         .to_string();
 
         assert!(error.contains("unknown field `surprise`"), "{error}");
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn registry_import_rejects_v1_patch_bundle_without_upgrade_flag() {
+        let _lock = env_lock();
+        let dir = test_workspace("graft-cli-registry-import-v1-reject-test");
+        let home = test_workspace("graft-cli-registry-import-v1-reject-home");
+        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        let _guard = EnvGuard::set("GRAFT_HOME", &home);
+        let store = GraftStore::open(&dir);
+        run_init_command(&store, false).unwrap();
+        let bundle = dir.join("legacy-registry.json");
+        fs::write(
+            &bundle,
+            include_str!("../tests/fixtures/legacy-v1-registry-bundle.json")
+                .replace("APPLICATION_ID", "application:demo"),
+        )
+        .unwrap();
+
+        let error = run_local(&Cli {
+            command: Command::Registry {
+                command: RegistryCommand::Import {
+                    upgrade_from_v1: false,
+                    path: bundle.clone(),
+                },
+            },
+            json: false,
+            cwd: dir.clone(),
+        })
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("[E_UNSUPPORTED_STORE_SCHEMA]"), "{error}");
+        assert!(error.contains("--upgrade-from-v1"), "{error}");
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn registry_import_upgrades_v1_patch_properties_to_constraint() {
+        let _lock = env_lock();
+        let dir = test_workspace("graft-cli-registry-import-v1-upgrade-test");
+        let home = test_workspace("graft-cli-registry-import-v1-upgrade-home");
+        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        let _guard = EnvGuard::set("GRAFT_HOME", &home);
+        let store = GraftStore::open(&dir);
+        run_init_command(&store, false).unwrap();
+        let target_snapshot = TreeSnapshot::new(Vec::new());
+        store.write_tree_snapshot(&target_snapshot).unwrap();
+        let application = write_test_application(
+            &store,
+            StateId::GraftTree("tree:legacy-base".to_string()),
+            None,
+            &target_snapshot,
+        );
+        let ApplicationRef::Stored(application_id) = application;
+        let bundle = dir.join("legacy-registry.json");
+        fs::write(
+            &bundle,
+            include_str!("../tests/fixtures/legacy-v1-registry-bundle.json")
+                .replace("APPLICATION_ID", application_id.as_str()),
+        )
+        .unwrap();
+
+        let import = run_local(&Cli {
+            command: Command::Registry {
+                command: RegistryCommand::Import {
+                    upgrade_from_v1: true,
+                    path: bundle.clone(),
+                },
+            },
+            json: false,
+            cwd: dir.clone(),
+        })
+        .unwrap();
+
+        assert!(import.registry_changed);
+        assert_eq!(import.patch_ids.len(), 1);
+        assert_ne!(import.patch_ids[0], "patch:legacy");
+        let patch = store.read_patch(&import.patch_ids[0]).unwrap();
+        let property = PropertyRef::new(PropertyId::new("property:legacy"), "legacy_policy");
+        assert_eq!(patch.constraint, Constraint::primitive(property.clone()));
+        assert_eq!(patch.admission.constraint, Constraint::primitive(property));
+        let candidates = store.list_candidates().unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_ne!(candidates[0].id.as_str(), "candidate:legacy");
+        assert_eq!(
+            candidates[0].constraint,
+            Constraint::primitive(PropertyRef::new(
+                PropertyId::new("property:legacy-candidate"),
+                "legacy_candidate_policy",
+            ),)
+        );
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&home);
     }
@@ -4995,13 +4278,14 @@ mod tests {
         let bundle = dir.join("registry.json");
         fs::write(
             &bundle,
-            r#"{"patches":[{"id":"patch:demo","application":{"kind":"stored","value":"application:demo"},"properties":[],"provenance":{"producer":"test","message":null,"created_at":"now"},"admitted_at":"now","surprise":true}],"evidence":[],"relations":[],"promotions":[]}"#,
+            r#"{"patches":[{"id":"patch:demo","application":{"kind":"stored","value":"application:demo"},"constraint":{"kind":"top"},"provenance":{"producer":"test","message":null,"created_at":"now"},"admission":{"constraint":{"kind":"top"}},"surprise":true}],"evidence":[],"relations":[],"promotions":[]}"#,
         )
         .unwrap();
 
         let error = run_local(&Cli {
             command: Command::Registry {
                 command: RegistryCommand::Import {
+                    upgrade_from_v1: false,
                     path: bundle.clone(),
                 },
             },
@@ -5036,6 +4320,7 @@ mod tests {
         let error = run_local(&Cli {
             command: Command::Registry {
                 command: RegistryCommand::Import {
+                    upgrade_from_v1: false,
                     path: bundle.clone(),
                 },
             },
@@ -5070,7 +4355,7 @@ mod tests {
         let validate_error = run_local(&Cli {
             command: Command::Validate {
                 id: id.to_string(),
-                expected: Vec::new(),
+                constraint_primitives: Vec::new(),
             },
             json: false,
             cwd: dir.clone(),
@@ -5296,6 +4581,107 @@ mod tests {
     }
 
     #[test]
+    fn gc_retains_live_application_dependencies_and_collects_unreachable_objects() {
+        let _lock = env_lock();
+        let dir = test_workspace("graft-cli-gc-application-reachability-test");
+        let home = test_workspace("graft-cli-gc-application-reachability-home");
+        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        let _guard = EnvGuard::set("GRAFT_HOME", &home);
+        let store = GraftStore::open(&dir);
+        store.init().unwrap();
+
+        let live_snapshot = TreeSnapshot::new(vec![TreeEntry {
+            path: "live.txt".to_string(),
+            hash: store.write_blob(b"live\n").unwrap(),
+            size: 5,
+        }]);
+        let orphan_snapshot = TreeSnapshot::new(vec![TreeEntry {
+            path: "orphan.txt".to_string(),
+            hash: store.write_blob(b"orphan\n").unwrap(),
+            size: 7,
+        }]);
+        store.write_tree_snapshot(&live_snapshot).unwrap();
+        store.write_tree_snapshot(&orphan_snapshot).unwrap();
+        let live_application = write_test_application(
+            &store,
+            StateId::GraftTree("tree:base".to_string()),
+            None,
+            &live_snapshot,
+        );
+        let orphan_application = write_test_application(
+            &store,
+            StateId::GraftTree("tree:orphan-base".to_string()),
+            None,
+            &orphan_snapshot,
+        );
+        let live_resolved = store.resolve_application(&live_application).unwrap();
+        let orphan_resolved = store.resolve_application(&orphan_application).unwrap();
+        let ApplicationRef::Stored(live_application_id) = &live_application;
+        let ApplicationRef::Stored(orphan_application_id) = &orphan_application;
+        let candidate = GraftCandidate {
+            id: graft_core::CandidateId::new("candidate:live"),
+            application: live_application.clone(),
+            constraint: Constraint::Top,
+            provenance: Provenance::now("test", None),
+        };
+        store.write_candidate(&candidate).unwrap();
+
+        let dry_run = render_command_human(&run_gc(&store, false, false).unwrap());
+        assert!(dry_run.contains("  orphan_applications: 1"), "{dry_run}");
+        assert!(dry_run.contains("  orphan_actions: 1"), "{dry_run}");
+        assert!(dry_run.contains("  orphan_changes: 1"), "{dry_run}");
+
+        run_gc(&store, true, false).unwrap();
+
+        assert!(
+            store
+                .paths()
+                .object_applications()
+                .join(format!("{live_application_id}.json"))
+                .exists()
+        );
+        assert!(
+            store
+                .paths()
+                .object_actions()
+                .join(format!("{}.json", live_resolved.record.action))
+                .exists()
+        );
+        assert!(
+            store
+                .paths()
+                .object_changes()
+                .join(format!("{}.json", live_resolved.record.change))
+                .exists()
+        );
+        assert!(
+            !store
+                .paths()
+                .object_applications()
+                .join(format!("{orphan_application_id}.json"))
+                .exists()
+        );
+        assert!(
+            !store
+                .paths()
+                .object_actions()
+                .join(format!("{}.json", orphan_resolved.record.action))
+                .exists()
+        );
+        assert!(
+            !store
+                .paths()
+                .object_changes()
+                .join(format!("{}.json", orphan_resolved.record.change))
+                .exists()
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn gc_without_workspace_still_cleans_registry() {
         let _lock = env_lock();
         let cwd = test_workspace("graft-cli-gc-no-workspace-cwd");
@@ -5406,9 +4792,9 @@ mod tests {
         let patch = PatchRecord {
             id: graft_core::PatchId::new("patch:corrupt-index"),
             application,
-            properties: Vec::new(),
+            constraint: Constraint::Top,
             provenance: Provenance::now("test", None),
-            admitted_at: "now".to_string(),
+            admission: empty_admission(),
         };
         store.write_patch(&patch).unwrap();
         fs::create_dir_all(store.paths().object_patch_evidence_index()).unwrap();
@@ -5454,9 +4840,9 @@ mod tests {
         let patch = PatchRecord {
             id: graft_core::PatchId::new("patch:corrupt-incoming-index"),
             application,
-            properties: Vec::new(),
+            constraint: Constraint::Top,
             provenance: Provenance::now("test", None),
-            admitted_at: "now".to_string(),
+            admission: empty_admission(),
         };
         store.write_patch(&patch).unwrap();
         fs::create_dir_all(store.paths().object_patch_evidence_index()).unwrap();
@@ -5510,7 +4896,7 @@ mod tests {
             "id": "candidate:demo",
             "base_state": "tree:base",
             "target_state": "tree:target",
-            "expected": [],
+            "constraint": [],
             "producer": "test",
             "message": null,
             "created_at": "now",
@@ -5533,7 +4919,7 @@ mod tests {
         let mut result = serde_json::to_value(CommandEnvelope::ok()).unwrap();
         result["next_actions"] = serde_json::json!([{
             "id": "validate",
-            "label": "graft validate candidate:demo",
+            "label": "graft patch validate candidate:demo",
             "kind": "recommended",
             "why": "validate before admit",
             "surprise": true
@@ -6266,11 +5652,21 @@ fn v2_cli_check(app: Application) -> Property {
         [],
     )
 }
+
+fn v2_extra_cli_check(app: Application) -> Property {
+    property(
+        [app.changed_paths().any_match(["added.txt"]).success()],
+        "extra added.txt policy is touched",
+        Severity.Blocking,
+        [],
+    )
+}
 "#,
         )
         .unwrap();
         let defs = load_property_defs(&store).unwrap();
         let property = defs["v2_cli_check"].property_ref().unwrap();
+        let extra_property = defs["v2_extra_cli_check"].property_ref().unwrap();
         write_property_lock(&store, &defs).unwrap();
 
         let base_snapshot = TreeSnapshot::new(Vec::new());
@@ -6291,10 +5687,7 @@ fn v2_cli_check(app: Application) -> Property {
         let mut candidate = GraftCandidate {
             id: graft_core::CandidateId::new("candidate:pending"),
             application,
-            expected: vec![ScopedPropertyRef::new(
-                PropertyScope::Workspace,
-                property.clone(),
-            )],
+            constraint: Constraint::primitive(property.clone()),
             provenance: Provenance::now("test", None),
         };
         candidate.id = candidate_id(&candidate).unwrap();
@@ -6304,7 +5697,7 @@ fn v2_cli_check(app: Application) -> Property {
         let validate = run_local(&Cli {
             command: Command::Validate {
                 id: candidate_id.clone(),
-                expected: Vec::new(),
+                constraint_primitives: Vec::new(),
             },
             json: false,
             cwd: cwd.clone(),
@@ -6315,10 +5708,43 @@ fn v2_cli_check(app: Application) -> Property {
         assert_eq!(validate.evidence[0].result, "passed");
         assert!(validate.evidence[0].verifier.starts_with("v2-plan:"));
 
+        let missing_extra = run_local(&Cli {
+            command: Command::Admit {
+                id: candidate_id.clone(),
+                required: vec!["v2_extra_cli_check".to_string()],
+            },
+            json: false,
+            cwd: cwd.clone(),
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(missing_extra.starts_with("[A001]"), "{missing_extra}");
+        assert!(
+            missing_extra.contains("all_of/[1]/primitive v2_extra_cli_check"),
+            "{missing_extra}"
+        );
+
+        let validate_extra = run_local(&Cli {
+            command: Command::Validate {
+                id: candidate_id.clone(),
+                constraint_primitives: vec!["v2_extra_cli_check".to_string()],
+            },
+            json: false,
+            cwd: cwd.clone(),
+        })
+        .unwrap();
+        assert!(
+            validate_extra.evidence.iter().any(|evidence| {
+                evidence.property == extra_property.id.as_str() && evidence.result == "passed"
+            }),
+            "expected passing extra evidence: {:?}",
+            validate_extra.evidence
+        );
+
         let admit = run_local(&Cli {
             command: Command::Admit {
                 id: candidate_id.clone(),
-                required: Vec::new(),
+                required: vec!["v2_extra_cli_check".to_string()],
             },
             json: false,
             cwd: cwd.clone(),
@@ -6326,10 +5752,25 @@ fn v2_cli_check(app: Application) -> Property {
         .unwrap();
         let patch_id = admit.patch_id.unwrap();
         let patch = store.read_patch(&patch_id).unwrap();
-        assert_eq!(patch.properties, vec![property]);
+        assert_eq!(
+            constraint_primitives(&patch.constraint),
+            vec![property.clone(), extra_property.clone()]
+        );
         let promoted = store.registry_evidence_for_subject(&patch_id).unwrap();
-        assert_eq!(promoted.len(), 1);
-        assert!(matches!(promoted[0].result, EvidenceResult::Passed));
+        assert!(
+            promoted.iter().any(|evidence| {
+                evidence.property == property.id
+                    && matches!(evidence.result, EvidenceResult::Passed)
+            }),
+            "expected promoted primary evidence: {promoted:?}"
+        );
+        assert!(
+            promoted.iter().any(|evidence| {
+                evidence.property == extra_property.id
+                    && matches!(evidence.result, EvidenceResult::Passed)
+            }),
+            "expected promoted extra evidence: {promoted:?}"
+        );
         assert!(store.read_candidate(&candidate_id).is_err());
         let _ = fs::remove_dir_all(&cwd);
         let _ = fs::remove_dir_all(&home);
@@ -6370,9 +5811,9 @@ fn v2_cli_check(app: Application) -> Property {
         let patch = PatchRecord {
             id: graft_core::PatchId::new("patch:materialize-test"),
             application,
-            properties: Vec::new(),
+            constraint: Constraint::Top,
             provenance: Provenance::now("test", None),
-            admitted_at: "now".to_string(),
+            admission: empty_admission(),
         };
         store.write_patch(&patch).unwrap();
 
@@ -6413,6 +5854,95 @@ fn v2_cli_check(app: Application) -> Property {
     }
 
     #[test]
+    fn show_validate_and_materialize_surface_application_integrity_failures() {
+        let _lock = env_lock();
+        let cwd = test_workspace("graft-cli-application-integrity-failure-test");
+        let home = test_workspace("graft-cli-application-integrity-failure-home");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        let _guard = EnvGuard::set("GRAFT_HOME", &home);
+        let store = GraftStore::open(&cwd);
+        store.init().unwrap();
+        write_property_lock(&store, &std::collections::BTreeMap::new()).unwrap();
+        let target_snapshot = TreeSnapshot::new(vec![TreeEntry {
+            path: "bad.txt".to_string(),
+            hash: store.write_blob(b"bad\n").unwrap(),
+            size: 4,
+        }]);
+        store.write_tree_snapshot(&target_snapshot).unwrap();
+        let application = write_test_application(
+            &store,
+            StateId::GraftTree("tree:base".to_string()),
+            None,
+            &target_snapshot,
+        );
+        let candidate = GraftCandidate {
+            id: graft_core::CandidateId::new("candidate:integrity-failure"),
+            application: application.clone(),
+            constraint: Constraint::Top,
+            provenance: Provenance::now("test", None),
+        };
+        store.write_candidate(&candidate).unwrap();
+        let patch = PatchRecord {
+            id: graft_core::PatchId::new("patch:integrity-failure"),
+            application: application.clone(),
+            constraint: Constraint::Top,
+            provenance: Provenance::now("test", None),
+            admission: empty_admission(),
+        };
+        store.write_patch(&patch).unwrap();
+        corrupt_application_action_body(&store, &application);
+
+        let show_error = show_record(&store, candidate.id.as_str(), false, false)
+            .unwrap_err()
+            .to_string();
+        assert!(show_error.contains("[E_CHANGE_INTEGRITY]"), "{show_error}");
+        assert!(show_error.contains("action id"), "{show_error}");
+
+        let validate_error = run_local(&Cli {
+            command: Command::Validate {
+                id: candidate.id.to_string(),
+                constraint_primitives: Vec::new(),
+            },
+            json: false,
+            cwd: cwd.clone(),
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            validate_error.contains("[E_CHANGE_INTEGRITY]"),
+            "{validate_error}"
+        );
+        assert!(validate_error.contains("action id"), "{validate_error}");
+
+        let materialize_error = error_chain_text(
+            run_local(&Cli {
+                command: Command::Materialize {
+                    id: patch.id.to_string(),
+                    dry_run: true,
+                    discard: false,
+                    as_commit: false,
+                    ref_name: None,
+                },
+                json: false,
+                cwd: cwd.clone(),
+            })
+            .unwrap_err(),
+        );
+        assert!(
+            materialize_error.contains("[E_CHANGE_INTEGRITY]"),
+            "{materialize_error}"
+        );
+        assert!(
+            materialize_error.contains("action id"),
+            "{materialize_error}"
+        );
+
+        let _ = fs::remove_dir_all(&cwd);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn materialize_rejects_as_commit() {
         let _lock = env_lock();
         let cwd = test_workspace("graft-cli-materialize-commit-test");
@@ -6442,9 +5972,9 @@ fn v2_cli_check(app: Application) -> Property {
         let patch = PatchRecord {
             id: graft_core::PatchId::new("patch:materialize-commit-test"),
             application,
-            properties: Vec::new(),
+            constraint: Constraint::Top,
             provenance: Provenance::now("test", None),
-            admitted_at: "now".to_string(),
+            admission: empty_admission(),
         };
         store.write_patch(&patch).unwrap();
 
@@ -6518,9 +6048,9 @@ fn v2_cli_check(app: Application) -> Property {
         let patch = PatchRecord {
             id: graft_core::PatchId::new("patch:promote-cache-test"),
             application,
-            properties: Vec::new(),
+            constraint: Constraint::Top,
             provenance: Provenance::now("test", None),
-            admitted_at: "now".to_string(),
+            admission: empty_admission(),
         };
         store.write_patch(&patch).unwrap();
 
@@ -6601,9 +6131,9 @@ fn v2_cli_check(app: Application) -> Property {
         let patch = PatchRecord {
             id: graft_core::PatchId::new("patch:diff-test"),
             application,
-            properties: Vec::new(),
+            constraint: Constraint::Top,
             provenance: Provenance::now("test", None),
-            admitted_at: "now".to_string(),
+            admission: empty_admission(),
         };
         store.write_patch(&patch).unwrap();
 

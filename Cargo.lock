@@ -1686,7 +1686,6 @@ version = "0.1.0"
 dependencies = [
  "gix",
  "graft-core",
- "graft-store",
  "serde",
  "serde_json",
  "thiserror",
@@ -1698,6 +1697,7 @@ name = "graft-validate"
 version = "0.1.0"
 dependencies = [
  "graft-core",
+ "graft-policy",
  "roto",
  "thiserror",
 ]

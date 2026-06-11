@@ -23,11 +23,11 @@ echo "smoke" > hello.txt
 scratch_out=$("$GRAFT_BIN" scratch write --base graft:empty hello.txt --content $'smoke\n')
 scratch=$(grep -oE 'scratch:[0-9a-f]+' <<<"$scratch_out" | tail -n1)
 [[ -n $scratch ]] || { echo "FAIL: no scratch id captured"; echo "$scratch_out"; exit 1; }
-candidate_out=$("$GRAFT_BIN" candidate from-scratch "$scratch" --message t5-smoke)
-candidate=$(grep -oE 'candidate:[0-9a-f]+' <<<"$candidate_out" | head -n1)
+candidate_out=$("$GRAFT_BIN" patch from-scratch "$scratch" --message t5-smoke)
+candidate=$(first_graft_id candidate "$candidate_out")
 [[ -n $candidate ]] || { echo "FAIL: no candidate id captured"; echo "$candidate_out"; exit 1; }
 
-out=$("$GRAFT_BIN" validate "$candidate")
+out=$("$GRAFT_BIN" patch validate "$candidate")
 
 # 1) human output must end with a Hole Report block (header `next:` + at
 #    least one `[kind] command` row).
@@ -35,8 +35,8 @@ if ! grep -qE '^next:$' <<<"$out"; then
   echo "FAIL: validate human output missing Hole Report header"
   echo "----"; echo "$out"; exit 1
 fi
-if ! grep -qE '^[[:space:]]+\[recommended\] graft admit ' <<<"$out"; then
-  echo "FAIL: validate Hole Report missing [recommended] admit action"
+if ! grep -qE '^[[:space:]]+\[recommended\] graft patch admit ' <<<"$out"; then
+  echo "FAIL: validate Hole Report missing [recommended] patch admit action"
   echo "----"; echo "$out"; exit 1
 fi
 if grep -qE '^next: graft ' <<<"$out"; then
@@ -45,7 +45,7 @@ if grep -qE '^next: graft ' <<<"$out"; then
 fi
 
 # 2) JSON output must carry next_actions[] with structured kind/why fields.
-json=$("$GRAFT_BIN" --json validate "$candidate")
+json=$("$GRAFT_BIN" --json patch validate "$candidate")
 if ! grep -qE '"kind": "recommended"' <<<"$json"; then
   echo "FAIL: --json validate missing recommended next_action kind"
   echo "$json"; exit 1
@@ -57,7 +57,7 @@ fi
 
 # 3) The --json next_actions on validate must include human-readable why text
 #    referencing the recommended next step.
-validate=$("$GRAFT_BIN" validate "$candidate")
+validate=$("$GRAFT_BIN" patch validate "$candidate")
 if ! grep -qE '\[recommended\]' <<<"$validate"; then
   echo "FAIL: validate output missing [recommended] action"
   echo "----"; echo "$validate"; exit 1

@@ -3,8 +3,8 @@
 #
 # Verifies that the documented CLI surface stays aligned with the current
 # top-level command router. Canonical docs should use the visible grouped
-# commands (`workspace`, `patch`, `bundle`, ...), plus state-first inspection
-# verbs (`materialize`, `run`) and the explicit publication verb (`promote`).
+# commands (`workspace`, `patch`, `bundle`, ...); patch lifecycle commands live
+# under `graft patch ...`, while `graft run` remains top-level.
 
 set -euo pipefail
 
@@ -36,14 +36,14 @@ check_help() {
 }
 
 # Visible top-level command groups.
-for sub in get sync workspace scratch patch repo bundle explain materialize run promote; do
+for sub in get sync workspace scratch patch repo bundle explain run; do
   check_help "$sub"
 done
 
 # Hidden compatibility aliases still parse for existing automation, but the
 # canonical docs/help should prefer the grouped forms checked below.
 for sub in init clone candidate candidates show validate admit status diff discard incoming search compose migrate \
-           revert property registry cache verify-pending evidence gc; do
+           revert materialize promote property registry cache verify-pending evidence gc; do
   check_help "$sub"
 done
 
@@ -62,7 +62,7 @@ done
 
 top_help=$("$GRAFT" --help 2>&1) || report "graft --help" "exited non-zero"
 for hidden_top in init clone candidate candidates show validate admit status diff discard incoming search compose migrate \
-                  revert property registry cache verify-pending evidence gc create learn; do
+                  revert materialize promote property registry cache verify-pending evidence gc create learn; do
   if grep -qE "^[[:space:]]+${hidden_top}[[:space:]]" <<<"$top_help"; then
     report "graft --help" "hidden/removed top-level command must not be user-facing: $hidden_top"
   fi
@@ -102,9 +102,6 @@ fi
 for hidden_materialize_flag in '--as-commit' '--ref'; do
   if grep -q -- "$hidden_materialize_flag" <<<"$("$GRAFT" patch materialize --help 2>&1)"; then
     report "graft patch materialize --help" "unsupported Git flag leaked into help: $hidden_materialize_flag"
-  fi
-  if grep -q -- "$hidden_materialize_flag" <<<"$("$GRAFT" materialize --help 2>&1)"; then
-    report "graft materialize --help" "unsupported Git flag leaked into help: $hidden_materialize_flag"
   fi
 done
 
@@ -166,7 +163,6 @@ check_flag "patch migrate" "--validate"
 check_flag "patch revert" "--expect"
 check_flag "patch revert" "--validate"
 check_flag "patch materialize" "--dry-run"
-check_flag "materialize" "--dry-run"
 check_flag "run" "--cwd"
 check_flag "patch promote" "--to"
 check_flag "patch promote" "--branch"

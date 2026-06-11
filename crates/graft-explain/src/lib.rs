@@ -84,7 +84,7 @@ pub struct NextAction {
     /// Stable id for machine consumers (`--json` uses this verbatim).
     pub id: String,
     /// Concrete invocation hint shown to the user, e.g.
-    /// `"graft validate candidate:..."`.
+    /// `"graft patch validate candidate:..."`.
     pub label: String,
     pub kind: NextActionKind,
     /// One-line rationale: why this is the right next step right now.
@@ -346,7 +346,7 @@ mod tests {
     fn next_action_kind_serializes_as_snake_case() {
         let action = NextAction::new(
             "validate",
-            "graft validate candidate:xyz",
+            "graft patch validate candidate:xyz",
             NextActionKind::Recommended,
             "no evidence yet",
         );

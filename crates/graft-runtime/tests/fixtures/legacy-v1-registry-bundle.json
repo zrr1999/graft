@@ -1,0 +1,26 @@
+{
+  "candidates": [
+    {
+      "id": "candidate:legacy",
+      "application": { "kind": "stored", "value": "APPLICATION_ID" },
+      "expected": [
+        { "id": "property:legacy-candidate", "name": "legacy_candidate_policy" }
+      ],
+      "provenance": { "producer": "test", "message": null, "created_at": "now" }
+    }
+  ],
+  "patches": [
+    {
+      "id": "patch:legacy",
+      "application": { "kind": "stored", "value": "APPLICATION_ID" },
+      "properties": [
+        { "id": "property:legacy", "name": "legacy_policy" }
+      ],
+      "provenance": { "producer": "test", "message": null, "created_at": "now" },
+      "admitted_at": "now"
+    }
+  ],
+  "evidence": [],
+  "relations": [],
+  "promotions": []
+}

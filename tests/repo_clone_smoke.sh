@@ -83,10 +83,10 @@ fi
 repo_write=$("$GRAFT_BIN" scratch write --repo demo --base main README.md --content $'demo changed\n')
 repo_scratch=$(grep -oE 'scratch:[0-9a-f]+' <<<"$repo_write" | tail -n1)
 [[ -n $repo_scratch ]] || { echo "FAIL: scratch write --repo demo did not return scratch id"; echo "$repo_write"; exit 1; }
-repo_candidate_out=$("$GRAFT_BIN" candidate from-scratch "$repo_scratch" --message repo-base-context)
-repo_candidate=$(grep -oE 'candidate:[0-9a-f]+' <<<"$repo_candidate_out" | head -n1)
+repo_candidate_out=$("$GRAFT_BIN" patch from-scratch "$repo_scratch" --message repo-base-context)
+repo_candidate=$(first_graft_id candidate "$repo_candidate_out")
 [[ -n $repo_candidate ]] || { echo "FAIL: scratch --repo base-context did not become a candidate"; echo "$repo_candidate_out"; exit 1; }
-repo_validate=$("$GRAFT_BIN" validate "$repo_candidate")
+repo_validate=$("$GRAFT_BIN" patch validate "$repo_candidate")
 grep -q 'validation completed' <<<"$repo_validate" || { echo "FAIL: scratch --repo base-context candidate did not validate"; echo "$repo_validate"; exit 1; }
 
 mkdir -p src
@@ -94,19 +94,19 @@ printf 'changed\n' > src/new.txt
 scratch_out=$("$GRAFT_BIN" scratch write --base graft:empty src/new.txt --content $'changed\n')
 scratch=$(grep -oE 'scratch:[0-9a-f]+' <<<"$scratch_out" | tail -n1)
 [[ -n $scratch ]] || { echo "FAIL: no scratch id captured"; echo "$scratch_out"; exit 1; }
-create=$("$GRAFT_BIN" candidate from-scratch "$scratch" --message repo-smoke-candidate)
-candidate=$(grep -oE 'candidate:[0-9a-f]+' <<<"$create" | head -n1)
+create=$("$GRAFT_BIN" patch from-scratch "$scratch" --message repo-smoke-candidate)
+candidate=$(first_graft_id candidate "$create")
 [[ -n $candidate ]] || { echo "FAIL: no candidate id captured"; echo "$create"; exit 1; }
 
-validate=$("$GRAFT_BIN" validate "$candidate" --json)
+validate=$("$GRAFT_BIN" patch validate "$candidate" --json)
 python3 - "$validate" <<'PY'
 import json, sys
 record = json.loads(sys.argv[1])
 assert record["evidence"] == [], record
 PY
 
-admit=$("$GRAFT_BIN" admit "$candidate")
-patch=$(grep -oE 'patch:[0-9a-f]+' <<<"$admit" | head -n1)
+admit=$("$GRAFT_BIN" patch admit "$candidate")
+patch=$(first_graft_id patch "$admit")
 [[ -n $patch ]] || { echo "FAIL: scratch-based candidate did not admit"; echo "$admit"; exit 1; }
 
 printf 'updated\n' > "$SOURCE/README.md"

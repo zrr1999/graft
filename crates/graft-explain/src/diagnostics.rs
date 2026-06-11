@@ -42,14 +42,14 @@ pub fn v002_property_violated(property: &str, detail: &str) -> Diagnostic {
     )
     .at(property.to_string())
     .fix(format!("inspect: {}", one_line(detail)))
-    .fix("amend the candidate worktree and run `graft validate` again")
+    .fix("amend the candidate worktree and run `graft patch validate` again")
     .see("validate")
     .see("evidence-result.failed")
 }
 
 /// V003 — base state required by the verifier could not be materialized.
 ///
-/// This is the case famously surfaced when running `graft validate` outside
+/// This is the case famously surfaced when running `graft patch validate` outside
 /// a Git repo: the original error is `git stderr` and used to leak through
 /// the evidence reason. Wrapped here so users see a code with one-line
 /// repair guidance instead.
@@ -98,13 +98,17 @@ pub fn v005_verifier_misconfigured(property: &str, why: &str) -> Diagnostic {
 
 /// A001 — admission requires evidence for a property that has none.
 pub fn a001_missing_required_evidence(property: &str) -> Diagnostic {
+    a001_missing_required_evidence_at(property, property)
+}
+
+pub fn a001_missing_required_evidence_at(property: &str, path: &str) -> Diagnostic {
     Diagnostic::new(
         DiagCode::new(DiagDomain::Admit, 1),
         format!("missing required evidence for `{property}`"),
     )
-    .at(property.to_string())
+    .at(format!("Constraint failed at: {path}"))
     .fix(format!(
-        "run `graft validate <candidate> --expect {property}`"
+        "run `graft patch validate <candidate> --expect {property}`"
     ))
     .see("admit")
     .see("validate")
@@ -113,12 +117,16 @@ pub fn a001_missing_required_evidence(property: &str) -> Diagnostic {
 /// A002 — admission requires evidence for a property whose evidence did not
 /// pass.
 pub fn a002_failed_required_evidence(property: &str) -> Diagnostic {
+    a002_failed_required_evidence_at(property, "<unknown>", property)
+}
+
+pub fn a002_failed_required_evidence_at(property: &str, evidence: &str, path: &str) -> Diagnostic {
     Diagnostic::new(
         DiagCode::new(DiagDomain::Admit, 2),
-        format!("evidence for `{property}` did not pass"),
+        format!("evidence `{evidence}` for `{property}` did not pass"),
     )
-    .at(property.to_string())
-    .fix("amend the candidate, re-run `graft validate`, then retry `graft admit`")
+    .at(format!("Constraint failed at: {path}"))
+    .fix("amend the candidate, re-run `graft patch validate`, then retry `graft patch admit`")
     .see("admit")
     .see("evidence-result.failed")
 }
@@ -268,7 +276,7 @@ pub const ALL_DIAGNOSTICS: &[DiagnosticDoc] = &[
         summary: "property verifier rejected the candidate; the patch was observed to violate the property",
         fix_hints: &[
             "inspect the verifier output for the violating evidence",
-            "amend the candidate worktree and run `graft validate` again",
+            "amend the candidate worktree and run `graft patch validate` again",
         ],
         see_also: &["validate", "evidence-result.failed"],
     },
@@ -304,13 +312,15 @@ pub const ALL_DIAGNOSTICS: &[DiagnosticDoc] = &[
     DiagnosticDoc {
         code: DiagCode::new(DiagDomain::Admit, 1),
         summary: "admission requires evidence for a property that has none",
-        fix_hints: &["run `graft validate <candidate> --expect <Property>` first"],
+        fix_hints: &["run `graft patch validate <candidate> --expect <Property>` first"],
         see_also: &["admit", "validate"],
     },
     DiagnosticDoc {
         code: DiagCode::new(DiagDomain::Admit, 2),
         summary: "admission requires evidence for a property whose evidence did not pass",
-        fix_hints: &["amend the candidate, re-run `graft validate`, then retry `graft admit`"],
+        fix_hints: &[
+            "amend the candidate, re-run `graft patch validate`, then retry `graft patch admit`",
+        ],
         see_also: &["admit", "evidence-result.failed"],
     },
     // M — materialize

@@ -50,30 +50,30 @@ printf 'hello\n' > hello.txt
 scratch_out=$("$GRAFT" scratch write --base graft:empty hello.txt --content $'hello\n')
 scratch=$(grep -oE 'scratch:[0-9a-f]+' <<<"$scratch_out" | tail -n1)
 [[ -n $scratch ]] || { echo "FAIL: no scratch id"; echo "$scratch_out"; exit 1; }
-create=$("$GRAFT" candidate from-scratch "$scratch" --expect workspace:touches_hello --message v2-smoke)
-candidate=$(grep -oE 'candidate:[0-9a-f]+' <<<"$create" | head -n1)
+create=$("$GRAFT" patch from-scratch "$scratch" --expect touches_hello --message v2-smoke)
+candidate=$(first_graft_id candidate "$create")
 [[ -n $candidate ]] || { echo "FAIL: no candidate id"; echo "$create"; exit 1; }
-find .graft/store/private/evidence_refs -type f | grep -q . || { echo "FAIL: from-scratch --expect did not create evidence refs"; echo "$create"; exit 1; }
-find .graft/store/derived/evidence -type f | grep -q . || { echo "FAIL: from-scratch --expect did not create evidence body"; echo "$create"; exit 1; }
-"$GRAFT" validate "$candidate" --expect workspace:touches_hello >/dev/null
-admit=$("$GRAFT" admit "$candidate" --require workspace:touches_hello)
-patch=$(grep -oE 'patch:[0-9a-f]+' <<<"$admit" | head -n1)
+[[ -n $(find .graft/store/private/evidence_refs -type f -print -quit) ]] || { echo "FAIL: from-scratch --expect did not create evidence refs"; echo "$create"; exit 1; }
+[[ -n $(find .graft/store/derived/evidence -type f -print -quit) ]] || { echo "FAIL: from-scratch --expect did not create evidence body"; echo "$create"; exit 1; }
+"$GRAFT" patch validate "$candidate" --expect touches_hello >/dev/null
+admit=$("$GRAFT" patch admit "$candidate" --require touches_hello)
+patch=$(first_graft_id patch "$admit")
 [[ -n $patch ]] || { echo "FAIL: no patch id"; echo "$admit"; exit 1; }
 [[ ! -e ".graft/store/private/candidate/$candidate.json" ]] || { echo "FAIL: private candidate remained after admit"; exit 1; }
 [[ ! -e ".graft/store/private/evidence_refs/$candidate.json" ]] || { echo "FAIL: private evidence_refs remained after admit"; exit 1; }
 [[ -e ".graft/store/public/patch/$patch.json" ]] || { echo "FAIL: public patch missing"; exit 1; }
 [[ -e ".graft/store/public/evidence_refs/$patch.json" ]] || { echo "FAIL: public evidence_refs missing"; exit 1; }
-find .graft/store/derived/evidence -type f | grep -q . || { echo "FAIL: derived evidence body missing before sync"; exit 1; }
+[[ -n $(find .graft/store/derived/evidence -type f -print -quit) ]] || { echo "FAIL: derived evidence body missing before sync"; exit 1; }
 
 # 3) materialize writes an isolated state inspection tree and leaves cwd untouched.
-materialize_out=$("$GRAFT" materialize "$patch" --discard)
+materialize_out=$("$GRAFT" patch materialize "$patch" --discard)
 materialized_path=$(extract_materialize_path <<<"$materialize_out")
 [[ -n $materialized_path ]] || { echo "FAIL: materialize did not report output path"; echo "$materialize_out"; exit 1; }
 [[ "$materialized_path" != *"$patch"* ]] || { echo "FAIL: materialize output path used patch id"; echo "$materialized_path"; exit 1; }
 [[ -e "$materialized_path/hello.txt" ]] || { echo "FAIL: materialized worktree missing"; echo "$materialize_out"; exit 1; }
 grep -q 'hello' "$materialized_path/hello.txt" || { echo "FAIL: materialized worktree content wrong"; exit 1; }
 grep -q 'hello' hello.txt || { echo "FAIL: cwd was unexpectedly modified by materialize"; exit 1; }
-if [[ -d .graft/store/public/relation ]] && find .graft/store/public/relation -type f | grep -q .; then
+if [[ -d .graft/store/public/relation ]] && [[ -n $(find .graft/store/public/relation -type f -print -quit) ]]; then
   echo "FAIL: materialize wrote a registry relation"
   find .graft/store/public/relation -type f
   exit 1
@@ -92,13 +92,12 @@ cat >> graft.toml <<TOML
 path = "$TARGET"
 branch = "graft-out"
 
-[promote_targets.out.required_properties]
-workspace = ["touches_hello"]
+required_properties = ["touches_hello"]
 TOML
 lock_properties
-"$GRAFT" promote "$patch" --to out --yes >/dev/null
+"$GRAFT" patch promote "$patch" --to out --yes >/dev/null
 git -C "$TARGET" rev-parse --verify refs/heads/graft-out >/dev/null
-find .graft/store/public/promotion -type f | grep -q . || { echo "FAIL: promotion record missing"; exit 1; }
+[[ -n $(find .graft/store/public/promotion -type f -print -quit) ]] || { echo "FAIL: promotion record missing"; exit 1; }
 
 # 5) Sync is enabled by default for local workspaces, explicit opt-out fails,
 # uses refs/graft/*, and omits derived evidence bodies; clone can rebuild them.
@@ -133,7 +132,7 @@ CLONE="$WORKDIR/clone"
 cp properties.roto "$CLONE/properties.roto"
 "$GRAFT" --cwd "$CLONE" property lock >/dev/null
 [[ -e "$CLONE/.graft/store/public/patch/$patch.json" ]] || { echo "FAIL: cloned public patch missing"; exit 1; }
-if find "$CLONE/.graft/store/derived/evidence" -type f | grep -q .; then
+if [[ -n $(find "$CLONE/.graft/store/derived/evidence" -type f -print -quit) ]]; then
   echo "FAIL: clone fetched derived evidence bodies"
   exit 1
 fi
@@ -141,13 +140,13 @@ incoming=$("$GRAFT" --cwd "$CLONE" incoming)
 grep -q 'not locally rebuilt' <<<"$incoming" || { echo "FAIL: incoming did not report pending evidence rebuild"; echo "$incoming"; exit 1; }
 verify=$("$GRAFT" --cwd "$CLONE" verify-pending --limit 1)
 grep -Eq 'rebuilt|appended|verified|evidence' <<<"$verify" || { echo "FAIL: verify-pending output unexpected"; echo "$verify"; exit 1; }
-find "$CLONE/.graft/store/derived/evidence" -type f | grep -q . || { echo "FAIL: verify-pending did not rebuild derived evidence"; exit 1; }
+[[ -n $(find "$CLONE/.graft/store/derived/evidence" -type f -print -quit) ]] || { echo "FAIL: verify-pending did not rebuild derived evidence"; exit 1; }
 
 # 6) GC derived-only dry-run/apply.
 gc_dry=$("$GRAFT" --cwd "$CLONE" gc --derived-only)
 grep -q 'evidence_bodies_to_delete: 1' <<<"$gc_dry" || { echo "FAIL: gc dry-run did not describe derived evidence"; echo "$gc_dry"; exit 1; }
 "$GRAFT" --cwd "$CLONE" gc --derived-only --apply >/dev/null
-if find "$CLONE/.graft/store/derived/evidence" -type f | grep -q .; then
+if [[ -n $(find "$CLONE/.graft/store/derived/evidence" -type f -print -quit) ]]; then
   echo "FAIL: gc --derived-only --apply left evidence bodies"
   exit 1
 fi

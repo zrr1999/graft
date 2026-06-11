@@ -2,8 +2,8 @@
 # tests/candidate_from_scratch_smoke.sh
 #
 # Minimal lifecycle smoke for the canonical scratch -> candidate entrypoint:
-# scratch write --base -> scratch edit/delete --from -> candidate from-scratch
-# -> validate -> admit -> materialize dry-run.
+# scratch write --base -> scratch edit/delete --from -> patch from-scratch
+# -> patch validate -> patch admit -> patch materialize dry-run.
 
 set -euo pipefail
 
@@ -29,8 +29,8 @@ seed_remove_out=$("$GRAFT" scratch write --from "$scratch_note" remove.txt --con
 scratch_seed=$(grep -oE 'scratch:[0-9a-f]+' <<<"$seed_remove_out" | tail -n1)
 [[ -n $scratch_seed ]] || { echo "FAIL: seed remove write did not return scratch id"; echo "$seed_remove_out"; exit 1; }
 
-seed_candidate_out=$("$GRAFT" candidate from-scratch "$scratch_seed")
-seed_candidate=$(grep -oE 'candidate:[0-9a-f]+' <<<"$seed_candidate_out" | head -n1)
+seed_candidate_out=$("$GRAFT" patch from-scratch "$scratch_seed")
+seed_candidate=$(first_graft_id candidate "$seed_candidate_out")
 [[ -n $seed_candidate ]] || { echo "FAIL: seed candidate from-scratch without message did not return candidate id"; echo "$seed_candidate_out"; exit 1; }
 
 write_out=$("$GRAFT" scratch write --base "$seed_candidate" added.txt --content $'added\n')
@@ -54,26 +54,26 @@ scratch_delete=$(grep -oE 'scratch:[0-9a-f]+' <<<"$delete_out" | tail -n1)
 [[ -n $scratch_delete ]] || { echo "FAIL: scratch delete did not return scratch id"; echo "$delete_out"; exit 1; }
 grep -q 'remove.txt' <<<"$delete_out" || { echo "FAIL: delete changed_paths missing remove.txt"; echo "$delete_out"; exit 1; }
 
-candidate_out=$("$GRAFT" candidate from-scratch "$scratch_delete" --message scratch-candidate)
-candidate=$(grep -oE 'candidate:[0-9a-f]+' <<<"$candidate_out" | head -n1)
+candidate_out=$("$GRAFT" patch from-scratch "$scratch_delete" --message scratch-candidate)
+candidate=$(first_graft_id candidate "$candidate_out")
 [[ -n $candidate ]] || { echo "FAIL: candidate from-scratch did not return candidate id"; echo "$candidate_out"; exit 1; }
 for path in added.txt note.txt remove.txt; do
   grep -q "$path" <<<"$candidate_out" || { echo "FAIL: candidate changed_paths missing $path"; echo "$candidate_out"; exit 1; }
 done
 
-candidate_materialize_out=$("$GRAFT" materialize "$candidate" --dry-run)
+candidate_materialize_out=$("$GRAFT" patch materialize "$candidate" --dry-run)
 candidate_materialized_path=$(extract_materialize_path <<<"$candidate_materialize_out")
 [[ -n $candidate_materialized_path ]] || { echo "FAIL: candidate materialize dry-run did not report output path"; echo "$candidate_materialize_out"; exit 1; }
 [[ "$candidate_materialized_path" != *"$candidate"* ]] || { echo "FAIL: candidate materialize output path used candidate id"; echo "$candidate_materialized_path"; exit 1; }
 
-validate_out=$("$GRAFT" validate "$candidate")
+validate_out=$("$GRAFT" patch validate "$candidate")
 grep -q 'validation completed' <<<"$validate_out" || { echo "FAIL: validate did not complete"; echo "$validate_out"; exit 1; }
 
-admit_out=$("$GRAFT" admit "$candidate")
-patch=$(grep -oE 'patch:[0-9a-f]+' <<<"$admit_out" | head -n1)
+admit_out=$("$GRAFT" patch admit "$candidate")
+patch=$(first_graft_id patch "$admit_out")
 [[ -n $patch ]] || { echo "FAIL: admit did not return patch id"; echo "$admit_out"; exit 1; }
 
-materialize_out=$("$GRAFT" materialize "$patch" --dry-run --discard)
+materialize_out=$("$GRAFT" patch materialize "$patch" --dry-run --discard)
 grep -q 'materialization dry-run' <<<"$materialize_out" || { echo "FAIL: materialize dry-run did not report plan"; echo "$materialize_out"; exit 1; }
 materialized_path=$(extract_materialize_path <<<"$materialize_out")
 [[ -n $materialized_path ]] || { echo "FAIL: materialize dry-run did not report output path"; echo "$materialize_out"; exit 1; }
@@ -81,4 +81,4 @@ materialized_path=$(extract_materialize_path <<<"$materialize_out")
 [[ "$materialized_path" != *"$patch"* ]] || { echo "FAIL: materialize dry-run output path used patch id"; echo "$materialized_path"; exit 1; }
 [[ ! -e "$materialized_path" ]] || { echo "FAIL: materialize dry-run unexpectedly wrote worktree"; exit 1; }
 
-echo "OK: candidate from-scratch write/edit/delete -> validate -> admit -> materialize dry-run lifecycle works."
+echo "OK: patch from-scratch write/edit/delete -> validate -> admit -> materialize dry-run lifecycle works."
