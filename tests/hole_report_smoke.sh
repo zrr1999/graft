@@ -62,7 +62,7 @@ if ! grep -qE '\[recommended\]' <<<"$validate"; then
   echo "FAIL: validate output missing [recommended] action"
   echo "----"; echo "$validate"; exit 1
 fi
-if ! grep -qE '^[[:space:]]+no property evidence is required' <<<"$validate"; then
+if ! grep -qE '^[[:space:]]+no constraint evidence is required' <<<"$validate"; then
   echo "FAIL: validate why text missing for core-integrity-only stage"
   echo "----"; echo "$validate"; exit 1
 fi

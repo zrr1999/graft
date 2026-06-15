@@ -6,10 +6,10 @@ content.
 
 | Template | Purpose |
 | --- | --- |
-| [`default/`](./default/) | Minimal layout `graft init` produces — empty `properties.roto`, no admission/promotion gates. |
+| [`default/`](./default/) | Minimal layout `graft init` produces — empty `constraints.roto`, no admission/promotion gates. |
 
-These templates use the final Roto property language conventions
-(top-level `fn name(app: Application) -> Property`, no
-`property_registry()`, no PascalCase aliases). The default template is
-empty by design; add property functions to `properties.roto` as workspace
+These templates use the Roto constraint language conventions
+(top-level `fn name(app: Application) -> Constraint`, no
+`constraint_registry()`, no PascalCase aliases). The default template is
+empty by design; add constraint functions to `constraints.roto` as workspace
 policy grows.

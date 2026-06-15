@@ -1,7 +1,7 @@
 # Graft 设计 · 运行时（§6–§9）
 
 > 本文件是 Graft 设计文档的一个模块，从 [`../design.md`](../design.md)（索引）拆出。
-> 完整形式化 kernel 见 [`../graft-kernel.lean`](../graft-kernel.lean)。
+> 完整形式化 kernel 见 [`formal/kernel.lean`](../../formal/kernel.lean)。
 
 ## 6. Sync protocol
 
@@ -18,7 +18,7 @@ Graft 远端是一个 Git 仓库，负责存储以下三个固定 refs：
 
 ```text
 refs/graft/facts          镜像 store/public/{tree,action,application,change,
-                                                  property,patch,evidence_refs,
+                                                  constraint,patch,evidence_refs,
                                                   relation,promotion}/
 refs/graft/blobs          镜像 store/public/blob/
 refs/graft/manifests      sync checkpoint chain
@@ -41,15 +41,13 @@ refs/graft/manifests      sync checkpoint chain
 ```json
 {
   "id": "manifest:abc123def456",
-  "version": 1,
+  "version": 2,
   "facts_tip": "<refs/graft/facts 上本次 commit 的 oid>",
   "blobs_tip": "<refs/graft/blobs 上本次 commit 的 oid>",
   "prev_manifest": "manifest:<prev>",
   "summary": {
-    "new_patches":   ["patch:91sx8q2h", "patch:bc12ef34"],
-    "new_promotions": ["promotion:778899"],
-    "new_blobs_count": 12,
-    "removed_objects": []
+    "facts_files": 312,
+    "blob_files": 48
   }
 }
 ```
@@ -141,8 +139,8 @@ suggested:
 
 1. **按 base_state 分组**。同一 base 下的 patch 可能是串联或并列，由 base->target 的本地拓扑决定取 sibling 还是 nested。
 2. **本地 cwd 的 base 置顶**，其他 base 被始终按 "不在本地 store"/"远古老" 等标签分组。
-3. **patch 核心信息以 property 为主**，evidence 给 drill-down。`graft patch show patch:X --evidence` 展开。
-4. **property drift 标注 stale**：如果 patch 的 PropertyId 与当前同名 property 函数解析结果对不上，渲染为 `cargo_tests_pass ✓ (property drift; was X, now X')`。
+3. **patch 核心信息以 constraint 为主**，evidence 给 drill-down。`graft patch show patch:X --evidence` 展开。
+4. **constraint drift 标注 stale**：如果 patch 的 PlanId 与当前同名 constraint 函数解析结果对不上，渲染为 `cargo_tests_pass ✓ (constraint drift; was X, now X')`。
 5. **未本地重建的 evidence** 标 "referenced by remote, 0 locally rebuilt"。
 
 ### 6.6 Evidence sync 细则
@@ -169,10 +167,10 @@ append-only union (重要):
 
 reuse / invalidation:
   evidence body 只有在本地 store/derived/evidence/<id>.json 存在，且 body 中
-  (ApplicationId, PropertyId, ValidationRunKey, canonical result/effects/outputs)
+  (subject Application/Patch/Candidate, PlanId, execution contract, canonical result/effects/outputs)
   与当前查询完全匹配时，才能满足 admission/promote/search。
-  description/severity 变化不影响既有 evidence；PropertyId 变化会让旧 evidence 不再
-  满足当前 property name 要求。ApplicationId 或 ValidationRunKey 变化也必须重跑。
+  description / top-level constraint name 变化不影响既有 primitive evidence；PlanId 变化会让旧 evidence 不再
+  满足当前 constraint primitive 要求。ApplicationId 或 execution contract 变化也必须重跑。
 ```
 
 #### 不变量
@@ -221,7 +219,7 @@ graft get <remote> <dir>
 3. fetch refs/graft/{facts, blobs, manifests} 从 <remote>。
 4. 走 sync 状态机 (§6.3)；case B （remote ahead） 在这里是唯一可能。
 5. 写入 store/public/。local/remotes/origin/last_synced 设为远端 latest。
-6. cwd 留空（不创建 graft.toml，不创建 properties.roto）。
+6. cwd 留空（不创建 graft.toml，不创建 constraints.roto）。
 7. 提示用户选择下一步:
    - graft patch incoming
    - graft patch materialize <application:|patch:|tree:|candidate:|repo:|git-treeish>
@@ -298,7 +296,7 @@ CI / sandbox 场景靠 daemon 的 idle timeout 自动退出（§8.4）。
 
 ### 8.2 IPC 协议
 
-当前实现使用 `cli_exec` wire op 承载多数 daemon-owned workspace 写命令——daemon 接收 argv、在 daemon 进程内解析并执行同一套 command logic。P8 起每个 routed 请求必须携带 `workspace_id`；daemon 通过 registry 解析 workspace，并把可选 `workspace_root` 只当作一致性校验。`cli_exec` 不是泛用 argv 后门：scratch/candidate 走 typed RPC，`attach`/`detach` 走 workspace registry typed op，status/show/property/init 等本地或只读命令不允许通过 `cli_exec`。
+当前实现使用 `cli_exec` wire op 承载多数 daemon-owned workspace 写命令——daemon 接收 argv、在 daemon 进程内解析并执行同一套 command logic。P8 起每个 routed 请求必须携带 `workspace_id`；daemon 通过 registry 解析 workspace，并把可选 `workspace_root` 只当作一致性校验。`cli_exec` 不是泛用 argv 后门：scratch/candidate 走 typed RPC，`attach`/`detach` 走 workspace registry typed op，status/show/constraint/init 等本地或只读命令不允许通过 `cli_exec`。
 
 ```json
 {
@@ -372,11 +370,11 @@ graft workspace gc --derived-only      # 只清 store/derived/
 
 ```text
 roots =
-    state/aliases/{candidates,patches,promotions}/* 解析到的 ID
-  ∪ 当前 properties.roto 顶层 property 函数解析到的 PropertyId 集合
-  ∪ [admission].required_properties 解析到的 PropertyId
-  ∪ [promotion].required_properties 解析到的 PropertyId
-  ∪ [promote_targets.*].required_properties 解析到的 PropertyId
+    local/aliases/{candidates,patches,promotions}/* 解析到的 ID
+  ∪ 当前 constraints.roto 顶层 constraint 函数解析到的 Constraint body id 与 primitive PlanId 集合
+  ∪ [admission].required 解析到的 Constraint body id / PlanId 集合
+  ∪ [promotion].required 解析到的 Constraint body id / PlanId 集合
+  ∪ [promote_targets.*].required 解析到的 Constraint body id / PlanId 集合
   ∪ daemon 内存中当前 active scratch / lease 中的 blob/tree
 ```
 
@@ -400,9 +398,9 @@ change.target_state        -> tree (若 Tree variant)
 change.ops[].blob          -> blob
 tree.entries[].hash        -> blob
 evidence_refs[<id>].evidence -> evidence (in store/derived/)
-evidence.application       -> application
-evidence.change            -> change (endpoint view, if present)
-evidence.property          -> property
+evidence.subject           -> candidate / patch / application owner
+evidence.plan              -> plan
+constraint primitive       -> plan
 relation.inputs[]          -> any
 relation.outputs[]         -> any
 promotion.patch            -> patch

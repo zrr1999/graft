@@ -1,0 +1,19 @@
+// Pattern: relational oracle over base and target runs.
+//
+// `same_output(run_a, run_b, selectors)` observes two Runs. `outputs_same`
+// asserts every selected slice is byte-identical between runs.
+
+fn precision_invariance(app: Application) -> Constraint {
+    let base_run = call(["bash", "./run.sh"], app.base());
+    let target_run = call(["bash", "./run.sh"], app.target());
+
+    primitive(
+        same_output(base_run, target_run, [
+            post_file("./alignment/expected.json"),
+            stdout,
+            stderr,
+        ]),
+        outputs_same,
+        "running run.sh on base and target produces identical alignment outputs",
+    )
+}

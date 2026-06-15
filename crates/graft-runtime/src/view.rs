@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 /// migrated to typed views.
 ///
 /// Migration backlog after the initial `ps`/`gc` slice: workspace status/attach,
-/// doctor, repo, property, bundle/registry, scratch/candidate, patch lifecycle,
+/// doctor, repo, constraint, bundle/registry, scratch/candidate, patch lifecycle,
 /// sync/clone, diff/incoming/search, and promote/materialize command families.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -205,7 +205,7 @@ pub(crate) struct PromotionView {
 pub(crate) struct EvidenceView {
     pub(crate) id: String,
     pub(crate) subject: String,
-    pub(crate) property: String,
+    pub(crate) constraint: String,
     pub(crate) verifier: String,
     pub(crate) result: String,
     pub(crate) created_at: String,
@@ -301,7 +301,7 @@ pub(crate) fn render_command_human(envelope: &CommandEnvelope) -> String {
     for evidence in &envelope.evidence {
         lines.push(format!(
             "evidence: {} {} {} ({})",
-            evidence.id, evidence.property, evidence.result, evidence.verifier
+            evidence.id, evidence.constraint, evidence.result, evidence.verifier
         ));
     }
     lines.push(format!("cache {}", changed_word(envelope.cache_changed)));

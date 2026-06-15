@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tests/daemon_lifecycle_smoke.sh
 #
-# Pins daemon ownership and cleanup for v2.
+# Pins daemon ownership and cleanup.
 
 set -euo pipefail
 

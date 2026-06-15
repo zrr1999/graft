@@ -1,0 +1,35 @@
+// Pattern: historical counterexample with overlay.
+//
+// `previous_failure` is symbolic. If no matching history exists at validation
+// time, the overlay/run that needs it evaluates to Unknown.
+
+fn training_alignment(app: Application) -> Constraint {
+    let target = primitive(
+        app.run(["bash", "./check_diff.sh"]),
+        exit_zero,
+        "target validator succeeds",
+    );
+
+    let prev = app.previous_failure(History.First);
+    let checker = app.target().file("./check_diff.sh");
+    let bad_tree = prev.target().with_overlay([
+        replace_file("./check_diff.sh", checker),
+    ]);
+    let bad_run = call(["bash", "./check_diff.sh"], bad_tree);
+
+    both(
+        target,
+        either(
+            primitive(
+                app.changed_paths(["check_diff.sh", "compare.py"]),
+                no_match,
+                "validator files are unchanged",
+            ),
+            primitive(
+                observe_run(bad_run),
+                exit_nonzero,
+                "historical counterexample is still rejected",
+            ),
+        ),
+    )
+}

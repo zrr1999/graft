@@ -4,9 +4,9 @@
 //!
 //! - **Diagnostic codes**: `V003`, `A007`, etc. Source: [`super::diagnostics`].
 //! - **Builtin evaluators**: `changed_paths_any_match`, `changed_paths_all_match`, etc. Source:
-//!   [`super::properties`].
+//!   [`super::constraints`].
 //! - **Concept ids**: free-form names like `admit`, `materialize`,
-//!   `agent-workflow`, `properties`, `valid-patch`. The catalog is supplied by
+//!   `agent-workflow`, `constraints`, `valid-patch`. The catalog is supplied by
 //!   the caller (typically the CLI, so it can read clap-derived `about` strings
 //!   as the single source of truth).
 //!
@@ -17,8 +17,8 @@
 //! payload that the CLI can render as Markdown-free human text or stream as
 //! `--json`.
 
+use crate::constraints::{ALL_BUILTINS, BuiltinEvaluatorMetadata, metadata_for_evaluator};
 use crate::diagnostics::{ALL_DIAGNOSTICS, DiagnosticDoc, doc_for};
-use crate::properties::{ALL_BUILTINS, BuiltinEvaluatorMetadata, metadata_for_evaluator};
 use crate::{DiagCode, Diagnostic};
 use serde::Serialize;
 
@@ -107,9 +107,9 @@ const AGENT_WORKFLOW_LONG_ABOUT: &str = concat!(
     "1. Use `graft explain agent-workflow` or pi-graft `graft_help` when unsure; direct tool descriptions should stay short.\n",
     "2. Bootstrap and diagnose with `graft workspace init`, `graft workspace ps`, and `graft workspace doctor` before writing changes.\n",
     "3. Draft only in scratch: use `graft scratch read|write|edit|delete --base <base> ...` and continue with `--from scratch:<digest>`, or use `graft scratch capture --base <base>` to stash-like capture cwd changes into scratch; scratch is daemon-backed draft state, not a candidate, patch, sync object, or Git ref.\n",
-    "4. Turn draft into reviewable state with `graft patch from-scratch scratch:<digest> --expect <Property> --message <msg>`; the patch from-scratch command generates a private local candidate and immediately validates any `--expect` properties, but does not admit or promote it.\n",
-    "5. Re-run or add evidence with `graft patch validate candidate:<digest> --expect <Property>` and inspect with `graft patch show`, `graft patch list --candidates`, or `graft patch search`.\n",
-    "6. Admit only after required evidence passes: `graft patch admit candidate:<digest> --require <Property>`; admit generates a public patch and moves candidate evidence refs to the patch.\n",
+    "4. Turn draft into reviewable state with `graft patch from-scratch scratch:<digest> --expect <Constraint> --message <msg>`; the patch from-scratch command generates a private local candidate and immediately validates any `--expect` constraints, but does not admit or promote it.\n",
+    "5. Re-run or add evidence with `graft patch validate candidate:<digest> --expect <Constraint>` and inspect with `graft patch show`, `graft patch list --candidates`, or `graft patch search`.\n",
+    "6. Admit only after required evidence passes: `graft patch admit candidate:<digest> --require <Constraint>`; admit generates a public patch and moves candidate evidence refs to the patch.\n",
     "7. Check output with `graft patch materialize <patch-id>` or `graft run <state-ref> -- <cmd>`; materialize writes isolated `.worktrees/<state>/` inspection output, not cwd or Git refs.\n",
     "8. External promote is low-frequency and explicit: only run `graft patch promote <patch-id> --to <target> --yes` when an approved patch must update an outside Git branch, PR, or release target.\n",
     "9. Low-frequency advanced write commands such as patch compose/migrate/revert/promote, sync, repo add/sync/lock/update, bundle import, and workspace gc --apply may use pi-graft `graft_cli_exec` argv; keep read/inspect commands on the local CLI path and keep high-frequency agents on typed scratch/patch ops plus validate/admit/show/materialize."
@@ -121,17 +121,17 @@ const SCRATCH_LONG_ABOUT: &str = concat!(
 );
 
 const CANDIDATE_LONG_ABOUT: &str = concat!(
-    "Candidate is the local-only proposal state. `graft patch from-scratch scratch:<digest>` generates a private candidate from a scratch draft, expected properties, provenance producer, and optional message; any `--expect` properties are validated immediately.\n",
+    "Candidate is the local-only proposal state. `graft patch from-scratch scratch:<digest>` generates a private candidate from a scratch draft, expected constraints, provenance producer, and optional message; any `--expect` constraints are validated immediately.\n",
     "A candidate is not public review history and is not synced; re-run validate to refresh or add evidence, then admit it when required evidence passes."
 );
 
 const VALIDATE_LONG_ABOUT: &str = concat!(
     "Validate runs configured verifiers for an explicit candidate, patch, or change and records evidence.\n",
-    "Validation proves properties but does not admit, materialize, promote, or otherwise move lifecycle state."
+    "Validation proves constraints but does not admit, materialize, promote, or otherwise move lifecycle state."
 );
 
 const ADMIT_LONG_ABOUT: &str = concat!(
-    "Admit is the candidate to patch boundary. It checks required properties against passed evidence, then generates a public patch and moves evidence refs from private candidate storage to public patch storage.\n",
+    "Admit is the candidate to patch boundary. It checks required constraints against passed evidence, then generates a public patch and moves evidence refs from private candidate storage to public patch storage.\n",
     "Admit does not capture cwd, does not materialize output, and does not update external Git targets; run scratch/candidate first and promote only as a separate explicit operation."
 );
 

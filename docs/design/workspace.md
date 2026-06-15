@@ -1,7 +1,7 @@
 # Graft 设计 · 工作区（§3 + §12）
 
 > 本文件是 Graft 设计文档的一个模块，从 [`../design.md`](../design.md)（索引）拆出。
-> 完整形式化 kernel 见 [`../graft-kernel.lean`](../graft-kernel.lean)。
+> 完整形式化 kernel 见 [`formal/kernel.lean`](../../formal/kernel.lean)。
 
 ## 3. Workspace layout
 
@@ -10,8 +10,8 @@
 ```text
 cwd/
   graft.toml              # 项目定义，进 snapshot
-  graft.lock              # workspace 元配置锁（properties + repos），进 snapshot
-  properties.roto          # property source，进 snapshot
+  graft.lock              # workspace 元配置锁（constraints + repos），进 snapshot
+  constraints.roto          # constraint source，进 snapshot
   src/                    # workspace files，进 snapshot
   worktrees/              # local managed-repo checkout/output area; 默认不进 snapshot
   README.md
@@ -23,7 +23,7 @@ cwd/
 - 这里的 `cwd/` 只描述 `graft workspace init` 创建的 **local workspace root**。一般命令的 cwd 可以是任意目录；它通过 §12 的 lookup / routes 解析到 workspace。
 - local workspace root 拒绝 `.git/`；Git checkout 只能作为外部 repo/promote target，而不是 Graft workspace 本体。
 - snapshot 包含什么：
-  - 包含：`graft.toml`、`graft.lock`、`properties.roto`、所有普通工作区文件。
+  - 包含：`graft.toml`、`graft.lock`、`constraints.roto`、所有普通工作区文件。
   - 不包含：`.graft/`（本地事实空间）、`.worktrees/`（临时 materialize 输出）、`worktrees/`（local managed-repo checkout/output area）。发现 `.git/` 时拒绝 capture，而不是静默忽略。
   - 排除规则的具体语法在 §3.4。
 
@@ -42,7 +42,7 @@ local workspace root 是工作区，不是默认视图。Graft 不维护"当前 
       action/      <digest>.json
       application/ <digest>.json
       change/      <digest>.json
-      property/    <digest>.json
+      constraint/    <digest>.json
       patch/       <digest>.json
       evidence_refs/  <patch-digest>.json     # append-only index, sync
       relation/    <digest>.json
@@ -119,7 +119,7 @@ local/aliases/patches/release-candidate -> patch:abc123
 
 它们不进入 manifest，不写 remote refs，不与其他 clone merge。两个 clone 可以把同一个 alias 名指向不同 patch，这不是 sync conflict。远端 patch fetch 到本地后，用户可以显式设置本地 alias 指向它；不设置 alias 就只是 store 中多了一个可查对象。
 
-Property names 是另一回事：`properties.roto` 顶层 property 函数是 patchable workspace source，改变函数名、`checks` 或 `requires` 会产生新的 `PropertyId`；evidence/admission 仍按 `PropertyId` 比较。
+Constraint names 是另一回事：`constraints.roto` 顶层 constraint 函数是 patchable workspace source；函数名是配置/lock key，primitive 身份来自函数体里的 `PlanId = blake3(canonical(observation, assertion))`。
 
 #### gc 范围
 
@@ -127,8 +127,8 @@ reachability roots：
 
 ```
 local/aliases/{candidates,patches,promotions}/*  解析得到的对象 ID
-当前 properties.roto 顶层 property 函数解析得到的 PropertyId 集合
-当前 graft.toml [admission].required_properties / [promotion].required_properties / [promote_targets.*].required_properties 解析到的 PropertyId
+当前 constraints.roto 顶层 constraint 函数解析得到的 Constraint body id 与 primitive PlanId 集合
+当前 graft.toml [admission].required / [promotion].required / [promote_targets.*].required 解析到的 Constraint body id / PlanId 集合
 daemon 内存中持有 lease 的 active scratch
 ```
 
@@ -147,10 +147,10 @@ daemon 内存中持有 lease 的 active scratch
 schema = 1
 
 [admission]
-required_properties = []
+required = []
 
 [promotion]
-required_properties = []
+required = []
 
 [repos.linux-stable]
 url = "https://git.kernel.org/.../linux-stable.git"
@@ -162,7 +162,7 @@ url = "https://github.com/python/cpython"
 [promote_targets.gh-main]
 path = "../external-git-repo"
 branch = "main"
-required_properties = ["cargo_tests_pass"]
+required = ["cargo_tests_pass"]
 ```
 
 ```toml
@@ -170,14 +170,10 @@ required_properties = ["cargo_tests_pass"]
 version = 1
 locked_at = "2026-06-01T08:30:00Z"
 
-# Properties: property function name -> PropertyId
-[properties.empty_change]
-id         = "property:374d33205102"
-check_hash = "..."
-
-[properties.cargo_tests_pass]
-id         = "property:044b52a36644"
-check_hash = "..."
+# Constraints: constraint function name -> Constraint body id
+[constraints]
+empty_change = "constraint:374d33205102"
+cargo_tests_pass = "constraint:044b52a36644"
 
 # Repos: repo id -> resolved tree
 [repos.linux-stable]
@@ -193,26 +189,27 @@ resolved_oid = "tree-oid:..."
 resolved_at  = "2026-06-01T08:30:00Z"
 ```
 
-#### Properties 节
+#### Constraints 节
 
-来源：`properties.roto`。每次 graft 命令启动时 daemon 解析并 typecheck：
+来源：`constraints.roto`。每次需要 constraint catalog 的命令都会解析并 typecheck：
 
 ```text
-properties.roto top-level function foo(app: Application) -> Property
-  -> canonical PropertyPlan
-  -> PropertyId + check_hash
-  -> graft.lock [properties.foo]
+constraints.roto top-level function foo(app: Application) -> Constraint
+  -> ConstraintDef { name: "foo", description, body }
+  -> body_id = blake3(canonical(body))
+  -> graft.lock [constraints].foo = body_id
+  -> primitive plans materialized under store/public/plan/
 ```
 
-如果 `graft.lock` 中 `[properties.foo].check_hash` 与当前算出不一致 → drift detected。修复方式不是旁路写 lock，而是构造一个元配置 patch，把 `properties.roto` 与 `graft.lock` 的新解析结果一起 admit。
+如果 `graft.lock` 中 `[constraints].foo` 与当前算出的 body id 不一致 → drift detected。修复方式不是旁路写 lock，而是构造一个元配置 patch，把 `constraints.roto` 与 `graft.lock` 的新解析结果一起 admit。
 
 命名与边界：
 
-- Property name 是顶层函数名的原样拼写，例如 `empty_change`、`cargo_tests_pass`；不做 PascalCase alias 转换。
+- Constraint name 是顶层函数名的原样拼写，例如 `empty_change`、`cargo_tests_pass`；不做 PascalCase alias 转换。
 - Runtime primitive id 使用 `snake_case`，例如 `changed_paths`, `match`, `all_match`, `call`, `exit_code_is`, `same_output`。
 - Runtime primitive 是内部 observe/compute/decide 的 building block，不承载 workspace policy name，也不把多个可独立命名的 policy requirement 捆成一个 primitive。
-- `apply(action, base, proof) == target` 与 `replay(base, change.ops) == target` 是 Graft core application integrity，不是 property，也不是 runtime primitive；admit/materialize/promote 默认都会检查它。
-- 空 change 是普通 property，可由 workspace 在 `properties.roto` 中声明，例如 `fn empty_change(app: Application) -> Property { ... }`；非空要求也应作为 workspace policy 显式声明，而不是默认 gate。
+- `apply(action, base, proof) == target` 与 `replay(base, change.ops) == target` 是 Graft core application integrity，不是 constraint，也不是 runtime primitive；admit/materialize/promote 默认都会检查它。
+- 空 change 是普通 constraint，可由 workspace 在 `constraints.roto` 中声明，例如 `fn empty_change(app: Application) -> Constraint { ... }`；非空要求也应作为 workspace policy 显式声明，而不是默认 gate。
 
 #### Repos 节
 
@@ -258,11 +255,11 @@ graft repo update --all
 ```
 
 ```text
-[E_PROPERTY_LOCK_DRIFT]
-  properties.roto 中 X 的 check_hash 与 graft.lock [properties.X].check_hash 不一致。
+[E_CONSTRAINT_LOCK_DRIFT]
+  constraints.roto 中 X 的 body id 与 graft.lock [constraints].X 不一致。
 
   解决：构造元配置 patch，刷新 lock。
-  注意：refresh 后 PropertyId 可能漂移，旧 evidence 不再满足新 admission。
+  注意：refresh 后 primitive PlanId 可能漂移，旧 evidence 不再满足新 admission。
 ```
 
 #### 不变量
@@ -328,7 +325,7 @@ $GRAFT_HOME                 # default: ~/.graft
     default/                # ws:default system workspace root
       graft.toml
       graft.lock
-      properties.roto
+      constraints.roto
       .graft/
       worktrees/
 ```
@@ -408,16 +405,16 @@ Bootstrap creates an empty policy baseline:
 schema = 1
 
 [admission]
-required_properties = []
+required = []
 
 [promotion]
-required_properties = []
+required = []
 
 [sync]
 enabled = false
 ```
 
-`properties.roto` starts as an empty comment-only property source. The daemon writes an empty `[properties]` lock and relies on core application integrity (`apply(action, base, proof) == target` and `replay(base, change.ops) == target`) for default admission/materialization/promotion. Workspaces add explicit top-level property functions such as `empty_change`, `docs_only`, or `cargo_tests_pass` when they need policy beyond that invariant.
+`constraints.roto` starts as an empty comment-only constraint source. The daemon writes an empty `[constraints]` lock and relies on core application integrity (`apply(action, base, proof) == target` and `replay(base, change.ops) == target`) for default admission/materialization/promotion. Workspaces add explicit top-level constraint functions such as `empty_change`, `docs_only`, or `cargo_tests_pass` when they need policy beyond that invariant.
 
 Rules:
 
@@ -434,7 +431,7 @@ All workspace-owned files are changed through patch admit:
 | ---------------------------------------- | ----------------------------------------------- |
 | `graft.toml`                             | patch admit                                     |
 | `graft.lock`                             | same patch as the triggering meta-config change |
-| `properties.roto`                        | patch admit                                     |
+| `constraints.roto`                        | patch admit                                     |
 | user code/docs/data tracked by workspace | patch admit                                     |
 | `$GRAFT_HOME/registry.toml`              | daemon typed write, not a patch                 |
 | `.graft/store/`*                         | daemon internal writes                          |
@@ -445,7 +442,7 @@ Meta-config patch examples:
 - `graft repo add <repo_id> <url>` adds `[repos.<repo_id>]` and refreshes the matching lock entry.
 - `graft repo update <repo_id>` refreshes `treeish` / `resolved_oid`.
 - user adds `[promote_targets.release]`.
-- user edits `properties.roto` property function `cargo_tests_pass`.
+- user edits `constraints.roto` constraint function `cargo_tests_pass`.
 
 `graft attach` is deliberately not a meta-config patch: it only changes machine-local routing/index data in `$GRAFT_HOME/registry.toml`.
 
@@ -544,12 +541,12 @@ Configured targets:
 
 ```toml
 [promotion]
-required_properties = []
+required = []
 
 [promote_targets.release]
 path = "/Users/me/src/repo"      # may be "." after cwd resolution
 branch = "main"
-required_properties = ["cargo_tests_pass"]
+required = ["cargo_tests_pass"]
 
 [promote_targets.docs]
 path = "/Users/me/src/docs-repo"

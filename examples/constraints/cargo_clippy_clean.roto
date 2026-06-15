@@ -1,0 +1,19 @@
+// Pattern: command oracle on `app.target()`.
+//
+// Warning/non-blocking severity is no longer part of the core constraint model;
+// encode blocking/non-blocking policy at the admission/promotion layer.
+
+fn cargo_clippy_clean(app: Application) -> Constraint {
+    primitive(
+        app.run([
+            "cargo",
+            "clippy",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ]),
+        exit_zero,
+        "cargo clippy reports no warnings on the target tree",
+    )
+}

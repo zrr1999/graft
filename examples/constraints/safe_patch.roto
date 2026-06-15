@@ -1,0 +1,8 @@
+// Pattern: constraint composition through direct function calls.
+//
+// `safe_patch` composes the bodies of two other top-level constraints; there is
+// no separate `requires` registry layer.
+
+fn safe_patch(app: Application) -> Constraint {
+    both(no_generated_artifacts(app), cargo_tests_pass(app))
+}

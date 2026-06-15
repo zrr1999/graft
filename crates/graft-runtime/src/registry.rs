@@ -23,7 +23,7 @@ pub(crate) enum RegistryCommand {
     },
     /// Import a previously exported registry JSON bundle into public store
     Import {
-        /// Rewrite legacy v1 patch properties/admitted_at fields into v2 constraints while importing
+        /// Rewrite legacy v1 patch constraints/admitted_at fields into v2 constraints while importing
         #[arg(long)]
         upgrade_from_v1: bool,
         /// Input path of the JSON registry bundle
@@ -294,6 +294,18 @@ fn upgrade_bundle_from_v1(mut value: Value) -> Result<Value> {
             upgrade_patch_from_v1(object)?;
         }
     }
+    if let Some(evidence) = value.get_mut("evidence").and_then(Value::as_array_mut) {
+        for record in evidence {
+            let Some(object) = record.as_object_mut() else {
+                continue;
+            };
+            if !object.contains_key("plan")
+                && let Some(constraint) = object.remove("property")
+            {
+                object.insert("plan".to_string(), constraint);
+            }
+        }
+    }
     Ok(value)
 }
 
@@ -338,7 +350,9 @@ fn constraint_from_legacy_expected(expected: Option<&Value>) -> Result<Value> {
     })?;
     let primitives = expected
         .iter()
-        .map(|property| json!({ "kind": "primitive", "property": property }))
+        .map(
+            |property| json!({ "kind": "primitive", "plan": legacy_property_plan_value(property) }),
+        )
         .collect::<Vec<_>>();
     Ok(all_of_json(primitives))
 }
@@ -393,9 +407,19 @@ fn constraint_from_legacy_properties(properties: Option<&Value>) -> Result<Value
     })?;
     let primitives = properties
         .iter()
-        .map(|property| json!({ "kind": "primitive", "property": property }))
+        .map(
+            |property| json!({ "kind": "primitive", "plan": legacy_property_plan_value(property) }),
+        )
         .collect::<Vec<_>>();
     Ok(all_of_json(primitives))
+}
+
+fn legacy_property_plan_value(property: &Value) -> Value {
+    property
+        .as_object()
+        .and_then(|object| object.get("id"))
+        .cloned()
+        .unwrap_or_else(|| property.clone())
 }
 
 fn all_of_json(mut items: Vec<Value>) -> Value {

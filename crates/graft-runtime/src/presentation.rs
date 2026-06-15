@@ -6,7 +6,7 @@ use graft_core::{
 use graft_explain::NextAction;
 use graft_store::GraftStore;
 
-use crate::requirements::{constraint_primitives, property_label};
+use crate::requirements::{constraint_primitives, plan_label};
 use crate::resolved_application;
 use crate::view::{
     CandidateSummary, ChangeView, EvidenceCounts, EvidenceView, PatchSummary, PromotionView,
@@ -32,7 +32,7 @@ pub(crate) fn summarize_candidate_with_evidence(
         target_state: state_label(&resolved.record.target_state),
         constraint: constraint_primitives(&candidate.constraint)
             .iter()
-            .map(property_label)
+            .map(plan_label)
             .collect(),
         producer: candidate.provenance.producer.clone(),
         message: candidate.provenance.message.clone(),
@@ -54,7 +54,7 @@ pub(crate) fn summarize_patch_with_evidence(
         target_state: state_label(&resolved.record.target_state),
         constraint: constraint_primitives(&patch.constraint)
             .iter()
-            .map(property_label)
+            .map(plan_label)
             .collect(),
         producer: patch.provenance.producer.clone(),
         message: patch.provenance.message.clone(),
@@ -104,7 +104,7 @@ pub(crate) fn evidence_view(record: &EvidenceRecord) -> EvidenceView {
     EvidenceView {
         id: record.id.to_string(),
         subject: record.subject.clone(),
-        property: record.property.to_string(),
+        constraint: record.plan.to_string(),
         verifier: record.verifier.clone(),
         result: result_label(&record.result),
         created_at: record.created_at.clone(),
@@ -141,7 +141,7 @@ pub(crate) fn next_actions_for_patch(
         id: patch.id.to_string(),
         constraint_primitives: constraint_primitives(&patch.constraint)
             .iter()
-            .map(property_label)
+            .map(plan_label)
             .collect(),
         materialized,
         promoted,
@@ -162,7 +162,7 @@ pub(crate) fn next_actions_for_candidate(
         skipped: counts.skipped,
         constraint_primitives: constraint_primitives(&candidate.constraint)
             .iter()
-            .map(property_label)
+            .map(plan_label)
             .collect(),
     };
     graft_explain::next_actions::next_actions(&ctx)

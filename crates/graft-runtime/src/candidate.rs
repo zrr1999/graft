@@ -22,7 +22,7 @@ pub(crate) struct CandidateFromScratchArgs {
     scratch: String,
     #[arg(
         long = "expect",
-        help = "Whole-state property primitive to validate immediately and add to the candidate constraint, for example tests_pass (repeatable; repeats compose as all_of)"
+        help = "Whole-state constraint primitive to validate immediately and add to the candidate constraint, for example tests_pass (repeatable; repeats compose as all_of)"
     )]
     constraint: Vec<String>,
     #[arg(

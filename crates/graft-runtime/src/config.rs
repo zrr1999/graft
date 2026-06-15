@@ -2,9 +2,9 @@ use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use graft_core::{Constraint, PropertyRef, PropertySpec};
+use graft_core::{Constraint, ConstraintDef, Plan, PlanId};
 
-use crate::roto_properties::load_roto_property_specs;
+use crate::roto_constraints::{LoadedConstraints, load_roto_constraint_defs};
 use graft_store::GraftStore;
 use serde::{Deserialize, Serialize};
 
@@ -24,7 +24,9 @@ pub(crate) struct GraftConfig {
     #[serde(default)]
     pub(crate) repos: BTreeMap<String, RepoConfig>,
     #[serde(skip)]
-    pub(crate) properties: BTreeMap<String, PropertySpec>,
+    pub(crate) constraints: BTreeMap<String, ConstraintDef>,
+    #[serde(skip)]
+    pub(crate) plans: BTreeMap<PlanId, Plan>,
 }
 
 impl GraftConfig {
@@ -36,7 +38,7 @@ impl GraftConfig {
             );
         }
         self.validate_repos()?;
-        self.validate_property_names()
+        self.validate_constraint_names()
     }
 
     fn validate_repos(&self) -> Result<()> {
@@ -55,19 +57,13 @@ impl GraftConfig {
         Ok(())
     }
 
-    fn validate_property_names(&self) -> Result<()> {
-        validate_required_property_names(
-            "admission.required_properties",
-            &self.admission.required_properties,
-        )?;
-        validate_required_property_names(
-            "promotion.required_properties",
-            &self.promotion.required_properties,
-        )?;
+    fn validate_constraint_names(&self) -> Result<()> {
+        validate_required_constraint_names("admission.required", &self.admission.required)?;
+        validate_required_constraint_names("promotion.required", &self.promotion.required)?;
         for (target_id, target) in &self.promote_targets {
-            validate_required_property_names(
-                &format!("promote_targets.{target_id}.required_properties"),
-                &target.required_properties,
+            validate_required_constraint_names(
+                &format!("promote_targets.{target_id}.required"),
+                &target.required,
             )?;
         }
         Ok(())
@@ -102,7 +98,8 @@ impl Default for GraftConfig {
             sync: SyncConfig::default(),
             promote_targets: BTreeMap::new(),
             repos: BTreeMap::new(),
-            properties: BTreeMap::new(),
+            constraints: BTreeMap::new(),
+            plans: BTreeMap::new(),
         }
     }
 }
@@ -122,24 +119,24 @@ pub(crate) struct RepoConfig {
 #[serde(deny_unknown_fields)]
 pub(crate) struct AdmissionConfig {
     #[serde(default)]
-    pub(crate) required_properties: RequiredPropertiesConfig,
+    pub(crate) required: RequiredConstraintsConfig,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PromotionConfig {
     #[serde(default)]
-    pub(crate) required_properties: RequiredPropertiesConfig,
+    pub(crate) required: RequiredConstraintsConfig,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(untagged)]
-pub(crate) enum RequiredPropertiesConfig {
+pub(crate) enum RequiredConstraintsConfig {
     Expr(ConstraintConfig),
     Names(Vec<String>),
 }
 
-impl Default for RequiredPropertiesConfig {
+impl Default for RequiredConstraintsConfig {
     fn default() -> Self {
         Self::Names(Vec::new())
     }
@@ -185,25 +182,25 @@ pub(crate) struct PromoteTargetConfig {
     pub(crate) path: PathBuf,
     pub(crate) branch: Option<String>,
     #[serde(default)]
-    pub(crate) required_properties: RequiredPropertiesConfig,
+    pub(crate) required: RequiredConstraintsConfig,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct PropertyLock {
+pub(crate) struct ConstraintLock {
     #[serde(default = "graft_lock_version")]
     pub(crate) version: u32,
     #[serde(default)]
-    pub(crate) properties: BTreeMap<String, String>,
+    pub(crate) constraints: BTreeMap<String, String>,
     #[serde(default)]
     pub(crate) repos: BTreeMap<String, RepoLockEntry>,
 }
 
-impl Default for PropertyLock {
+impl Default for ConstraintLock {
     fn default() -> Self {
         Self {
             version: graft_lock_version(),
-            properties: BTreeMap::new(),
+            constraints: BTreeMap::new(),
             repos: BTreeMap::new(),
         }
     }
@@ -224,26 +221,20 @@ fn graft_lock_version() -> u32 {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct PropertyLockDrift {
+pub(crate) struct ConstraintLockDrift {
     pub(crate) missing: Vec<String>,
-    pub(crate) changed: Vec<PropertyLockChange>,
+    pub(crate) changed: Vec<ConstraintLockChange>,
     pub(crate) extra: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct PropertyLockChange {
+pub(crate) struct ConstraintLockChange {
     pub(crate) name: String,
     pub(crate) locked: String,
     pub(crate) current: String,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RequiresVisitState {
-    Visiting,
-    Done,
-}
-
-impl PropertyLockDrift {
+impl ConstraintLockDrift {
     pub(crate) fn is_clean(&self) -> bool {
         self.missing.is_empty() && self.changed.is_empty() && self.extra.is_empty()
     }
@@ -272,8 +263,10 @@ impl PropertyLockDrift {
 
 pub(crate) fn load_graft_config(store: &GraftStore) -> Result<GraftConfig> {
     let mut config = load_graft_config_metadata(store)?;
-    config.properties = load_property_defs(store)?;
-    require_property_lock_current(store, &config.properties)?;
+    let loaded = load_constraint_catalog(store)?;
+    config.constraints = loaded.defs;
+    config.plans = loaded.plans;
+    require_constraint_lock_current(store, &config.constraints)?;
     Ok(config)
 }
 
@@ -294,145 +287,104 @@ pub(crate) fn load_graft_config_metadata(store: &GraftStore) -> Result<GraftConf
     Ok(config)
 }
 
-pub(crate) fn load_property_defs(store: &GraftStore) -> Result<BTreeMap<String, PropertySpec>> {
-    let legacy_path = store.paths().properties_config();
+pub(crate) fn load_constraint_catalog(store: &GraftStore) -> Result<LoadedConstraints> {
+    let legacy_path = store.paths().legacy_properties_config();
     if legacy_path.exists() {
         bail!(
-            "[E_LEGACY_PROPERTIES_UNSUPPORTED] {} is legacy property configuration; use only the v2 properties.roto file",
+            "[E_LEGACY_CONSTRAINTS_UNSUPPORTED] {} is legacy constraint configuration; use only the v2 constraints.roto file",
             legacy_path.display()
         );
     }
-    let roto_path = store.paths().properties_roto_config();
+    let roto_path = store.paths().constraints_roto_config();
     if !roto_path.exists() {
         bail!(
             "{} does not exist; run graft init first",
             roto_path.display()
         );
     }
-    let properties = load_roto_property_specs(&roto_path)?;
-    validate_property_requires_graph(&properties)?;
-    Ok(properties)
+    let loaded = load_roto_constraint_defs(&roto_path)?;
+    validate_constraint_name_graph(&loaded.defs)?;
+    Ok(loaded)
 }
 
-pub(crate) fn validate_property_requires_graph(
-    defs: &BTreeMap<String, PropertySpec>,
-) -> Result<()> {
-    for (name, spec) in defs {
-        if spec.name.as_str() != name {
-            bail!(
-                "[E_PROPERTY_NAME_MISMATCH] property map key `{name}` contains spec named `{}`",
-                spec.name.as_str()
-            );
-        }
-        let mut seen_requires = std::collections::BTreeSet::new();
-        for required in &spec.plan.requires {
-            let required = required.as_str();
-            if !seen_requires.insert(required) {
-                bail!(
-                    "[E_PROPERTY_REQUIRES_DUPLICATE] property `{name}` lists required property `{required}` more than once"
-                );
-            }
-            if !defs.contains_key(required) {
-                bail!(
-                    "[E_PROPERTY_REQUIRES_UNKNOWN] property `{name}` requires unknown property `{required}`"
-                );
-            }
-        }
-    }
-
-    let mut states = BTreeMap::new();
-    let mut stack = Vec::new();
-    for name in defs.keys() {
-        visit_requires_graph(name, defs, &mut states, &mut stack)?;
-    }
-    Ok(())
+pub(crate) fn load_constraint_defs(store: &GraftStore) -> Result<BTreeMap<String, ConstraintDef>> {
+    Ok(load_constraint_catalog(store)?.defs)
 }
 
-fn visit_requires_graph(
-    name: &str,
-    defs: &BTreeMap<String, PropertySpec>,
-    states: &mut BTreeMap<String, RequiresVisitState>,
-    stack: &mut Vec<String>,
-) -> Result<()> {
-    match states.get(name).copied() {
-        Some(RequiresVisitState::Done) => return Ok(()),
-        Some(RequiresVisitState::Visiting) => {
-            let start = stack
-                .iter()
-                .position(|entry| entry == name)
-                .unwrap_or_default();
-            let mut cycle = stack[start..].to_vec();
-            cycle.push(name.to_string());
-            bail!(
-                "[E_PROPERTY_REQUIRES_CYCLE] property requires cycle: {}",
-                cycle.join(" -> ")
-            );
-        }
-        None => {}
-    }
-
-    states.insert(name.to_string(), RequiresVisitState::Visiting);
-    stack.push(name.to_string());
-    let spec = defs
-        .get(name)
-        .with_context(|| format!("missing property `{name}` while walking requires graph"))?;
-    for required in &spec.plan.requires {
-        visit_requires_graph(required.as_str(), defs, states, stack)?;
-    }
-    stack.pop();
-    states.insert(name.to_string(), RequiresVisitState::Done);
-    Ok(())
-}
-
-pub(crate) fn property_lock_path(store: &GraftStore) -> PathBuf {
-    store.paths().properties_lock()
-}
-
-pub(crate) fn current_property_lock(defs: &BTreeMap<String, PropertySpec>) -> Result<PropertyLock> {
-    validate_property_requires_graph(defs)?;
-    let mut properties = BTreeMap::new();
+pub(crate) fn validate_constraint_name_graph(defs: &BTreeMap<String, ConstraintDef>) -> Result<()> {
     for (name, def) in defs {
-        properties.insert(name.clone(), def.property_id()?.to_string());
+        if def.name != *name {
+            bail!(
+                "[E_CONSTRAINT_NAME_MISMATCH] constraint map key `{name}` contains constraint named `{}`",
+                def.name
+            );
+        }
     }
-    Ok(PropertyLock {
+    Ok(())
+}
+
+pub(crate) fn constraint_lock_path(store: &GraftStore) -> PathBuf {
+    store.paths().constraints_lock()
+}
+
+pub(crate) fn current_constraint_lock(
+    defs: &BTreeMap<String, ConstraintDef>,
+) -> Result<ConstraintLock> {
+    validate_constraint_name_graph(defs)?;
+    let mut constraints = BTreeMap::new();
+    for (name, def) in defs {
+        constraints.insert(name.clone(), def.body_id()?);
+    }
+    Ok(ConstraintLock {
         version: graft_lock_version(),
-        properties,
+        constraints,
         repos: BTreeMap::new(),
     })
 }
 
-pub(crate) fn read_property_lock(store: &GraftStore) -> Result<Option<PropertyLock>> {
-    let path = property_lock_path(store);
+pub(crate) fn read_constraint_lock(store: &GraftStore) -> Result<Option<ConstraintLock>> {
+    let path = constraint_lock_path(store);
     if !path.exists() {
         return Ok(None);
     }
     let text =
         std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-    let lock: PropertyLock =
+    let lock: ConstraintLock =
         toml::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
     Ok(Some(lock))
 }
 
-fn write_graft_lock(store: &GraftStore, lock: &PropertyLock) -> Result<()> {
-    let path = property_lock_path(store);
+fn write_graft_lock(store: &GraftStore, lock: &ConstraintLock) -> Result<()> {
+    let path = constraint_lock_path(store);
     let text = toml::to_string_pretty(lock).context("serialize graft.lock")?;
     std::fs::write(
         &path,
-        format!("# @generated by graft property lock; do not edit by hand\n{text}"),
+        format!("# @generated by graft constraint lock; do not edit by hand\n{text}"),
     )
     .with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }
 
-pub(crate) fn write_property_lock(
+pub(crate) fn write_constraint_lock(
     store: &GraftStore,
-    defs: &BTreeMap<String, PropertySpec>,
-) -> Result<PropertyLock> {
-    for spec in defs.values() {
-        store.write_property_spec(spec)?;
+    defs: &BTreeMap<String, ConstraintDef>,
+) -> Result<ConstraintLock> {
+    write_constraint_lock_with_plans(store, defs, &BTreeMap::new())
+}
+
+pub(crate) fn write_constraint_lock_with_plans(
+    store: &GraftStore,
+    defs: &BTreeMap<String, ConstraintDef>,
+    plans: &BTreeMap<PlanId, Plan>,
+) -> Result<ConstraintLock> {
+    for plan in plans.values() {
+        store.write_plan(plan)?;
     }
-    let mut lock = current_property_lock(defs)?;
-    if let Some(existing) = read_property_lock(store)? {
+    for def in defs.values() {
+        store.write_constraint_def(def)?;
+    }
+    let mut lock = current_constraint_lock(defs)?;
+    if let Some(existing) = read_constraint_lock(store)? {
         lock.repos = existing.repos;
     }
     write_graft_lock(store, &lock)?;
@@ -445,10 +397,10 @@ pub(crate) fn write_repo_lock_entry(
     url: &str,
     treeish: &str,
     resolved_oid: &str,
-) -> Result<PropertyLock> {
-    let Some(mut lock) = read_property_lock(store)? else {
+) -> Result<ConstraintLock> {
+    let Some(mut lock) = read_constraint_lock(store)? else {
         bail!(
-            "[E_PROPERTY_LOCK_MISSING] graft.lock is missing; run `graft property lock` before locking repository refs"
+            "[E_CONSTRAINT_LOCK_MISSING] graft.lock is missing; run `graft constraint lock` before locking repository refs"
         );
     };
     lock.version = graft_lock_version();
@@ -471,9 +423,9 @@ pub(crate) fn require_repo_lock_current(
     repo_config: &RepoConfig,
     requested_treeish: &str,
 ) -> Result<RepoLockEntry> {
-    let Some(lock) = read_property_lock(store)? else {
+    let Some(lock) = read_constraint_lock(store)? else {
         bail!(
-            "[E_PROPERTY_LOCK_MISSING] graft.lock is missing; run `graft property lock` before resolving repository bases"
+            "[E_CONSTRAINT_LOCK_MISSING] graft.lock is missing; run `graft constraint lock` before resolving repository bases"
         );
     };
     let Some(entry) = lock.repos.get(repo_id) else {
@@ -508,55 +460,57 @@ pub(crate) fn require_repo_lock_current(
     Ok(entry.clone())
 }
 
-pub(crate) fn property_lock_drift(
-    defs: &BTreeMap<String, PropertySpec>,
-    lock: &PropertyLock,
-) -> Result<PropertyLockDrift> {
-    let current = current_property_lock(defs)?;
-    let mut drift = PropertyLockDrift::default();
-    for (name, current_id) in &current.properties {
-        match lock.properties.get(name) {
+pub(crate) fn constraint_lock_drift(
+    defs: &BTreeMap<String, ConstraintDef>,
+    lock: &ConstraintLock,
+) -> Result<ConstraintLockDrift> {
+    let current = current_constraint_lock(defs)?;
+    let mut drift = ConstraintLockDrift::default();
+    for (name, current_id) in &current.constraints {
+        match lock.constraints.get(name) {
             None => drift.missing.push(name.clone()),
-            Some(locked_id) if locked_id != current_id => drift.changed.push(PropertyLockChange {
-                name: name.clone(),
-                locked: locked_id.clone(),
-                current: current_id.clone(),
-            }),
+            Some(locked_id) if locked_id != current_id => {
+                drift.changed.push(ConstraintLockChange {
+                    name: name.clone(),
+                    locked: locked_id.clone(),
+                    current: current_id.clone(),
+                })
+            }
             Some(_) => {}
         }
     }
-    for name in lock.properties.keys() {
-        if !current.properties.contains_key(name) {
+    for name in lock.constraints.keys() {
+        if !current.constraints.contains_key(name) {
             drift.extra.push(name.clone());
         }
     }
     Ok(drift)
 }
 
-pub(crate) fn require_property_lock_current(
+pub(crate) fn require_constraint_lock_current(
     store: &GraftStore,
-    defs: &BTreeMap<String, PropertySpec>,
-) -> Result<PropertyLock> {
-    let Some(lock) = read_property_lock(store)? else {
+    defs: &BTreeMap<String, ConstraintDef>,
+) -> Result<ConstraintLock> {
+    let Some(lock) = read_constraint_lock(store)? else {
         bail!(
-            "[E_PROPERTY_LOCK_MISSING] graft.lock is missing; run `graft property lock` to derive property ids from properties.roto"
+            "[E_CONSTRAINT_LOCK_MISSING] graft.lock is missing; run `graft constraint lock` to derive constraint ids from constraints.roto"
         );
     };
-    let drift = property_lock_drift(defs, &lock)?;
+    let drift = constraint_lock_drift(defs, &lock)?;
     if !drift.is_clean() {
         bail!(
-            "[E_PROPERTY_LOCK_DRIFT] graft.lock is stale ({}); run `graft property lock` to refresh it",
+            "[E_CONSTRAINT_LOCK_DRIFT] graft.lock is stale ({}); run `graft constraint lock` to refresh it",
             drift.summary()
         );
     }
     Ok(lock)
 }
 
-pub(crate) fn resolve_property(config: &GraftConfig, name: &str) -> Result<PropertyRef> {
-    let spec = config.properties.get(name).with_context(|| {
-        format!("[E_UNKNOWN_PROPERTY] property {name} is not configured in properties.roto")
+pub(crate) fn resolve_constraint(config: &GraftConfig, name: &str) -> Result<Constraint> {
+    let def = config.constraints.get(name).with_context(|| {
+        format!("[E_UNKNOWN_CONSTRAINT] constraint {name} is not configured in constraints.roto")
     })?;
-    spec.property_ref().map_err(Into::into)
+    Ok(def.body.clone())
 }
 
 fn validate_repo_id(repo_id: &str) -> Result<()> {
@@ -575,17 +529,17 @@ fn validate_repo_id(repo_id: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn required_properties_constraint(
+pub(crate) fn required_constraints_constraint(
     config: &GraftConfig,
-    required: &RequiredPropertiesConfig,
+    required: &RequiredConstraintsConfig,
 ) -> Result<Constraint> {
     match required {
-        RequiredPropertiesConfig::Names(names) => names
+        RequiredConstraintsConfig::Names(names) => names
             .iter()
             .map(|name| constraint_primitive(config, name))
             .collect::<Result<Vec<_>>>()
             .map(Constraint::all_of),
-        RequiredPropertiesConfig::Expr(expr) => constraint_expr(config, expr),
+        RequiredConstraintsConfig::Expr(expr) => constraint_expr(config, expr),
     }
 }
 
@@ -654,30 +608,26 @@ fn constraint_term(config: &GraftConfig, term: &ConstraintTermConfig) -> Result<
 }
 
 fn constraint_primitive(config: &GraftConfig, value: &str) -> Result<Constraint> {
-    validate_property_name("property requirement", value)?;
-    Ok(Constraint::Primitive {
-        property: resolve_property(config, value)?,
-    })
+    validate_constraint_name("constraint requirement", value)?;
+    resolve_constraint(config, value)
 }
 
-fn validate_required_property_names(
+fn validate_required_constraint_names(
     label: &str,
-    properties: &RequiredPropertiesConfig,
+    constraints: &RequiredConstraintsConfig,
 ) -> Result<()> {
-    match properties {
-        RequiredPropertiesConfig::Names(names) => {
+    match constraints {
+        RequiredConstraintsConfig::Names(names) => {
             for name in names {
-                validate_property_name(label, name)?;
+                validate_constraint_name(label, name)?;
             }
         }
-        RequiredPropertiesConfig::Expr(expr) => {
-            validate_constraint_expr_property_names(label, expr)?
-        }
+        RequiredConstraintsConfig::Expr(expr) => validate_constraint_expr_names(label, expr)?,
     }
     Ok(())
 }
 
-fn validate_constraint_expr_property_names(label: &str, expr: &ConstraintConfig) -> Result<()> {
+fn validate_constraint_expr_names(label: &str, expr: &ConstraintConfig) -> Result<()> {
     for item in expr
         .all_of
         .iter()
@@ -686,29 +636,29 @@ fn validate_constraint_expr_property_names(label: &str, expr: &ConstraintConfig)
         .chain(expr.either.iter())
         .flatten()
     {
-        validate_constraint_term_property_names(label, item)?;
+        validate_constraint_term_names(label, item)?;
     }
     if let Some(primitive) = &expr.primitive {
-        validate_property_name(label, primitive)?;
+        validate_constraint_name(label, primitive)?;
     }
     Ok(())
 }
 
-fn validate_constraint_term_property_names(label: &str, term: &ConstraintTermConfig) -> Result<()> {
+fn validate_constraint_term_names(label: &str, term: &ConstraintTermConfig) -> Result<()> {
     match term {
-        ConstraintTermConfig::Name(name) => validate_property_name(label, name)?,
-        ConstraintTermConfig::Expr(expr) => validate_constraint_expr_property_names(label, expr)?,
+        ConstraintTermConfig::Name(name) => validate_constraint_name(label, name)?,
+        ConstraintTermConfig::Expr(expr) => validate_constraint_expr_names(label, expr)?,
     }
     Ok(())
 }
 
-fn validate_property_name(label: &str, value: &str) -> Result<()> {
+fn validate_constraint_name(label: &str, value: &str) -> Result<()> {
     if value.trim().is_empty() {
-        bail!("[E_INVALID_PROPERTY] {label} contains an empty property name");
+        bail!("[E_INVALID_CONSTRAINT] {label} contains an empty constraint name");
     }
     if value.contains(':') {
         bail!(
-            "[E_SCOPED_PROPERTY_UNSUPPORTED] {label} uses `{value}`, but property requirements must be bare names; properties are whole-workspace by definition"
+            "[E_SCOPED_CONSTRAINT_UNSUPPORTED] {label} uses `{value}`, but constraint requirements must be bare names; constraints are whole-workspace by definition"
         );
     }
     Ok(())
@@ -760,7 +710,7 @@ fn resolve_config_path(workspace: &Path, path: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use graft_core::{CheckPlan, PropertyName, PropertyPlan, Severity};
+    use graft_core::{Assertion, Observation};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn parse_config(text: &str) -> GraftConfig {
@@ -780,96 +730,68 @@ mod tests {
         ))
     }
 
-    fn test_property_spec(name: &str, requires: &[&str]) -> PropertySpec {
-        PropertySpec {
-            name: PropertyName::new(name),
-            plan: PropertyPlan {
-                checks: vec![CheckPlan::Unavailable {
-                    reason: format!("{name} check"),
-                }],
-                requires: requires
-                    .iter()
-                    .map(|name| PropertyName::new(*name))
-                    .collect(),
-            },
-            description: format!("{name} property"),
-            severity: Severity::Blocking,
-            source_ref: None,
+    fn plan_id(name: &str) -> PlanId {
+        PlanId::new(format!("plan:{name}"))
+    }
+
+    fn constraint_def(name: &str) -> ConstraintDef {
+        ConstraintDef {
+            name: name.to_string(),
+            description: format!("{name} constraint"),
+            body: Constraint::primitive(plan_id(name)),
         }
     }
 
-    fn config_with_properties(text: &str, names: &[&str]) -> GraftConfig {
+    fn config_with_constraints(text: &str, names: &[&str]) -> GraftConfig {
         let mut config = parse_config(text);
         for name in names {
             config
-                .properties
-                .insert((*name).to_string(), test_property_spec(name, &[]));
+                .constraints
+                .insert((*name).to_string(), constraint_def(name));
         }
         config
     }
 
     #[test]
-    fn required_properties_flat_list_lowers_to_all_of_constraint() {
-        let config = config_with_properties(
+    fn required_flat_list_lowers_to_all_of_constraint_bodies() {
+        let config = config_with_constraints(
             r#"
 [admission]
-required_properties = ["fmt_clean", "tests_pass"]
+required = ["fmt_clean", "tests_pass"]
 "#,
             &["fmt_clean", "tests_pass"],
         );
 
         let constraint =
-            required_properties_constraint(&config, &config.admission.required_properties).unwrap();
+            required_constraints_constraint(&config, &config.admission.required).unwrap();
 
         assert_eq!(
             constraint,
             Constraint::all_of(vec![
-                Constraint::primitive(resolve_property(&config, "fmt_clean").unwrap()),
-                Constraint::primitive(resolve_property(&config, "tests_pass").unwrap()),
+                resolve_constraint(&config, "fmt_clean").unwrap(),
+                resolve_constraint(&config, "tests_pass").unwrap(),
             ])
         );
     }
 
     #[test]
-    fn required_properties_tagged_all_of_lowers_to_both_constraint() {
-        let config = config_with_properties(
+    fn required_tagged_any_of_lowers_to_either_constraint() {
+        let config = config_with_constraints(
             r#"
-[admission.required_properties]
-all_of = ["fmt_clean", "tests_pass"]
-"#,
-            &["fmt_clean", "tests_pass"],
-        );
-
-        let constraint =
-            required_properties_constraint(&config, &config.admission.required_properties).unwrap();
-
-        assert_eq!(
-            constraint,
-            Constraint::all_of(vec![
-                Constraint::primitive(resolve_property(&config, "fmt_clean").unwrap(),),
-                Constraint::primitive(resolve_property(&config, "tests_pass").unwrap(),),
-            ])
-        );
-    }
-
-    #[test]
-    fn required_properties_tagged_any_of_lowers_to_either_constraint() {
-        let config = config_with_properties(
-            r#"
-[admission.required_properties]
+[admission.required]
 any_of = ["fast_check", "slow_check"]
 "#,
             &["fast_check", "slow_check"],
         );
 
         let constraint =
-            required_properties_constraint(&config, &config.admission.required_properties).unwrap();
+            required_constraints_constraint(&config, &config.admission.required).unwrap();
 
         assert_eq!(
             constraint,
             Constraint::any_of(vec![
-                Constraint::primitive(resolve_property(&config, "fast_check").unwrap()),
-                Constraint::primitive(resolve_property(&config, "slow_check").unwrap()),
+                resolve_constraint(&config, "fast_check").unwrap(),
+                resolve_constraint(&config, "slow_check").unwrap(),
             ])
         );
     }
@@ -965,26 +887,12 @@ branch = "{value}"
     #[test]
     fn sync_config_is_enabled_unless_explicitly_disabled() {
         assert!(parse_config("").sync.enabled);
-
-        let config = parse_config(
-            r#"
-[sync]
-enabled = true
-"#,
-        );
-        assert!(config.sync.enabled);
-
-        let config = parse_config(
-            r#"
-[sync]
-enabled = false
-"#,
-        );
-        assert!(!config.sync.enabled);
+        assert!(parse_config("[sync]\nenabled = true\n").sync.enabled);
+        assert!(!parse_config("[sync]\nenabled = false\n").sync.enabled);
     }
 
     #[test]
-    fn load_graft_config_requires_existing_property_lock() {
+    fn load_graft_config_requires_existing_constraint_lock() {
         let dir = test_workspace("missing-lock-load");
         let store = GraftStore::open(&dir);
         store.init().unwrap();
@@ -992,7 +900,7 @@ enabled = false
 
         let error = load_graft_config(&store).unwrap_err().to_string();
 
-        assert!(error.contains("[E_PROPERTY_LOCK_MISSING]"), "{error}");
+        assert!(error.contains("[E_CONSTRAINT_LOCK_MISSING]"), "{error}");
         assert!(
             !dir.join("graft.lock").exists(),
             "read-only config load must not recreate graft.lock"
@@ -1001,137 +909,122 @@ enabled = false
     }
 
     #[test]
-    fn load_property_defs_discovers_v2_top_level_property_functions() {
-        let dir = test_workspace("v2-roto-load");
+    fn load_constraint_defs_discovers_three_layer_constraint_functions() {
+        let dir = test_workspace("roto-load");
         let store = GraftStore::open(&dir);
         store.init().unwrap();
         std::fs::write(
-            dir.join("properties.roto"),
+            dir.join("constraints.roto"),
             r#"
-fn helper(app: Application) -> Check {
-    unavailable("helper only")
+fn no_generated_artifacts(app: Application) -> Constraint {
+    primitive(app.changed_paths(["target/**", "*.tmp"]), no_match, "no generated artifacts")
 }
 
-fn no_generated_artifacts(app: Application) -> Property {
-    property(
-        [app.changed_paths().any_match(["target/**", "*.tmp"]).failure()],
-        "no generated artifacts",
-        Severity.Blocking,
-        [],
-    )
-}
-
-fn cargo_tests_pass(app: Application) -> Property {
-    property(
-        [call(["cargo", "test", "--all-targets"], app.target()).exit_code_is(0).success()],
-        "cargo tests pass",
-        Severity.Warning,
-        ["no_generated_artifacts"],
-    )
+fn cargo_tests_pass(app: Application) -> Constraint {
+    primitive(app.run(["cargo", "test", "--all-targets"]), exit_zero, "cargo tests pass")
 }
 "#,
         )
         .unwrap();
 
-        let properties = load_property_defs(&store).unwrap();
+        let catalog = load_constraint_catalog(&store).unwrap();
 
         assert_eq!(
-            properties.keys().cloned().collect::<Vec<_>>(),
+            catalog.defs.keys().cloned().collect::<Vec<_>>(),
             vec!["cargo_tests_pass", "no_generated_artifacts"]
         );
-        let cargo = properties.get("cargo_tests_pass").unwrap();
-        assert_eq!(cargo.name.as_str(), "cargo_tests_pass");
-        assert_eq!(
-            cargo.plan.requires,
-            vec![PropertyName::new("no_generated_artifacts")]
-        );
-        assert_eq!(cargo.severity, graft_core::Severity::Warning);
+        assert_eq!(catalog.defs["cargo_tests_pass"].name, "cargo_tests_pass");
+        assert_eq!(catalog.plans.len(), 2);
         assert!(
-            cargo
-                .property_id()
-                .unwrap()
-                .as_str()
-                .starts_with("property:")
+            catalog
+                .plans
+                .values()
+                .any(|plan| matches!(plan.assertion, Assertion::ExitCodeIs { code: 0 }))
         );
         std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
-    fn property_requires_graph_rejects_missing_dependencies() {
+    fn validate_constraint_name_graph_rejects_name_mismatch() {
         let defs = BTreeMap::from([(
             "cargo_tests_pass".to_string(),
-            test_property_spec("cargo_tests_pass", &["no_generated_artifacts"]),
+            ConstraintDef {
+                name: "different".to_string(),
+                description: "mismatch".to_string(),
+                body: Constraint::primitive(plan_id("cargo_tests_pass")),
+            },
         )]);
 
-        let error = validate_property_requires_graph(&defs)
+        let error = validate_constraint_name_graph(&defs)
             .unwrap_err()
             .to_string();
 
-        assert!(error.contains("[E_PROPERTY_REQUIRES_UNKNOWN]"), "{error}");
-        assert!(error.contains("cargo_tests_pass"), "{error}");
-        assert!(error.contains("no_generated_artifacts"), "{error}");
+        assert!(error.contains("[E_CONSTRAINT_NAME_MISMATCH]"), "{error}");
     }
 
     #[test]
-    fn property_requires_graph_rejects_cycles() {
-        let defs = BTreeMap::from([
-            ("a".to_string(), test_property_spec("a", &["b"])),
-            ("b".to_string(), test_property_spec("b", &["c"])),
-            ("c".to_string(), test_property_spec("c", &["a"])),
-        ]);
+    fn constraint_lock_uses_constraint_body_identity_not_description() {
+        let first = BTreeMap::from([(
+            "cargo_tests_pass".to_string(),
+            ConstraintDef {
+                name: "cargo_tests_pass".to_string(),
+                description: "first description".to_string(),
+                body: Constraint::primitive(plan_id("cargo_tests_pass")),
+            },
+        )]);
+        let second = BTreeMap::from([(
+            "cargo_tests_pass".to_string(),
+            ConstraintDef {
+                name: "cargo_tests_pass".to_string(),
+                description: "second description".to_string(),
+                body: Constraint::primitive(plan_id("cargo_tests_pass")),
+            },
+        )]);
 
-        let error = validate_property_requires_graph(&defs)
-            .unwrap_err()
-            .to_string();
-
-        assert!(error.contains("[E_PROPERTY_REQUIRES_CYCLE]"), "{error}");
-        assert!(error.contains("a -> b -> c -> a"), "{error}");
+        assert_eq!(
+            current_constraint_lock(&first).unwrap().constraints,
+            current_constraint_lock(&second).unwrap().constraints
+        );
     }
 
     #[test]
-    fn property_lock_for_v2_roto_uses_static_plan_identity() {
-        let dir = test_workspace("v2-roto-lock");
+    fn write_constraint_lock_with_plans_materializes_constraint_defs_and_plans() {
+        let dir = test_workspace("lock-with-plans");
         let store = GraftStore::open(&dir);
         store.init().unwrap();
-        let first = r#"
-fn cargo_tests_pass(app: Application) -> Property {
-    property(
-        [call(["cargo", "test"], app.target()).exit_code_is(0).success()],
-        "first description",
-        Severity.Blocking,
-        [],
-    )
-}
-"#;
-        let second = r#"
-// comments and metadata do not affect v2 property identity
-fn cargo_tests_pass(app: Application) -> Property {
-    let check = call(["cargo", "test"], app.target()).exit_code_is(0).success();
-    property(
-        [check],
-        "second description",
-        Severity.Info,
-        [],
-    )
-}
-"#;
+        let plan = Plan {
+            observation: Observation::ChangedPaths {
+                patterns: vec!["src/**".to_string()],
+            },
+            assertion: Assertion::PathsAnyMatch,
+        };
+        let plan_id = plan.plan_id().unwrap();
+        let defs = BTreeMap::from([(
+            "source_changed".to_string(),
+            ConstraintDef {
+                name: "source_changed".to_string(),
+                description: "source changes".to_string(),
+                body: Constraint::primitive(plan_id.clone()),
+            },
+        )]);
+        let plans = BTreeMap::from([(plan_id.clone(), plan)]);
 
-        std::fs::write(dir.join("properties.roto"), first).unwrap();
-        let first_defs = load_property_defs(&store).unwrap();
-        let first_lock = current_property_lock(&first_defs).unwrap();
-        write_property_lock(&store, &first_defs).unwrap();
+        let lock = write_constraint_lock_with_plans(&store, &defs, &plans).unwrap();
 
-        std::fs::write(dir.join("properties.roto"), second).unwrap();
-        let second_defs = load_property_defs(&store).unwrap();
-        let second_lock = current_property_lock(&second_defs).unwrap();
-
-        assert_eq!(first_lock.properties, second_lock.properties);
-        assert!(store.paths().object_properties().exists());
+        assert_eq!(lock.constraints.len(), 1);
+        assert!(store.paths().object_constraints().exists());
+        assert!(
+            store
+                .paths()
+                .object_plans()
+                .join(format!("{plan_id}.json"))
+                .exists()
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
-    fn repo_lock_entry_requires_existing_property_lock_and_preserves_properties() {
+    fn repo_lock_entry_requires_existing_constraint_lock_and_preserves_constraints() {
         let dir = test_workspace("repo-lock-existing");
         let store = GraftStore::open(&dir);
         store.init().unwrap();
@@ -1146,10 +1039,10 @@ fn cargo_tests_pass(app: Application) -> Property {
         )
         .unwrap_err()
         .to_string();
-        assert!(missing.contains("[E_PROPERTY_LOCK_MISSING]"), "{missing}");
+        assert!(missing.contains("[E_CONSTRAINT_LOCK_MISSING]"), "{missing}");
 
         let defs = BTreeMap::new();
-        write_property_lock(&store, &defs).unwrap();
+        write_constraint_lock(&store, &defs).unwrap();
         let lock = write_repo_lock_entry(
             &store,
             "demo",
@@ -1159,7 +1052,7 @@ fn cargo_tests_pass(app: Application) -> Property {
         )
         .unwrap();
 
-        assert!(lock.properties.is_empty());
+        assert!(lock.constraints.is_empty());
         assert_eq!(
             lock.repos
                 .get("demo")
@@ -1232,17 +1125,17 @@ path = "../release"
     }
 
     #[test]
-    fn load_property_defs_rejects_legacy_properties_directory() {
+    fn load_constraint_defs_rejects_legacy_constraints_directory() {
         let dir = test_workspace("legacy-properties-dir");
         let store = GraftStore::open(&dir);
         store.init().unwrap();
-        std::fs::remove_file(dir.join("properties.roto")).unwrap();
+        std::fs::remove_file(dir.join("constraints.roto")).unwrap();
         std::fs::create_dir(dir.join("properties")).unwrap();
         std::fs::write(dir.join("properties").join("Old.toml"), "name = \"Old\"\n").unwrap();
 
-        let err = load_property_defs(&store).unwrap_err().to_string();
+        let err = load_constraint_defs(&store).unwrap_err().to_string();
 
-        assert!(err.contains("[E_LEGACY_PROPERTIES_UNSUPPORTED]"), "{err}");
+        assert!(err.contains("[E_LEGACY_CONSTRAINTS_UNSUPPORTED]"), "{err}");
         std::fs::remove_dir_all(dir).ok();
     }
 }

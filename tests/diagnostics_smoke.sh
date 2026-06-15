@@ -35,21 +35,14 @@ if ! grep -q 'validation completed' <<<"$validate_out"; then
   exit 1
 fi
 
-write_properties_roto <<'ROTO'
-fn touches_unvalidated(app: Application) -> Property {
-    property(
-        [
-            app.changed_paths().any_match(["unvalidated.txt"]).success(),
-        ],
-        "change touches the intentionally unvalidated smoke file",
-        Severity.Blocking,
-        [],
-    )
+write_constraints_roto <<'ROTO'
+fn touches_unvalidated(app: Application) -> Constraint {
+    primitive(app.changed_paths(["unvalidated.txt"]), any_match, "change touches the intentionally unvalidated smoke file")
 }
 ROTO
-lock_properties
+lock_constraints
 
-# 2) Admit without passing evidence for an explicit property must surface A001/A002 diagnostics.
+# 2) Admit without passing evidence for an explicit constraint must surface A001/A002 diagnostics.
 scratch_out2=$("$GRAFT_BIN" scratch write --base graft:empty unvalidated.txt --content $'unvalidated\n')
 scratch2=$(grep -oE 'scratch:[0-9a-f]+' <<<"$scratch_out2" | tail -n1)
 [[ -n $scratch2 ]] || { echo "FAIL: no scratch captured for admit smoke"; echo "$scratch_out2"; exit 1; }

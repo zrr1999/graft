@@ -17,11 +17,11 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+pub mod constraints;
 pub mod diagnostics;
 pub mod evidence_result;
 pub mod explain;
 pub mod next_actions;
-pub mod properties;
 
 /// A node in graft's user-visible vocabulary that can describe itself.
 ///
@@ -220,7 +220,7 @@ pub struct Diagnostic {
     pub code: DiagCode,
     /// Single-line summary of what this diagnostic means. No newlines.
     pub summary: String,
-    /// Optional precise locus: candidate id, file path, property name, etc.
+    /// Optional precise locus: candidate id, file path, constraint name, etc.
     /// Free-form because graft's "location" varies by subsystem.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub loc: Option<String>,

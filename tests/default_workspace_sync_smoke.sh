@@ -74,10 +74,10 @@ if [[ -e "$REMOTE/graft-public" ]]; then
 fi
 
 "$GRAFT" --cwd "$UNATTACHED" attach >/dev/null
-property_check=$("$GRAFT" --cwd "$UNATTACHED" property check)
-grep -q 'property lock current' <<<"$property_check" || {
-  echo "FAIL: explicit default workspace is missing a usable property lock"
-  echo "$property_check"
+constraint_check=$("$GRAFT" --cwd "$UNATTACHED" constraint check)
+grep -q 'constraint lock current' <<<"$constraint_check" || {
+  echo "FAIL: explicit default workspace is missing a usable constraint lock"
+  echo "$constraint_check"
   exit 1
 }
 set +e

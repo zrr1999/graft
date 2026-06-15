@@ -49,13 +49,13 @@ require_local_socket_bind() {
   require_local_socket_bind_available "$probe_path"
 }
 
-write_properties_roto() {
-  cat > properties.roto
+write_constraints_roto() {
+  cat > constraints.roto
 }
 
-lock_properties() {
+lock_constraints() {
   local graft_bin="${GRAFT_BIN:-${GRAFT:-}}"
-  "$graft_bin" property lock >/dev/null
+  "$graft_bin" constraint lock >/dev/null
 }
 
 first_graft_id() {

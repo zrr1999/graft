@@ -1,0 +1,68 @@
+fn no_generated_artifacts(app: Application) -> Constraint {
+    primitive(
+        app.changed_paths([
+            "target/**",
+            "dist/**",
+            "build/**",
+        ]),
+        no_match,
+        "patch does not contain generated build artifacts",
+    )
+}
+
+fn cargo_tests_pass(app: Application) -> Constraint {
+    primitive(
+        app.run(["cargo", "test", "--all-targets"]),
+        exit_zero,
+        "cargo test --all-targets passes on the target tree",
+    )
+}
+
+fn safe_patch(app: Application) -> Constraint {
+    both(no_generated_artifacts(app), cargo_tests_pass(app))
+}
+
+fn precision_invariance(app: Application) -> Constraint {
+    let base_run = call(["bash", "./run.sh"], app.base());
+    let target_run = call(["bash", "./run.sh"], app.target());
+
+    primitive(
+        same_output(base_run, target_run, [
+            post_file("./alignment/expected.json"),
+            stdout,
+        ]),
+        outputs_same,
+        "selected outputs are identical between base and target runs",
+    )
+}
+
+fn training_alignment(app: Application) -> Constraint {
+    let target = primitive(
+        app.run(["bash", "./check_diff.sh"]),
+        exit_zero,
+        "target validator succeeds",
+    );
+
+    let prev = app.previous_failure(History.First);
+    let checker = app.target().file("./check_diff.sh");
+    let bad_tree = prev.target().with_overlay([
+        replace_file("./check_diff.sh", checker),
+    ]);
+    let bad_run = call(["bash", "./check_diff.sh"], bad_tree);
+
+    both(
+        target,
+        either(
+            primitive(
+                app.changed_paths(["check_diff.sh", "compare.py"]),
+                no_match,
+                "validator files are unchanged",
+            ),
+            primitive(
+                observe_run(bad_run),
+                exit_nonzero,
+                "historical counterexample is still rejected",
+            ),
+        ),
+    )
+}

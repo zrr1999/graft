@@ -21,26 +21,26 @@ use crate::{DiagCode, DiagDomain, Diagnostic};
 // V — validate / verify
 // =====================================================================
 
-/// V001 — declared expected property is not defined in `graft.toml`.
-pub fn v001_unknown_property(property: &str) -> Diagnostic {
+/// V001 — declared expected constraint is not defined in `graft.toml`.
+pub fn v001_unknown_constraint(constraint: &str) -> Diagnostic {
     Diagnostic::new(
         DiagCode::new(DiagDomain::Validate, 1),
-        format!("property `{property}` is not declared in graft.toml and not a builtin"),
+        format!("constraint `{constraint}` is not declared in graft.toml and not a builtin"),
     )
-    .at(property.to_string())
-    .fix("declare it under [properties.<name>] in graft.toml, or pass a builtin name")
-    .see("properties")
+    .at(constraint.to_string())
+    .fix("declare it under [constraints.<name>] in graft.toml, or pass a builtin name")
+    .see("constraints")
     .see("graft.toml")
 }
 
-/// V002 — property verifier rejected the candidate; the patch was observed
-/// to violate the expected property.
-pub fn v002_property_violated(property: &str, detail: &str) -> Diagnostic {
+/// V002 — constraint verifier rejected the candidate; the patch was observed
+/// to violate the expected constraint.
+pub fn v002_constraint_violated(constraint: &str, detail: &str) -> Diagnostic {
     Diagnostic::new(
         DiagCode::new(DiagDomain::Validate, 2),
-        format!("property `{property}` was observed violated"),
+        format!("constraint `{constraint}` was observed violated"),
     )
-    .at(property.to_string())
+    .at(constraint.to_string())
     .fix(format!("inspect: {}", one_line(detail)))
     .fix("amend the candidate worktree and run `graft patch validate` again")
     .see("validate")
@@ -67,28 +67,28 @@ pub fn v003_base_unmaterializable(detail: &str) -> Diagnostic {
 }
 
 /// V004 — verifier command exited non-zero.
-pub fn v004_command_verifier_nonzero(property: &str, command: &str, exit: &str) -> Diagnostic {
+pub fn v004_command_verifier_nonzero(constraint: &str, command: &str, exit: &str) -> Diagnostic {
     Diagnostic::new(
         DiagCode::new(DiagDomain::Validate, 4),
-        format!("verify command for `{property}` exited unsuccessfully ({exit})"),
+        format!("verify command for `{constraint}` exited unsuccessfully ({exit})"),
     )
-    .at(format!("{property}: {}", one_line(command)))
+    .at(format!("{constraint}: {}", one_line(command)))
     .fix("re-run the command in the validation worktree to inspect output")
     .fix("ensure the command is deterministic, idempotent and side-effect free")
     .see("validate")
-    .see("properties")
+    .see("constraints")
 }
 
 /// V005 — verifier configuration is malformed.
-pub fn v005_verifier_misconfigured(property: &str, why: &str) -> Diagnostic {
+pub fn v005_verifier_misconfigured(constraint: &str, why: &str) -> Diagnostic {
     Diagnostic::new(
         DiagCode::new(DiagDomain::Validate, 5),
-        format!("verifier configuration for property `{property}` is malformed"),
+        format!("verifier configuration for constraint `{constraint}` is malformed"),
     )
-    .at(property.to_string())
+    .at(constraint.to_string())
     .fix(format!("fix: {}", one_line(why)))
-    .fix("see `graft explain properties` for the supported `verify` shapes")
-    .see("properties")
+    .fix("see `graft explain constraints` for the supported `verify` shapes")
+    .see("constraints")
     .see("graft.toml")
 }
 
@@ -96,34 +96,38 @@ pub fn v005_verifier_misconfigured(property: &str, why: &str) -> Diagnostic {
 // A — admit
 // =====================================================================
 
-/// A001 — admission requires evidence for a property that has none.
-pub fn a001_missing_required_evidence(property: &str) -> Diagnostic {
-    a001_missing_required_evidence_at(property, property)
+/// A001 — admission requires evidence for a constraint that has none.
+pub fn a001_missing_required_evidence(constraint: &str) -> Diagnostic {
+    a001_missing_required_evidence_at(constraint, constraint)
 }
 
-pub fn a001_missing_required_evidence_at(property: &str, path: &str) -> Diagnostic {
+pub fn a001_missing_required_evidence_at(constraint: &str, path: &str) -> Diagnostic {
     Diagnostic::new(
         DiagCode::new(DiagDomain::Admit, 1),
-        format!("missing required evidence for `{property}`"),
+        format!("missing required evidence for `{constraint}`"),
     )
     .at(format!("Constraint failed at: {path}"))
     .fix(format!(
-        "run `graft patch validate <candidate> --expect {property}`"
+        "run `graft patch validate <candidate> --expect {constraint}`"
     ))
     .see("admit")
     .see("validate")
 }
 
-/// A002 — admission requires evidence for a property whose evidence did not
+/// A002 — admission requires evidence for a constraint whose evidence did not
 /// pass.
-pub fn a002_failed_required_evidence(property: &str) -> Diagnostic {
-    a002_failed_required_evidence_at(property, "<unknown>", property)
+pub fn a002_failed_required_evidence(constraint: &str) -> Diagnostic {
+    a002_failed_required_evidence_at(constraint, "<unknown>", constraint)
 }
 
-pub fn a002_failed_required_evidence_at(property: &str, evidence: &str, path: &str) -> Diagnostic {
+pub fn a002_failed_required_evidence_at(
+    constraint: &str,
+    evidence: &str,
+    path: &str,
+) -> Diagnostic {
     Diagnostic::new(
         DiagCode::new(DiagDomain::Admit, 2),
-        format!("evidence `{evidence}` for `{property}` did not pass"),
+        format!("evidence `{evidence}` for `{constraint}` did not pass"),
     )
     .at(format!("Constraint failed at: {path}"))
     .fix("amend the candidate, re-run `graft patch validate`, then retry `graft patch admit`")
@@ -267,13 +271,13 @@ pub const ALL_DIAGNOSTICS: &[DiagnosticDoc] = &[
     // V — validate / verify
     DiagnosticDoc {
         code: DiagCode::new(DiagDomain::Validate, 1),
-        summary: "declared expected property is not defined in graft.toml",
-        fix_hints: &["declare it under [properties.<name>] in graft.toml, or pass a builtin name"],
-        see_also: &["properties", "graft.toml"],
+        summary: "declared expected constraint is not defined in graft.toml",
+        fix_hints: &["declare it under [constraints.<name>] in graft.toml, or pass a builtin name"],
+        see_also: &["constraints", "graft.toml"],
     },
     DiagnosticDoc {
         code: DiagCode::new(DiagDomain::Validate, 2),
-        summary: "property verifier rejected the candidate; the patch was observed to violate the property",
+        summary: "constraint verifier rejected the candidate; the patch was observed to violate the constraint",
         fix_hints: &[
             "inspect the verifier output for the violating evidence",
             "amend the candidate worktree and run `graft patch validate` again",
@@ -300,24 +304,24 @@ pub const ALL_DIAGNOSTICS: &[DiagnosticDoc] = &[
             "re-run the command in the validation worktree to inspect output",
             "ensure the command is deterministic, idempotent and side-effect free",
         ],
-        see_also: &["validate", "properties"],
+        see_also: &["validate", "constraints"],
     },
     DiagnosticDoc {
         code: DiagCode::new(DiagDomain::Validate, 5),
         summary: "verifier configuration is malformed",
-        fix_hints: &["see `graft explain properties` for the supported `verify` shapes"],
-        see_also: &["properties", "graft.toml"],
+        fix_hints: &["see `graft explain constraints` for the supported `verify` shapes"],
+        see_also: &["constraints", "graft.toml"],
     },
     // A — admit
     DiagnosticDoc {
         code: DiagCode::new(DiagDomain::Admit, 1),
-        summary: "admission requires evidence for a property that has none",
-        fix_hints: &["run `graft patch validate <candidate> --expect <Property>` first"],
+        summary: "admission requires evidence for a constraint that has none",
+        fix_hints: &["run `graft patch validate <candidate> --expect <Constraint>` first"],
         see_also: &["admit", "validate"],
     },
     DiagnosticDoc {
         code: DiagCode::new(DiagDomain::Admit, 2),
-        summary: "admission requires evidence for a property whose evidence did not pass",
+        summary: "admission requires evidence for a constraint whose evidence did not pass",
         fix_hints: &[
             "amend the candidate, re-run `graft patch validate`, then retry `graft patch admit`",
         ],
@@ -429,7 +433,7 @@ mod tests {
     fn diagnostics_cover_all_seven_subsystems() {
         // Smoke check: at least one canned builder per subsystem letter.
         let samples: Vec<DiagCode> = vec![
-            v001_unknown_property("X").code,
+            v001_unknown_constraint("X").code,
             a001_missing_required_evidence("X").code,
             m001_registry_tree_id_mismatch("X").code,
             // P-domain codes are added by promote-required-from-config.
@@ -484,8 +488,8 @@ mod tests {
     #[test]
     fn every_diagnostic_summary_and_loc_are_single_line() {
         let all = [
-            v001_unknown_property("p"),
-            v002_property_violated("p", "diff"),
+            v001_unknown_constraint("p"),
+            v002_constraint_violated("p", "diff"),
             v003_base_unmaterializable("err"),
             v004_command_verifier_nonzero("p", "cmd", "exit 1"),
             v005_verifier_misconfigured("p", "why"),

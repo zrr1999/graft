@@ -2,7 +2,7 @@
 # tests/quality_gates_smoke.sh
 #
 # Lightweight static gate for convergence invariants that tend to drift in docs
-# and smoke tests: public lifecycle commands, bare properties, application
+# and smoke tests: public lifecycle commands, bare constraints, application
 # integrity wording, and meaningful regression tests.
 
 set -euo pipefail
@@ -53,7 +53,7 @@ def scan(label: str, pattern: str, paths: list[str], *, suffixes: Optional[tuple
 
 
 scan(
-    "public docs/templates/explain leaked retired lifecycle or scoped-property syntax",
+    "public docs/templates/explain leaked retired lifecycle or scoped-constraint syntax",
     r"base \+ change == target|workspace:<|<scope>:|workspace = \[|graft materialize|graft promote",
     ["README.md", "templates/default", "crates/graft-explain/src"],
     suffixes=(".md", ".toml", ".roto", ".rs"),

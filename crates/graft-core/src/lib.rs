@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use time::OffsetDateTime;
 
 #[derive(Debug, thiserror::Error)]
@@ -51,7 +50,7 @@ pub use application_model::{
     application_from_change, application_id, materialize_application,
     validate_application_integrity,
 };
-id_type!(PropertyId);
+id_type!(PlanId);
 id_type!(RelationId);
 id_type!(PromotionId);
 id_type!(ScratchId);
@@ -389,17 +388,15 @@ pub struct ChangeSummary {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PropertyRef {
-    pub id: PropertyId,
+pub struct ConstraintDef {
     pub name: String,
+    pub description: String,
+    pub body: Constraint,
 }
 
-impl PropertyRef {
-    pub fn new(id: PropertyId, name: impl Into<String>) -> Self {
-        Self {
-            id,
-            name: name.into(),
-        }
+impl ConstraintDef {
+    pub fn body_id(&self) -> Result<String> {
+        stable_typed_id("constraint", &self.body)
     }
 }
 
@@ -409,7 +406,7 @@ pub enum Constraint {
     Top,
     Bottom,
     Primitive {
-        property: PropertyRef,
+        plan: PlanId,
     },
     Both {
         left: Box<Constraint>,
@@ -430,8 +427,8 @@ impl Constraint {
         Self::Bottom
     }
 
-    pub fn primitive(property: PropertyRef) -> Self {
-        Self::Primitive { property }
+    pub fn primitive(plan: PlanId) -> Self {
+        Self::Primitive { plan }
     }
 
     pub fn all_of(items: impl IntoIterator<Item = Constraint>) -> Self {
@@ -464,109 +461,11 @@ fn fold_right(
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum Query {
-    ChangeMeta,
-    TargetSnapshot,
-    BaseAndTarget,
-    Change,
-    Files {
-        include: Vec<String>,
-        exclude: Vec<String>,
-    },
-    Command {
-        command: String,
-        args: Vec<String>,
-    },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum Evaluator {
-    Builtin {
-        name: String,
-        options: BTreeMap<String, String>,
-    },
-    Command {
-        command: String,
-        args: Vec<String>,
-        env: BTreeMap<String, String>,
-        setup: Vec<String>,
-        pre: Vec<String>,
-        teardown: Vec<String>,
-        timeout_secs: Option<u64>,
-    },
-    Pair {
-        command: String,
-        args: Vec<String>,
-        env: BTreeMap<String, String>,
-        setup: Vec<String>,
-        pre: Vec<String>,
-        teardown: Vec<String>,
-        timeout_secs: Option<u64>,
-    },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum Judge {
-    ExitOk,
-    BoolTrue,
-    BoolFalse,
-    Pairwise,
-    Command {
-        command: String,
-        args: Vec<String>,
-        env: BTreeMap<String, String>,
-        timeout_secs: Option<u64>,
-    },
-    ExitCodeZero,
-    StdoutContains {
-        text: String,
-    },
-    JsonEquals {
-        pointer: String,
-        value: String,
-    },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PropertyDef {
-    pub name: String,
-    pub query: Query,
-    pub evaluator: Evaluator,
-    pub judge: Judge,
-}
-
-impl PropertyDef {
-    pub fn property_id(&self) -> Result<PropertyId> {
-        let seed = PropertyDefSeed {
-            query: &self.query,
-            evaluator: &self.evaluator,
-            judge: &self.judge,
-        };
-        Ok(PropertyId::new(stable_typed_id("property", &seed)?))
-    }
-
-    pub fn property_ref(&self) -> Result<PropertyRef> {
-        Ok(PropertyRef::new(self.property_id()?, self.name.clone()))
-    }
-}
-
-#[derive(Serialize)]
-struct PropertyDefSeed<'a> {
-    query: &'a Query,
-    evaluator: &'a Evaluator,
-    judge: &'a Judge,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct PropertyName(String);
+pub struct ConstraintName(String);
 
-impl PropertyName {
+impl ConstraintName {
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
     }
@@ -576,90 +475,50 @@ impl PropertyName {
     }
 }
 
-impl From<&str> for PropertyName {
+impl From<&str> for ConstraintName {
     fn from(value: &str) -> Self {
         Self::new(value)
     }
 }
 
-impl From<String> for PropertyName {
+impl From<String> for ConstraintName {
     fn from(value: String) -> Self {
         Self::new(value)
     }
 }
 
-impl std::fmt::Display for PropertyName {
+impl std::fmt::Display for ConstraintName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub enum Severity {
-    Blocking,
-    Warning,
-    Info,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PropertySourceRef {
-    pub path: String,
-    pub function: PropertyName,
+pub struct Plan {
+    pub observation: Observation,
+    pub assertion: Assertion,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PropertySpec {
-    pub name: PropertyName,
-    pub plan: PropertyPlan,
-    pub description: String,
-    pub severity: Severity,
-    pub source_ref: Option<PropertySourceRef>,
-}
-
-impl PropertySpec {
-    pub fn property_id(&self) -> Result<PropertyId> {
-        let seed = PropertySpecSeed {
-            name: &self.name,
-            checks: &self.plan.checks,
-            requires: &self.plan.requires,
-        };
-        Ok(PropertyId::new(stable_typed_id("property", &seed)?))
+impl Plan {
+    pub fn plan_id(&self) -> Result<PlanId> {
+        Ok(PlanId::new(stable_typed_id("plan", self)?))
     }
-
-    pub fn property_ref(&self) -> Result<PropertyRef> {
-        Ok(PropertyRef::new(self.property_id()?, self.name.as_str()))
-    }
-}
-
-#[derive(Serialize)]
-struct PropertySpecSeed<'a> {
-    name: &'a PropertyName,
-    checks: &'a [CheckPlan],
-    requires: &'a [PropertyName],
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PropertyPlan {
-    pub checks: Vec<CheckPlan>,
-    pub requires: Vec<PropertyName>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum CheckPlan {
-    Expect {
-        probe: ProbePlan,
-        polarity: ProbePolarity,
+pub enum Observation {
+    ChangedPaths {
+        patterns: Vec<String>,
     },
-    AllOf {
-        checks: Vec<CheckPlan>,
+    Run {
+        run: RunPlan,
     },
-    AnyOf {
-        checks: Vec<CheckPlan>,
+    SameOutput {
+        left: RunPlan,
+        right: RunPlan,
+        selectors: Vec<RunSelectorPlan>,
     },
     Unavailable {
         reason: String,
@@ -667,40 +526,17 @@ pub enum CheckPlan {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub enum ProbePolarity {
-    Success,
-    Failure,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub enum ProbeResult {
-    Success,
-    Failure,
-    Error,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ProbePlan {
-    PathMatch {
-        paths: PathSetPlan,
-        patterns: Vec<String>,
-    },
-    PathAllMatch {
-        paths: PathSetPlan,
-        patterns: Vec<String>,
-    },
-    RunExitCodeIs {
-        run: RunPlan,
-        code: i32,
-    },
-    SameOutput {
-        left: RunPlan,
-        right: RunPlan,
-        selectors: Vec<RunSelectorPlan>,
-    },
+pub enum Assertion {
+    PathsAnyMatch,
+    PathsAllMatch,
+    PathsNoMatch,
+    PathsNotAllMatch,
+    ExitCodeIs { code: i32 },
+    ExitCodeIsNot { code: i32 },
+    OutputsSame,
+    OutputsDiffer,
+    Unavailable,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -835,7 +671,7 @@ pub struct PatchRecord {
 pub struct EvidenceRecord {
     pub id: EvidenceId,
     pub subject: String,
-    pub property: PropertyId,
+    pub plan: PlanId,
     pub verifier: String,
     pub result: EvidenceResult,
     pub created_at: String,
@@ -844,14 +680,14 @@ pub struct EvidenceRecord {
 impl EvidenceRecord {
     pub fn new(
         subject: impl Into<String>,
-        property: PropertyId,
+        plan: PlanId,
         verifier: impl Into<String>,
         result: EvidenceResult,
     ) -> Result<Self> {
         let mut record = Self {
             id: EvidenceId::new("evidence:pending"),
             subject: subject.into(),
-            property,
+            plan,
             verifier: verifier.into(),
             result,
             created_at: OffsetDateTime::now_utc().to_string(),
@@ -862,21 +698,21 @@ impl EvidenceRecord {
 
     pub fn passed(
         subject: impl Into<String>,
-        property: PropertyId,
+        plan: PlanId,
         verifier: impl Into<String>,
     ) -> Result<Self> {
-        Self::new(subject, property, verifier, EvidenceResult::Passed)
+        Self::new(subject, plan, verifier, EvidenceResult::Passed)
     }
 
     pub fn failed(
         subject: impl Into<String>,
-        property: PropertyId,
+        plan: PlanId,
         verifier: impl Into<String>,
         reason: impl Into<String>,
     ) -> Result<Self> {
         Self::new(
             subject,
-            property,
+            plan,
             verifier,
             EvidenceResult::Failed {
                 reason: reason.into(),
@@ -886,13 +722,13 @@ impl EvidenceRecord {
 
     pub fn unknown(
         subject: impl Into<String>,
-        property: PropertyId,
+        plan: PlanId,
         verifier: impl Into<String>,
         reason: impl Into<String>,
     ) -> Result<Self> {
         Self::new(
             subject,
-            property,
+            plan,
             verifier,
             EvidenceResult::Unknown {
                 reason: reason.into(),
@@ -902,13 +738,13 @@ impl EvidenceRecord {
 
     pub fn skipped(
         subject: impl Into<String>,
-        property: PropertyId,
+        plan: PlanId,
         verifier: impl Into<String>,
         reason: impl Into<String>,
     ) -> Result<Self> {
         Self::new(
             subject,
-            property,
+            plan,
             verifier,
             EvidenceResult::Skipped {
                 reason: reason.into(),
@@ -951,7 +787,7 @@ pub struct PatchRelation {
 #[derive(Serialize)]
 struct EvidenceSeed {
     subject: String,
-    property: PropertyId,
+    plan: PlanId,
     verifier: String,
     result: EvidenceResult,
 }
@@ -1001,7 +837,7 @@ pub fn patch_id(patch: &PatchRecord) -> Result<PatchId> {
 pub fn evidence_id(evidence: &EvidenceRecord) -> Result<EvidenceId> {
     let seed = EvidenceSeed {
         subject: evidence.subject.clone(),
-        property: evidence.property.clone(),
+        plan: evidence.plan.clone(),
         verifier: evidence.verifier.clone(),
         result: evidence.result.clone(),
     };
@@ -1062,59 +898,84 @@ struct PromotionSeed<'a> {
 mod tests {
     use super::*;
 
-    fn test_property_def(name: &str, command: &str) -> PropertyDef {
-        PropertyDef {
-            name: name.to_string(),
-            query: Query::ChangeMeta,
-            evaluator: Evaluator::Command {
-                command: command.to_string(),
-                args: Vec::new(),
-                env: BTreeMap::new(),
-                setup: Vec::new(),
-                pre: Vec::new(),
-                teardown: Vec::new(),
-                timeout_secs: Some(60),
+    fn run_exit_zero_plan(argv: &[&str]) -> Plan {
+        Plan {
+            observation: Observation::Run {
+                run: RunPlan {
+                    argv: argv.iter().map(|value| (*value).to_string()).collect(),
+                    tree: current_target_tree(),
+                },
             },
-            judge: Judge::ExitOk,
+            assertion: Assertion::ExitCodeIs { code: 0 },
         }
     }
 
-    fn test_property_ref(name: &str) -> PropertyRef {
-        test_property_def(name, "cargo test")
-            .property_ref()
-            .unwrap()
+    fn test_plan_id(name: &str) -> PlanId {
+        run_exit_zero_plan(&[name]).plan_id().unwrap()
     }
 
     #[test]
     fn stable_ids_use_typed_display_form() {
-        let property = test_property_def("TestsPass", "cargo test")
-            .property_id()
-            .unwrap();
-        let evidence = EvidenceRecord::passed("candidate:demo", property, "test-verifier").unwrap();
+        let plan = run_exit_zero_plan(&["cargo", "test"]).plan_id().unwrap();
+        let evidence = EvidenceRecord::passed("candidate:demo", plan, "test-verifier").unwrap();
         assert!(evidence.id.as_str().starts_with("evidence:"));
     }
 
     #[test]
-    fn property_id_ignores_name_and_tracks_verifier_content() {
-        let original = test_property_def("TestsPass", "cargo test");
-        let renamed = test_property_def("CargoTests", "cargo test");
-        let changed_verifier = test_property_def("TestsPass", "cargo test --all");
+    fn plan_id_tracks_observation_and_assertion_only() {
+        let original = run_exit_zero_plan(&["cargo", "test"]);
+        let renamed = ConstraintDef {
+            name: "cargo_tests_pass".to_string(),
+            description: "cargo tests pass".to_string(),
+            body: Constraint::primitive(original.plan_id().unwrap()),
+        };
+        let changed_metadata = ConstraintDef {
+            name: "tests_pass".to_string(),
+            description: "renamed display text".to_string(),
+            body: renamed.body.clone(),
+        };
+        let changed_observation = run_exit_zero_plan(&["cargo", "test", "--all"]);
+        let changed_assertion = Plan {
+            observation: original.observation.clone(),
+            assertion: Assertion::ExitCodeIs { code: 1 },
+        };
 
         assert_eq!(
-            original.property_id().unwrap(),
-            renamed.property_id().unwrap()
+            original.plan_id().unwrap(),
+            match &renamed.body {
+                Constraint::Primitive { plan } => plan.clone(),
+                other => panic!("expected primitive body, got {other:?}"),
+            }
+        );
+        assert_eq!(
+            renamed.body_id().unwrap(),
+            changed_metadata.body_id().unwrap()
         );
         assert_ne!(
-            original.property_id().unwrap(),
-            changed_verifier.property_id().unwrap()
+            original.plan_id().unwrap(),
+            changed_observation.plan_id().unwrap()
         );
-        assert!(
-            original
-                .property_id()
-                .unwrap()
-                .as_str()
-                .starts_with("property:")
+        assert_ne!(
+            original.plan_id().unwrap(),
+            changed_assertion.plan_id().unwrap()
         );
+        assert!(original.plan_id().unwrap().as_str().starts_with("plan:"));
+    }
+
+    #[test]
+    fn plan_identity_merges_same_recipe_but_not_composition() {
+        let first = run_exit_zero_plan(&["cargo", "test"]);
+        let second = run_exit_zero_plan(&["cargo", "test"]);
+        let clippy = run_exit_zero_plan(&["cargo", "clippy"]);
+        let composition = Constraint::all_of(vec![
+            Constraint::primitive(first.plan_id().unwrap()),
+            Constraint::primitive(clippy.plan_id().unwrap()),
+        ]);
+        let composition_id = stable_typed_id("constraint", &composition).unwrap();
+
+        assert_eq!(first.plan_id().unwrap(), second.plan_id().unwrap());
+        assert!(composition_id.starts_with("constraint:"));
+        assert_ne!(composition_id, first.plan_id().unwrap().as_str());
     }
 
     fn current_target_tree() -> TreePlan {
@@ -1124,77 +985,31 @@ mod tests {
         }
     }
 
-    fn test_property_spec() -> PropertySpec {
-        let run = RunPlan {
-            argv: vec!["cargo".into(), "test".into(), "--all-targets".into()],
-            tree: current_target_tree(),
+    #[test]
+    fn constraint_def_name_and_description_do_not_enter_body_identity() {
+        let test_plan = run_exit_zero_plan(&["cargo", "test"]);
+        let artifact_plan = Plan {
+            observation: Observation::ChangedPaths {
+                patterns: vec!["target/**".to_string()],
+            },
+            assertion: Assertion::PathsNoMatch,
         };
-        PropertySpec {
-            name: PropertyName::new("cargo_tests_pass"),
-            plan: PropertyPlan {
-                checks: vec![CheckPlan::Expect {
-                    probe: ProbePlan::RunExitCodeIs { run, code: 0 },
-                    polarity: ProbePolarity::Success,
-                }],
-                requires: vec![PropertyName::new("no_generated_artifacts")],
-            },
-            description: "cargo tests pass".to_string(),
-            severity: Severity::Blocking,
-            source_ref: Some(PropertySourceRef {
-                path: "properties.roto".to_string(),
-                function: PropertyName::new("cargo_tests_pass"),
-            }),
-        }
-    }
+        let body = Constraint::all_of(vec![
+            Constraint::primitive(artifact_plan.plan_id().unwrap()),
+            Constraint::primitive(test_plan.plan_id().unwrap()),
+        ]);
+        let first = ConstraintDef {
+            name: "safe_patch".to_string(),
+            description: "safe patch".to_string(),
+            body: body.clone(),
+        };
+        let second = ConstraintDef {
+            name: "renamed_safe_patch".to_string(),
+            description: "renamed display text".to_string(),
+            body,
+        };
 
-    #[test]
-    fn v2_property_id_ignores_display_metadata() {
-        let original = test_property_spec();
-        let mut changed_metadata = original.clone();
-        changed_metadata.description = "renamed display text".to_string();
-        changed_metadata.severity = Severity::Warning;
-        changed_metadata.source_ref = None;
-
-        assert_eq!(
-            original.property_id().unwrap(),
-            changed_metadata.property_id().unwrap()
-        );
-    }
-
-    #[test]
-    fn v2_property_id_tracks_name_checks_and_requires() {
-        let original = test_property_spec();
-
-        let mut renamed = original.clone();
-        renamed.name = PropertyName::new("tests_pass");
-
-        let mut changed_requires = original.clone();
-        changed_requires.plan.requires = vec![PropertyName::new("cargo_fmt_clean")];
-
-        let mut changed_check = original.clone();
-        changed_check.plan.checks = vec![CheckPlan::Expect {
-            probe: ProbePlan::RunExitCodeIs {
-                run: RunPlan {
-                    argv: vec!["cargo".into(), "test".into(), "--doc".into()],
-                    tree: current_target_tree(),
-                },
-                code: 0,
-            },
-            polarity: ProbePolarity::Success,
-        }];
-
-        assert_ne!(
-            original.property_id().unwrap(),
-            renamed.property_id().unwrap()
-        );
-        assert_ne!(
-            original.property_id().unwrap(),
-            changed_requires.property_id().unwrap()
-        );
-        assert_ne!(
-            original.property_id().unwrap(),
-            changed_check.property_id().unwrap()
-        );
+        assert_eq!(first.body_id().unwrap(), second.body_id().unwrap());
     }
 
     #[test]
@@ -1233,16 +1048,13 @@ mod tests {
             tree: target,
         };
 
-        let checks = vec![
-            CheckPlan::Expect {
-                probe: ProbePlan::RunExitCodeIs {
-                    run: bad_run,
-                    code: 0,
-                },
-                polarity: ProbePolarity::Failure,
+        let plans = vec![
+            Plan {
+                observation: Observation::Run { run: bad_run },
+                assertion: Assertion::ExitCodeIs { code: 0 },
             },
-            CheckPlan::Expect {
-                probe: ProbePlan::SameOutput {
+            Plan {
+                observation: Observation::SameOutput {
                     left: base_run,
                     right: target_run,
                     selectors: vec![
@@ -1253,11 +1065,11 @@ mod tests {
                         RunSelectorPlan::Stderr,
                     ],
                 },
-                polarity: ProbePolarity::Success,
+                assertion: Assertion::OutputsSame,
             },
         ];
 
-        let json = serde_json::to_string(&checks).unwrap();
+        let json = serde_json::to_string(&plans).unwrap();
         assert!(json.contains("previous_failure"));
         assert!(json.contains("replace_file"));
         assert!(json.contains("same_output"));
@@ -1717,7 +1529,7 @@ mod tests {
 
     #[test]
     fn constraint_smart_constructors_fold_empty_and_singleton() {
-        let primitive = Constraint::primitive(test_property_ref("TestsPass"));
+        let primitive = Constraint::primitive(test_plan_id("TestsPass"));
 
         assert_eq!(Constraint::all_of(Vec::new()), Constraint::Top);
         assert_eq!(Constraint::any_of(Vec::new()), Constraint::Bottom);
@@ -1730,9 +1542,9 @@ mod tests {
 
     #[test]
     fn constraint_smart_constructors_fold_right_associative() {
-        let first = Constraint::primitive(test_property_ref("First"));
-        let second = Constraint::primitive(test_property_ref("Second"));
-        let third = Constraint::primitive(test_property_ref("Third"));
+        let first = Constraint::primitive(test_plan_id("First"));
+        let second = Constraint::primitive(test_plan_id("Second"));
+        let third = Constraint::primitive(test_plan_id("Third"));
 
         let expected = Constraint::Both {
             left: Box::new(first.clone()),
@@ -1747,7 +1559,7 @@ mod tests {
 
     #[test]
     fn constraint_serdes_every_lattice_node() {
-        let primitive = Constraint::primitive(test_property_ref("TestsPass"));
+        let primitive = Constraint::primitive(test_plan_id("TestsPass"));
         let constraint = Constraint::Either {
             left: Box::new(Constraint::Both {
                 left: Box::new(Constraint::Top),
@@ -1764,7 +1576,7 @@ mod tests {
 
     #[test]
     fn patch_ids_include_admission_summary_but_ignore_provenance_time() {
-        let constraint = Constraint::primitive(test_property_ref("TestsPass"));
+        let constraint = Constraint::primitive(test_plan_id("TestsPass"));
         let patch = PatchRecord {
             id: PatchId::new("patch:pending"),
             application: ApplicationRef::Stored(ApplicationId::new("application:demo")),

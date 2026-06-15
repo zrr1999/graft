@@ -20,8 +20,9 @@ format:
     just --fmt --unstable
     cargo fmt --all
 
-# Run static checks (rustfmt + clippy)
+# Run static checks
 check:
+    lean formal/kernel.lean
     cargo fmt --all -- --check
     cargo clippy --locked --workspace --all-targets -- -D warnings
 

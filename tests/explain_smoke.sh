@@ -91,27 +91,20 @@ trap 'rm -rf "$WORKDIR"' EXIT
 (
   cd "$WORKDIR"
   "$GRAFT_BIN" workspace init >/dev/null
-  write_properties_roto <<'ROTO'
-fn empty_change(app: Application) -> Property {
-    property(
-        [
-            app.changed_paths().any_match(["**"]).failure(),
-        ],
-        "the change touches no paths",
-        Severity.Blocking,
-        [],
-    )
+  write_constraints_roto <<'ROTO'
+fn empty_change(app: Application) -> Constraint {
+    primitive(app.changed_paths(["**"]), no_match, "the change touches no paths")
 }
 ROTO
-  lock_properties
-  property=$("$GRAFT_BIN" explain empty_change)
-  if ! grep -qE '^concept: empty_change$' <<<"$property"; then
-    echo "FAIL: explain empty_change did not render configured property alias"
-    echo "$property"; exit 1
+  lock_constraints
+  constraint=$("$GRAFT_BIN" explain empty_change)
+  if ! grep -qE '^concept: empty_change$' <<<"$constraint"; then
+    echo "FAIL: explain empty_change did not render configured constraint alias"
+    echo "$constraint"; exit 1
   fi
-  if ! grep -q 'static v2 PropertyPlan' <<<"$property"; then
-    echo "FAIL: explain empty_change did not describe its v2 property-plan source"
-    echo "$property"; exit 1
+  if ! grep -q 'fn name(app: Application) -> Constraint' <<<"$constraint"; then
+    echo "FAIL: explain empty_change did not describe its constraint source"
+    echo "$constraint"; exit 1
   fi
 )
 

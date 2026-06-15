@@ -1,0 +1,22 @@
+// Regression fixture: constraint composition uses host Constraint values and does
+// not rely on old Check-returning helper composition.
+
+fn no_generated_artifacts(app: Application) -> Constraint {
+    primitive(
+        app.changed_paths([
+            "target/**",
+            "dist/**",
+            "build/**",
+        ]),
+        no_match,
+        "patch does not contain generated build artifacts",
+    )
+}
+
+fn cargo_tests_pass(app: Application) -> Constraint {
+    primitive(app.run(["cargo", "test"]), exit_zero, "cargo test passes")
+}
+
+fn safe_patch(app: Application) -> Constraint {
+    both(no_generated_artifacts(app), cargo_tests_pass(app))
+}

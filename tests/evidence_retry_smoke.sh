@@ -2,7 +2,7 @@
 # tests/evidence_retry_smoke.sh
 #
 # Verifies admission policy reads the evidence set semantically: a later
-# passing proof for the same property satisfies the gate even when an earlier
+# passing proof for the same constraint satisfies the gate even when an earlier
 # failed attempt is retained for audit history.
 
 set -euo pipefail
@@ -18,21 +18,12 @@ trap cleanup_workspace EXIT
 cd "$WORKDIR"
 printf 'hello\n' > hello.txt
 "$GRAFT_BIN" init >/dev/null
-write_properties_roto <<'ROTO'
-fn retry_passes(app: Application) -> Property {
-    let run = call(["false"], app.target());
-
-    property(
-        [
-            run.exit_code_is(0).success(),
-        ],
-        "retry verifier that can be changed from failing to passing",
-        Severity.Blocking,
-        [],
-    )
+write_constraints_roto <<'ROTO'
+fn retry_passes(app: Application) -> Constraint {
+    primitive(app.run(["false"]), exit_zero, "retry verifier that can be changed from failing to passing")
 }
 ROTO
-lock_properties
+lock_constraints
 
 scratch_out=$("$GRAFT_BIN" scratch write --base graft:empty hello.txt --content $'hello\n')
 scratch=$(grep -oE 'scratch:[0-9a-f]+' <<<"$scratch_out" | tail -n1)
@@ -50,11 +41,11 @@ fi
 python3 - <<'PY'
 from pathlib import Path
 
-path = Path("properties.roto")
+path = Path("constraints.roto")
 text = path.read_text()
 path.write_text(text.replace('["false"]', '["true"]', 1))
 PY
-lock_properties
+lock_constraints
 
 passed=$("$GRAFT_BIN" patch validate "$candidate" --expect retry_passes)
 if ! grep -q 'passed' <<<"$passed"; then
@@ -68,4 +59,4 @@ if ! grep -qE 'admitted patch patch:[0-9a-f]+ from candidate' <<<"$admitted"; th
   echo "$admitted"; exit 1
 fi
 
-echo "OK: admission ignores unrelated failed evidence and accepts a passing required property."
+echo "OK: admission ignores unrelated failed evidence and accepts a passing required constraint."

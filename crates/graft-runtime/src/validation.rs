@@ -5,15 +5,16 @@ use std::process::Command as ProcessCommand;
 
 use anyhow::{Context, Result, bail};
 use graft_core::{
-    ApplicationEndpoint, ApplicationPlan, ApplicationRef, Change, CheckPlan, EvidenceRecord,
+    ApplicationEndpoint, ApplicationPlan, ApplicationRef, Assertion, Change, EvidenceRecord,
     EvidenceResult, FileChange, FileChangeKind, FileRefPlan, GraftCandidate, HistorySelector,
-    OverlayPlan, PatchRecord, PathSetPlan, ProbePlan, ProbePolarity, ProbeResult, PropertyRef,
-    PropertySpec, RunPlan, RunSelectorPlan, StateId, TreeEntry, TreePlan, TreeSnapshot,
+    Observation, OverlayPlan, PatchRecord, Plan, PlanId, RunPlan, RunSelectorPlan, StateId,
+    TreeEntry, TreePlan, TreeSnapshot, stable_typed_id,
 };
 use graft_store::GraftStore;
 use graft_validate::ValidationSubject;
+use serde::Serialize;
 
-use crate::config::{GraftConfig, load_graft_config, resolve_property};
+use crate::config::{GraftConfig, load_graft_config};
 use crate::repo::materialized_snapshot_for_state;
 use crate::requirements::{constraint_primitives, validation_constraint_with_base};
 
@@ -23,6 +24,12 @@ struct ValidationTarget {
     base_snapshot: Option<TreeSnapshot>,
     target_snapshot: Option<TreeSnapshot>,
     integrity: EvidenceResult,
+}
+
+#[derive(Default)]
+struct ValidationMemo {
+    evidence_by_plan: BTreeMap<String, Vec<EvidenceRecord>>,
+    run_results: BTreeMap<String, std::result::Result<RunExecution, String>>,
 }
 
 pub(crate) fn validate_candidate(
@@ -45,15 +52,15 @@ pub(crate) fn validate_candidate(
     )?;
     let primitives = constraint_primitives(&constraint);
     let mut records = Vec::new();
-    let mut memo = BTreeMap::new();
-    for property in primitives {
-        let mut property_records =
-            validate_property_ref(store, &config, &target, &property, &mut memo)?;
-        for evidence in &property_records {
+    let mut memo = ValidationMemo::default();
+    for constraint in primitives {
+        let mut constraint_records =
+            validate_plan_ref(store, &config, &target, &constraint, &mut memo)?;
+        for evidence in &constraint_records {
             store.write_evidence(evidence)?;
             store.append_candidate_evidence_index(candidate.id.as_str(), evidence.id.as_str())?;
         }
-        records.append(&mut property_records);
+        records.append(&mut constraint_records);
     }
     Ok(records)
 }
@@ -74,363 +81,336 @@ pub(crate) fn validate_patch(
     )?;
     let primitives = constraint_primitives(&constraint);
     let mut records = Vec::new();
-    let mut memo = BTreeMap::new();
-    for property in primitives {
-        let mut property_records =
-            validate_property_ref(store, &config, &target, &property, &mut memo)?;
-        for evidence in &property_records {
+    let mut memo = ValidationMemo::default();
+    for constraint in primitives {
+        let mut constraint_records =
+            validate_plan_ref(store, &config, &target, &constraint, &mut memo)?;
+        for evidence in &constraint_records {
             store.write_evidence(evidence)?;
             store.append_patch_evidence_index(patch.id.as_str(), evidence.id.as_str())?;
         }
-        records.append(&mut property_records);
+        records.append(&mut constraint_records);
     }
     Ok(records)
 }
 
-fn validate_property_ref(
+fn validate_plan_ref(
     store: &GraftStore,
     config: &GraftConfig,
     target: &ValidationTarget,
-    property: &PropertyRef,
-    memo: &mut BTreeMap<String, Vec<EvidenceRecord>>,
+    plan_id: &PlanId,
+    memo: &mut ValidationMemo,
 ) -> Result<Vec<EvidenceRecord>> {
-    let memo_key = property.id.to_string();
-    if let Some(records) = memo.get(&memo_key) {
+    let memo_key = plan_id.to_string();
+    if let Some(records) = memo.evidence_by_plan.get(&memo_key) {
         return Ok(records.clone());
     }
-    let spec = property_spec_for_ref(config, property)?;
-    let mut blockers = Vec::new();
-    for required in &spec.plan.requires {
-        let required_ref = resolve_property(config, required.as_str())?;
-        let required_records = validate_property_ref(store, config, target, &required_ref, memo)?;
-        if !required_records
-            .iter()
-            .all(|record| record.result.satisfies_requirement())
-        {
-            blockers.push(format!(
-                "`{}` ({}) => {}",
-                required_ref.name,
-                required_ref.id,
-                evidence_results_label(&required_records)
-            ));
-        }
+    let plan = config.plans.get(plan_id).with_context(|| {
+        format!(
+            "[E_UNKNOWN_PLAN] plan {} is not configured in constraints.roto",
+            plan_id
+        )
+    })?;
+    if plan.plan_id()? != *plan_id {
+        bail!(
+            "[E_CONSTRAINT_DRIFT] plan {} no longer matches its configured observation/assertion",
+            plan_id
+        );
     }
-
-    let record = if blockers.is_empty() {
-        verify_property_spec(store, config, target, property, spec)?
-    } else {
-        EvidenceRecord::skipped(
-            target.subject.id.clone(),
-            property.id.clone(),
-            verifier_id_for_spec(spec)?,
-            format!("required properties did not pass: {}", blockers.join("; ")),
-        )?
-    };
+    let record = verify_plan(store, config, target, plan_id, plan, memo)?;
     let records = vec![record];
-    memo.insert(memo_key, records.clone());
+    memo.evidence_by_plan.insert(memo_key, records.clone());
     Ok(records)
 }
 
 #[cfg(test)]
-fn validate_property(
+fn validate_plan(
     store: &GraftStore,
     config: &GraftConfig,
     target: &ValidationTarget,
-    property: &PropertyRef,
-    memo: &mut BTreeMap<String, Vec<EvidenceRecord>>,
+    plan_id: &PlanId,
+    memo: &mut ValidationMemo,
 ) -> Result<Vec<EvidenceRecord>> {
-    validate_property_ref(store, config, target, property, memo)
+    validate_plan_ref(store, config, target, plan_id, memo)
 }
 
-fn property_spec_for_ref<'a>(
-    config: &'a GraftConfig,
-    property: &PropertyRef,
-) -> Result<&'a PropertySpec> {
-    let spec = config.properties.get(&property.name).with_context(|| {
-        format!(
-            "[E_UNKNOWN_PROPERTY] property {} ({}) is not configured in properties.roto",
-            property.name, property.id
-        )
-    })?;
-    let current_id = spec.property_id()?;
-    if current_id != property.id {
-        bail!(
-            "[E_PROPERTY_DRIFT] property `{}` drifted: stored ref has {}, current property resolves to {}",
-            property.name,
-            property.id,
-            current_id
-        );
-    }
-    Ok(spec)
-}
-
-fn verify_property_spec(
+fn verify_plan(
     store: &GraftStore,
     config: &GraftConfig,
     target: &ValidationTarget,
-    property: &PropertyRef,
-    spec: &PropertySpec,
+    plan_id: &PlanId,
+    plan: &Plan,
+    memo: &mut ValidationMemo,
 ) -> Result<EvidenceRecord> {
-    let verifier = verifier_id_for_spec(spec)?;
-    let result = evaluate_check_list_as_all(store, config, target, property, &spec.plan.checks);
-    Ok(EvidenceRecord::new(
-        target.subject.id.clone(),
-        property.id.clone(),
-        verifier,
+    let result = evaluate_plan(store, config, target, plan_id, plan, memo);
+    Ok(graft_validate::evidence_for_plan_id(
+        &target.subject,
+        plan_id.clone(),
         result,
     )?)
 }
 
-fn verifier_id_for_spec(spec: &PropertySpec) -> Result<String> {
-    Ok(format!(
-        "v2-plan:{}@{}",
-        spec.name.as_str(),
-        spec.property_id()?
-    ))
-}
-
-fn evaluate_check_list_as_all(
+fn evaluate_plan(
     store: &GraftStore,
     config: &GraftConfig,
     target: &ValidationTarget,
-    property: &PropertyRef,
-    checks: &[CheckPlan],
+    plan_id: &PlanId,
+    plan: &Plan,
+    memo: &mut ValidationMemo,
 ) -> EvidenceResult {
-    for (index, check) in checks.iter().enumerate() {
-        let result = evaluate_check(store, config, target, property, check);
-        if !result.satisfies_requirement() {
-            return contextualize_non_passing_result(
-                result,
-                format!("check[{index}] did not pass"),
-            );
+    match (&plan.observation, &plan.assertion) {
+        (Observation::ChangedPaths { patterns }, Assertion::PathsAnyMatch) => {
+            if changed_paths_match_any(&target.subject.changed_paths, patterns) {
+                EvidenceResult::Passed
+            } else {
+                EvidenceResult::Failed {
+                    reason: "no changed path matched any pattern".to_string(),
+                }
+            }
         }
-    }
-    EvidenceResult::Passed
-}
-
-fn evaluate_check(
-    store: &GraftStore,
-    config: &GraftConfig,
-    target: &ValidationTarget,
-    property: &PropertyRef,
-    check: &CheckPlan,
-) -> EvidenceResult {
-    match check {
-        CheckPlan::Expect { probe, polarity } => {
-            evaluate_expect(store, config, target, property, probe, polarity)
+        (Observation::ChangedPaths { patterns }, Assertion::PathsAllMatch) => {
+            if changed_paths_all_match(&target.subject.changed_paths, patterns) {
+                EvidenceResult::Passed
+            } else {
+                EvidenceResult::Failed {
+                    reason: "at least one changed path did not match any pattern".to_string(),
+                }
+            }
         }
-        CheckPlan::AllOf { checks } => evaluate_all_of(store, config, target, property, checks),
-        CheckPlan::AnyOf { checks } => evaluate_any_of(store, config, target, property, checks),
-        CheckPlan::Unavailable { reason } => EvidenceResult::Unknown {
+        (Observation::ChangedPaths { patterns }, Assertion::PathsNoMatch) => {
+            if changed_paths_match_any(&target.subject.changed_paths, patterns) {
+                EvidenceResult::Failed {
+                    reason: "at least one changed path matched a forbidden pattern".to_string(),
+                }
+            } else {
+                EvidenceResult::Passed
+            }
+        }
+        (Observation::ChangedPaths { patterns }, Assertion::PathsNotAllMatch) => {
+            if changed_paths_all_match(&target.subject.changed_paths, patterns) {
+                EvidenceResult::Failed {
+                    reason: "all changed paths matched the patterns".to_string(),
+                }
+            } else {
+                EvidenceResult::Passed
+            }
+        }
+        (Observation::Run { run }, Assertion::ExitCodeIs { code }) => {
+            match execute_run_plan(store, config, target, plan_id, run, memo) {
+                Ok(run) if run.output.status.code() == Some(*code) => EvidenceResult::Passed,
+                Ok(run) => EvidenceResult::Failed {
+                    reason: format!(
+                        "run exit code was {:?}, expected {code}",
+                        run.output.status.code()
+                    ),
+                },
+                Err(reason) => EvidenceResult::Unknown { reason },
+            }
+        }
+        (Observation::Run { run }, Assertion::ExitCodeIsNot { code }) => {
+            match execute_run_plan(store, config, target, plan_id, run, memo) {
+                Ok(run) if run.output.status.code() != Some(*code) => EvidenceResult::Passed,
+                Ok(run) => EvidenceResult::Failed {
+                    reason: format!(
+                        "run exit code was {:?}, expected not {code}",
+                        run.output.status.code()
+                    ),
+                },
+                Err(reason) => EvidenceResult::Unknown { reason },
+            }
+        }
+        (
+            Observation::SameOutput {
+                left,
+                right,
+                selectors,
+            },
+            Assertion::OutputsSame,
+        ) => {
+            match evaluate_same_output(
+                store,
+                config,
+                target,
+                plan_id,
+                SameOutputPlan {
+                    left,
+                    right,
+                    selectors,
+                },
+                memo,
+            ) {
+                SameOutputEvaluation::Same => EvidenceResult::Passed,
+                SameOutputEvaluation::Different => EvidenceResult::Failed {
+                    reason: "selected outputs differed".to_string(),
+                },
+                SameOutputEvaluation::Error(reason) => EvidenceResult::Unknown { reason },
+            }
+        }
+        (
+            Observation::SameOutput {
+                left,
+                right,
+                selectors,
+            },
+            Assertion::OutputsDiffer,
+        ) => {
+            match evaluate_same_output(
+                store,
+                config,
+                target,
+                plan_id,
+                SameOutputPlan {
+                    left,
+                    right,
+                    selectors,
+                },
+                memo,
+            ) {
+                SameOutputEvaluation::Different => EvidenceResult::Passed,
+                SameOutputEvaluation::Same => EvidenceResult::Failed {
+                    reason: "selected outputs were the same".to_string(),
+                },
+                SameOutputEvaluation::Error(reason) => EvidenceResult::Unknown { reason },
+            }
+        }
+        (Observation::Unavailable { reason }, Assertion::Unavailable) => EvidenceResult::Unknown {
             reason: reason.clone(),
         },
-    }
-}
-
-fn evaluate_all_of(
-    store: &GraftStore,
-    config: &GraftConfig,
-    target: &ValidationTarget,
-    property: &PropertyRef,
-    checks: &[CheckPlan],
-) -> EvidenceResult {
-    for (index, check) in checks.iter().enumerate() {
-        let result = evaluate_check(store, config, target, property, check);
-        if !result.satisfies_requirement() {
-            return contextualize_non_passing_result(
-                result,
-                format!("all_of branch {index} did not pass"),
-            );
-        }
-    }
-    EvidenceResult::Passed
-}
-
-fn evaluate_any_of(
-    store: &GraftStore,
-    config: &GraftConfig,
-    target: &ValidationTarget,
-    property: &PropertyRef,
-    checks: &[CheckPlan],
-) -> EvidenceResult {
-    let mut failures = Vec::new();
-    let mut saw_unknown = false;
-    for (index, check) in checks.iter().enumerate() {
-        let result = evaluate_check(store, config, target, property, check);
-        if result.satisfies_requirement() {
-            return EvidenceResult::Passed;
-        }
-        saw_unknown |= matches!(
-            result,
-            EvidenceResult::Unknown { .. } | EvidenceResult::Skipped { .. }
-        );
-        failures.push(format!(
-            "branch {index}: {}",
-            evidence_result_label(&result)
-        ));
-    }
-    let reason = if failures.is_empty() {
-        "any_of had no branches".to_string()
-    } else {
-        format!("no any_of branch passed: {}", failures.join("; "))
-    };
-    if saw_unknown {
-        EvidenceResult::Unknown { reason }
-    } else {
-        EvidenceResult::Failed { reason }
-    }
-}
-
-fn evaluate_expect(
-    store: &GraftStore,
-    config: &GraftConfig,
-    target: &ValidationTarget,
-    property: &PropertyRef,
-    probe: &ProbePlan,
-    polarity: &ProbePolarity,
-) -> EvidenceResult {
-    match evaluate_probe(store, config, target, property, probe) {
-        ProbeEvaluation::Result(ProbeResult::Success) => match polarity {
-            ProbePolarity::Success => EvidenceResult::Passed,
-            ProbePolarity::Failure => EvidenceResult::Failed {
-                reason: "probe succeeded but failure was expected".to_string(),
-            },
+        _ => EvidenceResult::Unknown {
+            reason: format!(
+                "observation {:?} cannot satisfy assertion {:?}",
+                plan.observation, plan.assertion
+            ),
         },
-        ProbeEvaluation::Result(ProbeResult::Failure) => match polarity {
-            ProbePolarity::Success => EvidenceResult::Failed {
-                reason: "probe failed but success was expected".to_string(),
-            },
-            ProbePolarity::Failure => EvidenceResult::Passed,
-        },
-        ProbeEvaluation::Result(ProbeResult::Error) => EvidenceResult::Unknown {
-            reason: "probe evaluation returned error".to_string(),
-        },
-        ProbeEvaluation::Error(reason) => EvidenceResult::Unknown { reason },
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum ProbeEvaluation {
-    Result(ProbeResult),
-    Error(String),
+fn changed_paths_match_any(paths: &[String], patterns: &[String]) -> bool {
+    paths
+        .iter()
+        .any(|path| patterns.iter().any(|pattern| path_matches(pattern, path)))
 }
 
-fn evaluate_probe(
-    store: &GraftStore,
-    config: &GraftConfig,
-    target: &ValidationTarget,
-    property: &PropertyRef,
-    probe: &ProbePlan,
-) -> ProbeEvaluation {
-    match probe {
-        ProbePlan::PathMatch { paths, patterns } => {
-            let paths = evaluate_path_set(&target.subject, paths);
-            if paths
-                .iter()
-                .any(|path| patterns.iter().any(|pattern| path_matches(pattern, path)))
-            {
-                ProbeEvaluation::Result(ProbeResult::Success)
-            } else {
-                ProbeEvaluation::Result(ProbeResult::Failure)
-            }
-        }
-        ProbePlan::PathAllMatch { paths, patterns } => {
-            let paths = evaluate_path_set(&target.subject, paths);
-            if paths
-                .iter()
-                .all(|path| patterns.iter().any(|pattern| path_matches(pattern, path)))
-            {
-                ProbeEvaluation::Result(ProbeResult::Success)
-            } else {
-                ProbeEvaluation::Result(ProbeResult::Failure)
-            }
-        }
-        ProbePlan::RunExitCodeIs { run, code } => {
-            match execute_run_plan(store, config, target, property, run) {
-                Ok(run) if run.output.status.code() == Some(*code) => {
-                    ProbeEvaluation::Result(ProbeResult::Success)
-                }
-                Ok(_run) => ProbeEvaluation::Result(ProbeResult::Failure),
-                Err(reason) => ProbeEvaluation::Error(reason),
-            }
-        }
-        ProbePlan::SameOutput {
-            left,
-            right,
-            selectors,
-        } => evaluate_same_output(store, config, target, property, left, right, selectors),
-    }
+fn changed_paths_all_match(paths: &[String], patterns: &[String]) -> bool {
+    paths
+        .iter()
+        .all(|path| patterns.iter().any(|pattern| path_matches(pattern, path)))
 }
 
-fn evaluate_path_set<'a>(subject: &'a ValidationSubject, paths: &PathSetPlan) -> &'a [String] {
-    match paths {
-        PathSetPlan::ChangedPaths => &subject.changed_paths,
-    }
-}
-
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct RunExecution {
     output: std::process::Output,
     cwd: PathBuf,
+}
+
+#[derive(Serialize)]
+struct RunResultKeySeed<'a> {
+    argv: &'a [String],
+    tree: &'a str,
 }
 
 fn execute_run_plan(
     store: &GraftStore,
     config: &GraftConfig,
     target: &ValidationTarget,
-    property: &PropertyRef,
+    plan_id: &PlanId,
     run: &RunPlan,
+    memo: &mut ValidationMemo,
 ) -> std::result::Result<RunExecution, String> {
     let Some(program) = run.argv.first() else {
         return Err("run argv must not be empty".to_string());
     };
-    let cwd = materialize_run_tree(store, config, target, property, &run.tree)?;
-    let output = ProcessCommand::new(program)
+    let cwd = materialize_run_tree(store, config, target, plan_id, &run.tree)?;
+    let run_result_id = stable_typed_id(
+        "run_result",
+        &RunResultKeySeed {
+            argv: &run.argv,
+            tree: cwd
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| {
+                    format!("materialized run tree has invalid id: {}", cwd.display())
+                })?,
+        },
+    )
+    .map_err(|error| format!("run result id could not be computed: {error}"))?;
+    if let Some(cached) = memo.run_results.get(&run_result_id) {
+        return cached.clone();
+    }
+    let result = ProcessCommand::new(program)
         .args(&run.argv[1..])
         .current_dir(&cwd)
         .output()
+        .map(|output| RunExecution {
+            output,
+            cwd: cwd.clone(),
+        })
         .map_err(|error| {
             format!(
                 "failed to execute `{}` in {}: {error}",
                 program,
                 cwd.display()
             )
-        })?;
-    Ok(RunExecution { output, cwd })
+        });
+    memo.run_results.insert(run_result_id, result.clone());
+    result
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SameOutputEvaluation {
+    Same,
+    Different,
+    Error(String),
+}
+
+struct SameOutputPlan<'a> {
+    left: &'a RunPlan,
+    right: &'a RunPlan,
+    selectors: &'a [RunSelectorPlan],
 }
 
 fn evaluate_same_output(
     store: &GraftStore,
     config: &GraftConfig,
     target: &ValidationTarget,
-    property: &PropertyRef,
-    left: &RunPlan,
-    right: &RunPlan,
-    selectors: &[RunSelectorPlan],
-) -> ProbeEvaluation {
+    plan_id: &PlanId,
+    plan: SameOutputPlan<'_>,
+    memo: &mut ValidationMemo,
+) -> SameOutputEvaluation {
+    let SameOutputPlan {
+        left,
+        right,
+        selectors,
+    } = plan;
     if selectors.is_empty() {
-        return ProbeEvaluation::Error("same_output requires at least one selector".to_string());
+        return SameOutputEvaluation::Error(
+            "same_output requires at least one selector".to_string(),
+        );
     }
-    let left = match execute_run_plan(store, config, target, property, left) {
+    let left = match execute_run_plan(store, config, target, plan_id, left, memo) {
         Ok(run) => run,
-        Err(reason) => return ProbeEvaluation::Error(format!("left run failed: {reason}")),
+        Err(reason) => return SameOutputEvaluation::Error(format!("left run failed: {reason}")),
     };
     let left_values = match capture_run_selectors(&left, selectors) {
         Ok(values) => values,
-        Err(reason) => return ProbeEvaluation::Error(format!("left selector failed: {reason}")),
+        Err(reason) => {
+            return SameOutputEvaluation::Error(format!("left selector failed: {reason}"));
+        }
     };
-    let right = match execute_run_plan(store, config, target, property, right) {
+    let right = match execute_run_plan(store, config, target, plan_id, right, memo) {
         Ok(run) => run,
-        Err(reason) => return ProbeEvaluation::Error(format!("right run failed: {reason}")),
+        Err(reason) => return SameOutputEvaluation::Error(format!("right run failed: {reason}")),
     };
     let right_values = match capture_run_selectors(&right, selectors) {
         Ok(values) => values,
-        Err(reason) => return ProbeEvaluation::Error(format!("right selector failed: {reason}")),
+        Err(reason) => {
+            return SameOutputEvaluation::Error(format!("right selector failed: {reason}"));
+        }
     };
     if left_values == right_values {
-        ProbeEvaluation::Result(ProbeResult::Success)
+        SameOutputEvaluation::Same
     } else {
-        ProbeEvaluation::Result(ProbeResult::Failure)
+        SameOutputEvaluation::Different
     }
 }
 
@@ -465,10 +445,10 @@ fn materialize_run_tree(
     store: &GraftStore,
     config: &GraftConfig,
     target: &ValidationTarget,
-    property: &PropertyRef,
+    plan_id: &PlanId,
     tree: &TreePlan,
 ) -> std::result::Result<PathBuf, String> {
-    let snapshot = snapshot_for_tree_plan(store, config, target, property, tree)?;
+    let snapshot = snapshot_for_tree_plan(store, config, target, plan_id, tree)?;
     let tree_id = snapshot
         .id()
         .map_err(|error| format!("tree id could not be computed: {error}"))?;
@@ -483,7 +463,7 @@ fn snapshot_for_tree_plan(
     store: &GraftStore,
     config: &GraftConfig,
     target: &ValidationTarget,
-    property: &PropertyRef,
+    plan_id: &PlanId,
     tree: &TreePlan,
 ) -> std::result::Result<TreeSnapshot, String> {
     match tree {
@@ -503,10 +483,10 @@ fn snapshot_for_tree_plan(
         TreePlan::Application {
             application: ApplicationPlan::PreviousFailure { selector },
             endpoint,
-        } => previous_failure_snapshot(store, config, property, selector, endpoint),
+        } => previous_failure_snapshot(store, config, plan_id, selector, endpoint),
         TreePlan::WithOverlay { base, overlays } => {
-            let base = snapshot_for_tree_plan(store, config, target, property, base)?;
-            apply_overlays(store, config, target, property, base, overlays)
+            let base = snapshot_for_tree_plan(store, config, target, plan_id, base)?;
+            apply_overlays(store, config, target, plan_id, base, overlays)
         }
     }
 }
@@ -521,11 +501,11 @@ struct HistoricalFailure {
 fn previous_failure_snapshot(
     store: &GraftStore,
     config: &GraftConfig,
-    property: &PropertyRef,
+    plan_id: &PlanId,
     selector: &HistorySelector,
     endpoint: &ApplicationEndpoint,
 ) -> std::result::Result<TreeSnapshot, String> {
-    let failure = select_previous_failure(store, property, selector)?;
+    let failure = select_previous_failure(store, plan_id, selector)?;
     let resolved = store
         .resolve_application(&failure.application)
         .map_err(|error| {
@@ -549,7 +529,7 @@ fn previous_failure_snapshot(
 
 fn select_previous_failure(
     store: &GraftStore,
-    property: &PropertyRef,
+    plan_id: &PlanId,
     selector: &HistorySelector,
 ) -> std::result::Result<HistoricalFailure, String> {
     let mut failures = BTreeMap::<String, HistoricalFailure>::new();
@@ -565,7 +545,7 @@ fn select_previous_failure(
             &mut failures,
             subject,
             &candidate.application,
-            property,
+            plan_id,
             evidence,
         );
     }
@@ -581,7 +561,7 @@ fn select_previous_failure(
             &mut failures,
             subject,
             &patch.application,
-            property,
+            plan_id,
             evidence,
         );
     }
@@ -593,8 +573,8 @@ fn select_previous_failure(
     });
     if failures.is_empty() {
         return Err(format!(
-            "no previous failed application for property `{}`",
-            property.id.as_str()
+            "no previous failed application for plan `{}`",
+            plan_id.as_str()
         ));
     }
     let index = match selector {
@@ -616,12 +596,11 @@ fn record_failed_application(
     failures: &mut BTreeMap<String, HistoricalFailure>,
     subject: &str,
     application: &ApplicationRef,
-    property: &PropertyRef,
+    plan_id: &PlanId,
     evidence: Vec<EvidenceRecord>,
 ) {
     for record in evidence {
-        if record.property == property.id && matches!(record.result, EvidenceResult::Failed { .. })
-        {
+        if record.plan == *plan_id && matches!(record.result, EvidenceResult::Failed { .. }) {
             let failure = HistoricalFailure {
                 subject: subject.to_string(),
                 created_at: record.created_at,
@@ -653,7 +632,7 @@ fn apply_overlays(
     store: &GraftStore,
     config: &GraftConfig,
     target: &ValidationTarget,
-    property: &PropertyRef,
+    plan_id: &PlanId,
     base: TreeSnapshot,
     overlays: &[OverlayPlan],
 ) -> std::result::Result<TreeSnapshot, String> {
@@ -666,7 +645,7 @@ fn apply_overlays(
         match overlay {
             OverlayPlan::ReplaceFile { path, file } => {
                 let path = normalize_plan_path(path)?;
-                let file = resolve_file_ref(store, config, target, property, file)?;
+                let file = resolve_file_ref(store, config, target, plan_id, file)?;
                 entries.insert(
                     path.clone(),
                     TreeEntry {
@@ -685,13 +664,13 @@ fn resolve_file_ref(
     store: &GraftStore,
     config: &GraftConfig,
     target: &ValidationTarget,
-    property: &PropertyRef,
+    plan_id: &PlanId,
     file: &FileRefPlan,
 ) -> std::result::Result<TreeEntry, String> {
     match file {
         FileRefPlan::TreeFile { tree, path } => {
             let path = normalize_plan_path(path)?;
-            let snapshot = snapshot_for_tree_plan(store, config, target, property, tree)?;
+            let snapshot = snapshot_for_tree_plan(store, config, target, plan_id, tree)?;
             snapshot
                 .entries
                 .into_iter()
@@ -736,21 +715,6 @@ fn normalize_plan_path(path: &str) -> std::result::Result<String, String> {
     Ok(value.to_string())
 }
 
-fn contextualize_non_passing_result(result: EvidenceResult, context: String) -> EvidenceResult {
-    match result {
-        EvidenceResult::Passed => EvidenceResult::Passed,
-        EvidenceResult::Failed { reason } => EvidenceResult::Failed {
-            reason: format!("{context}: {reason}"),
-        },
-        EvidenceResult::Unknown { reason } => EvidenceResult::Unknown {
-            reason: format!("{context}: {reason}"),
-        },
-        EvidenceResult::Skipped { reason } => EvidenceResult::Skipped {
-            reason: format!("{context}: {reason}"),
-        },
-    }
-}
-
 fn path_matches(pattern: &str, path: &str) -> bool {
     if pattern == "*" {
         return true;
@@ -789,47 +753,19 @@ fn path_matches(pattern: &str, path: &str) -> bool {
     true
 }
 
-fn evidence_results_label(records: &[EvidenceRecord]) -> String {
-    if records.is_empty() {
-        return "no evidence".to_string();
-    }
-    records
-        .iter()
-        .map(|record| evidence_result_label(&record.result))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn evidence_result_label(result: &EvidenceResult) -> String {
-    match result {
-        EvidenceResult::Passed => "passed".to_string(),
-        EvidenceResult::Failed { reason } => format!("failed ({reason})"),
-        EvidenceResult::Unknown { reason } => format!("unknown ({reason})"),
-        EvidenceResult::Skipped { reason } => format!("skipped ({reason})"),
-    }
-}
-
 pub(crate) fn evidence_for_current_verifiers(
-    config: &GraftConfig,
-    required: &[PropertyRef],
+    _config: &GraftConfig,
+    required: &[PlanId],
     evidence: &[EvidenceRecord],
     subject: &str,
 ) -> Result<Vec<EvidenceRecord>> {
-    let mut current_verifiers = BTreeMap::new();
-    for property in required {
-        let spec = property_spec_for_ref(config, property)?;
-        current_verifiers.insert(property.id.clone(), verifier_id_for_spec(spec)?);
-    }
+    let required = required.iter().collect::<BTreeSet<_>>();
     Ok(evidence
         .iter()
         .filter(|record| {
-            required.iter().any(|property| {
-                record.property == property.id
-                    && record.subject == subject
-                    && current_verifiers
-                        .get(&property.id)
-                        .is_some_and(|verifier| verifier == &record.verifier)
-            })
+            required.contains(&record.plan)
+                && record.subject == subject
+                && record.verifier == graft_validate::verifier_id_for_plan(&record.plan)
         })
         .cloned()
         .collect())
@@ -1092,1020 +1028,175 @@ fn snapshot_mismatch_reason(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-    use std::fs;
-    use std::path::PathBuf;
+    use super::*;
+    use graft_core::{Assertion, Observation};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use graft_core::{
-        AdmissionSummary, ApplicationEndpoint, ApplicationPlan, Change, ChangeOp, CheckPlan,
-        Constraint, EvidenceRecord, EvidenceResult, FileMode, HistorySelector, PatchId,
-        PatchRecord, PathSetPlan, ProbePlan, ProbePolarity, PropertyName, PropertyPlan,
-        PropertyRef, PropertySpec, Provenance, RunPlan, Severity, StateId, TreeEntry, TreePlan,
-        TreeSnapshot, application_from_change,
-    };
-    use graft_store::GraftStore;
-    use graft_validate::ValidationSubject;
-
-    use super::{
-        ValidationTarget, evidence_for_current_verifiers, validate_change_replays_to_target,
-        validate_property, verifier_id_for_spec,
-    };
-
-    fn property_spec_with_checks(
-        name: &str,
-        checks: Vec<CheckPlan>,
-        requires: &[&str],
-    ) -> PropertySpec {
-        PropertySpec {
-            name: PropertyName::new(name),
-            plan: PropertyPlan {
-                checks,
-                requires: requires
-                    .iter()
-                    .map(|name| PropertyName::new(*name))
-                    .collect(),
-            },
-            description: format!("{name} property"),
-            severity: Severity::Blocking,
-            source_ref: None,
-        }
-    }
-
-    fn workspace_property(property: PropertyRef) -> PropertyRef {
-        property
-    }
-
-    fn write_historical_failed_patch(
-        store: &GraftStore,
-        patch_id: &str,
-        property: &PropertyRef,
-        path: &str,
-        content: &[u8],
-    ) {
-        let base_snapshot = TreeSnapshot::new(Vec::new());
-        let target_hash = store.write_blob(content).unwrap();
-        let target_snapshot = TreeSnapshot::new(vec![TreeEntry {
-            path: path.to_string(),
-            hash: target_hash,
-            size: u64::try_from(content.len()).unwrap(),
-        }]);
-        store.write_tree_snapshot(&base_snapshot).unwrap();
-        store.write_tree_snapshot(&target_snapshot).unwrap();
-        let change = Change::from_snapshots(
-            StateId::GraftTree(base_snapshot.id().unwrap()),
-            Some(&base_snapshot),
-            StateId::GraftTree(target_snapshot.id().unwrap()),
-            &target_snapshot,
-        );
-        let materialized = application_from_change(&change).unwrap();
-        let application = store.write_materialized_application(&materialized).unwrap();
-        let patch = PatchRecord {
-            id: PatchId::new(patch_id),
-            application,
-            constraint: Constraint::primitive(property.clone()),
-            provenance: Provenance::now("test", None),
-            admission: AdmissionSummary {
-                constraint: Constraint::primitive(property.clone()),
-            },
-        };
-        store.write_patch(&patch).unwrap();
-        let evidence = EvidenceRecord::failed(
-            patch.id.as_str(),
-            property.id.clone(),
-            "test-verifier",
-            "historical failure",
-        )
-        .unwrap();
-        let evidence_id = evidence.id.to_string();
-        store.write_evidence(&evidence).unwrap();
-        store
-            .append_patch_evidence_index(patch.id.as_str(), &evidence_id)
-            .unwrap();
-    }
-
-    #[test]
-    fn change_integrity_replays_change_to_target() {
-        let base = TreeSnapshot::new(vec![TreeEntry {
-            path: "src/lib.rs".to_string(),
-            hash: "old".to_string(),
-            size: 3,
-        }]);
-        let target = TreeSnapshot::new(vec![TreeEntry {
-            path: "src/lib.rs".to_string(),
-            hash: "new".to_string(),
-            size: 3,
-        }]);
-        let change = Change::from_snapshots(
-            StateId::GraftTree(base.id().unwrap()),
-            Some(&base),
-            StateId::GraftTree(target.id().unwrap()),
-            &target,
-        );
-
-        assert!(validate_change_replays_to_target(&change, &base, &target).is_ok());
-    }
-
-    #[test]
-    fn change_integrity_fails_when_base_content_does_not_match() {
-        let base = TreeSnapshot::new(vec![TreeEntry {
-            path: "src/lib.rs".to_string(),
-            hash: "old".to_string(),
-            size: 3,
-        }]);
-        let target = TreeSnapshot::new(vec![TreeEntry {
-            path: "src/lib.rs".to_string(),
-            hash: "new".to_string(),
-            size: 3,
-        }]);
-        let change = Change {
-            base_state: StateId::GraftTree(base.id().unwrap()),
-            target_state: StateId::GraftTree(target.id().unwrap()),
-            ops: vec![ChangeOp::ReplaceFile {
-                path: "src/lib.rs".to_string(),
-                before: "other".to_string(),
-                after: "new".to_string(),
-                mode_before: FileMode::Regular,
-                mode_after: FileMode::Regular,
-            }],
-            capture: false,
-        };
-
-        let reason = validate_change_replays_to_target(&change, &base, &target).unwrap_err();
-
-        assert!(reason.contains("does not match declared base content"));
-    }
-
-    #[test]
-    fn v2_structural_path_match_success_and_failure_polarity() {
-        let dir = test_workspace("graft-cli-v2-structural-path-test");
-        let store = GraftStore::open(&dir);
-        store.init_storage().unwrap();
-        let mut config = crate::config::GraftConfig::default();
-        config.properties.insert(
-            "source_changed".to_string(),
-            property_spec_with_checks(
-                "source_changed",
-                vec![CheckPlan::Expect {
-                    probe: ProbePlan::PathMatch {
-                        paths: PathSetPlan::ChangedPaths,
-                        patterns: vec!["src/**".to_string()],
-                    },
-                    polarity: ProbePolarity::Success,
-                }],
-                &[],
-            ),
-        );
-        config.properties.insert(
-            "no_generated".to_string(),
-            property_spec_with_checks(
-                "no_generated",
-                vec![CheckPlan::Expect {
-                    probe: ProbePlan::PathMatch {
-                        paths: PathSetPlan::ChangedPaths,
-                        patterns: vec!["target/**".to_string()],
-                    },
-                    polarity: ProbePolarity::Failure,
-                }],
-                &[],
-            ),
-        );
-        let target = ValidationTarget {
-            subject: ValidationSubject::with_change(
-                "candidate:demo",
-                vec!["src/lib.rs".to_string()],
-            ),
-            base_snapshot: None,
-            target_snapshot: None,
-            integrity: EvidenceResult::Passed,
-        };
-        let source_changed =
-            workspace_property(config.properties["source_changed"].property_ref().unwrap());
-        let no_generated =
-            workspace_property(config.properties["no_generated"].property_ref().unwrap());
-
-        let source_records = validate_property(
-            &store,
-            &config,
-            &target,
-            &source_changed,
-            &mut BTreeMap::new(),
-        )
-        .unwrap();
-        let generated_records = validate_property(
-            &store,
-            &config,
-            &target,
-            &no_generated,
-            &mut BTreeMap::new(),
-        )
-        .unwrap();
-
-        assert_eq!(source_records[0].result, EvidenceResult::Passed);
-        assert_eq!(generated_records[0].result, EvidenceResult::Passed);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn v2_structural_path_all_match_checks_every_changed_path() {
-        let dir = test_workspace("graft-cli-v2-structural-all-path-test");
-        let store = GraftStore::open(&dir);
-        store.init_storage().unwrap();
-        let mut config = crate::config::GraftConfig::default();
-        config.properties.insert(
-            "docs_only".to_string(),
-            property_spec_with_checks(
-                "docs_only",
-                vec![CheckPlan::Expect {
-                    probe: ProbePlan::PathAllMatch {
-                        paths: PathSetPlan::ChangedPaths,
-                        patterns: vec!["docs/**".to_string(), "README.md".to_string()],
-                    },
-                    polarity: ProbePolarity::Success,
-                }],
-                &[],
-            ),
-        );
-        let docs_only = workspace_property(config.properties["docs_only"].property_ref().unwrap());
-        let passing_target = ValidationTarget {
-            subject: ValidationSubject::with_change(
-                "candidate:docs",
-                vec!["docs/guide.md".to_string(), "README.md".to_string()],
-            ),
-            base_snapshot: None,
-            target_snapshot: None,
-            integrity: EvidenceResult::Passed,
-        };
-        let failing_target = ValidationTarget {
-            subject: ValidationSubject::with_change(
-                "candidate:mixed",
-                vec!["docs/guide.md".to_string(), "src/lib.rs".to_string()],
-            ),
-            base_snapshot: None,
-            target_snapshot: None,
-            integrity: EvidenceResult::Passed,
-        };
-
-        let passing = validate_property(
-            &store,
-            &config,
-            &passing_target,
-            &docs_only,
-            &mut BTreeMap::new(),
-        )
-        .unwrap();
-        let failing = validate_property(
-            &store,
-            &config,
-            &failing_target,
-            &docs_only,
-            &mut BTreeMap::new(),
-        )
-        .unwrap();
-
-        assert_eq!(passing[0].result, EvidenceResult::Passed);
-        assert!(matches!(failing[0].result, EvidenceResult::Failed { .. }));
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn v2_combinators_are_lazy() {
-        let dir = test_workspace("graft-cli-v2-lazy-combinators-test");
-        let store = GraftStore::open(&dir);
-        store.init_storage().unwrap();
-        let mut config = crate::config::GraftConfig::default();
-        config.properties.insert(
-            "any_short_circuit".to_string(),
-            property_spec_with_checks(
-                "any_short_circuit",
-                vec![CheckPlan::AnyOf {
-                    checks: vec![
-                        CheckPlan::Expect {
-                            probe: ProbePlan::PathMatch {
-                                paths: PathSetPlan::ChangedPaths,
-                                patterns: vec!["src/**".to_string()],
-                            },
-                            polarity: ProbePolarity::Success,
-                        },
-                        CheckPlan::Unavailable {
-                            reason: "any_of should not evaluate this branch".to_string(),
-                        },
-                    ],
-                }],
-                &[],
-            ),
-        );
-        config.properties.insert(
-            "all_short_circuit".to_string(),
-            property_spec_with_checks(
-                "all_short_circuit",
-                vec![CheckPlan::AllOf {
-                    checks: vec![
-                        CheckPlan::Expect {
-                            probe: ProbePlan::PathMatch {
-                                paths: PathSetPlan::ChangedPaths,
-                                patterns: vec!["target/**".to_string()],
-                            },
-                            polarity: ProbePolarity::Success,
-                        },
-                        CheckPlan::Unavailable {
-                            reason: "all_of should not evaluate this branch".to_string(),
-                        },
-                    ],
-                }],
-                &[],
-            ),
-        );
-        let target = ValidationTarget {
-            subject: ValidationSubject::with_change(
-                "candidate:demo",
-                vec!["src/lib.rs".to_string()],
-            ),
-            base_snapshot: None,
-            target_snapshot: None,
-            integrity: EvidenceResult::Passed,
-        };
-
-        let any_ref = workspace_property(
-            config.properties["any_short_circuit"]
-                .property_ref()
-                .unwrap(),
-        );
-        let all_ref = workspace_property(
-            config.properties["all_short_circuit"]
-                .property_ref()
-                .unwrap(),
-        );
-        let any_records =
-            validate_property(&store, &config, &target, &any_ref, &mut BTreeMap::new()).unwrap();
-        let all_records =
-            validate_property(&store, &config, &target, &all_ref, &mut BTreeMap::new()).unwrap();
-
-        assert_eq!(any_records[0].result, EvidenceResult::Passed);
-        assert!(matches!(
-            all_records[0].result,
-            EvidenceResult::Failed { ref reason }
-                if !reason.contains("all_of should not evaluate this branch")
-        ));
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn v2_run_exit_code_executes_in_materialized_target_tree() {
-        let dir = test_workspace("graft-cli-v2-run-probe-exec-test");
-        let store = GraftStore::open(&dir);
-        store.init_storage().unwrap();
-        let target_hash = store.write_blob(b"ok\n").unwrap();
-        let base_hash = store.write_blob(b"base\n").unwrap();
-        let target_snapshot = TreeSnapshot::new(vec![TreeEntry {
-            path: "marker.txt".to_string(),
-            hash: target_hash,
-            size: 3,
-        }]);
-        let base_snapshot = TreeSnapshot::new(vec![TreeEntry {
-            path: "base.txt".to_string(),
-            hash: base_hash,
-            size: 5,
-        }]);
-        let target_tree_id = target_snapshot.id().unwrap();
-        let base_tree_id = base_snapshot.id().unwrap();
-        let mut config = crate::config::GraftConfig::default();
-        config.properties.insert(
-            "command_check".to_string(),
-            property_spec_with_checks(
-                "command_check",
-                vec![CheckPlan::Expect {
-                    probe: ProbePlan::RunExitCodeIs {
-                        run: graft_core::RunPlan {
-                            argv: vec![
-                                "/bin/sh".to_string(),
-                                "-c".to_string(),
-                                "test -f marker.txt".to_string(),
-                            ],
-                            tree: graft_core::TreePlan::Application {
-                                application: graft_core::ApplicationPlan::Current,
-                                endpoint: graft_core::ApplicationEndpoint::Target,
-                            },
-                        },
-                        code: 0,
-                    },
-                    polarity: ProbePolarity::Success,
-                }],
-                &[],
-            ),
-        );
-        config.properties.insert(
-            "base_command_check".to_string(),
-            property_spec_with_checks(
-                "base_command_check",
-                vec![CheckPlan::Expect {
-                    probe: ProbePlan::RunExitCodeIs {
-                        run: graft_core::RunPlan {
-                            argv: vec![
-                                "/bin/sh".to_string(),
-                                "-c".to_string(),
-                                "test -f base.txt".to_string(),
-                            ],
-                            tree: graft_core::TreePlan::Application {
-                                application: graft_core::ApplicationPlan::Current,
-                                endpoint: graft_core::ApplicationEndpoint::Base,
-                            },
-                        },
-                        code: 0,
-                    },
-                    polarity: ProbePolarity::Success,
-                }],
-                &[],
-            ),
-        );
-        let target = ValidationTarget {
-            subject: ValidationSubject::new("candidate:demo"),
-            base_snapshot: Some(base_snapshot),
-            target_snapshot: Some(target_snapshot),
-            integrity: EvidenceResult::Passed,
-        };
-        let property =
-            workspace_property(config.properties["command_check"].property_ref().unwrap());
-        let base_property = workspace_property(
-            config.properties["base_command_check"]
-                .property_ref()
-                .unwrap(),
-        );
-
-        let records =
-            validate_property(&store, &config, &target, &property, &mut BTreeMap::new()).unwrap();
-
-        let base_records = validate_property(
-            &store,
-            &config,
-            &target,
-            &base_property,
-            &mut BTreeMap::new(),
-        )
-        .unwrap();
-
-        assert_eq!(records[0].result, EvidenceResult::Passed);
-        assert_eq!(base_records[0].result, EvidenceResult::Passed);
-        assert!(
-            store
-                .paths()
-                .derived_worktrees()
-                .join(target_tree_id)
-                .join("marker.txt")
-                .exists(),
-            "target run tree must be materialized under derived/worktrees/<tree-id>"
-        );
-        assert!(
-            store
-                .paths()
-                .derived_worktrees()
-                .join(base_tree_id)
-                .join("base.txt")
-                .exists(),
-            "base run tree must be materialized under derived/worktrees/<tree-id>"
-        );
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn v2_overlay_replaces_file_from_referenced_tree_for_command_runs() {
-        let dir = test_workspace("graft-cli-v2-overlay-run-test");
-        let store = GraftStore::open(&dir);
-        store.init_storage().unwrap();
-        let base_hash = store.write_blob(b"base\n").unwrap();
-        let replacement_hash = store.write_blob(b"ok\n").unwrap();
-        let base_snapshot = TreeSnapshot::new(vec![TreeEntry {
-            path: "check.txt".to_string(),
-            hash: base_hash,
-            size: 5,
-        }]);
-        let target_snapshot = TreeSnapshot::new(vec![TreeEntry {
-            path: "replacement.txt".to_string(),
-            hash: replacement_hash,
-            size: 3,
-        }]);
-        let mut config = crate::config::GraftConfig::default();
-        let target_tree = graft_core::TreePlan::Application {
-            application: graft_core::ApplicationPlan::Current,
-            endpoint: graft_core::ApplicationEndpoint::Target,
-        };
-        config.properties.insert(
-            "overlay_check".to_string(),
-            property_spec_with_checks(
-                "overlay_check",
-                vec![CheckPlan::Expect {
-                    probe: ProbePlan::RunExitCodeIs {
-                        run: graft_core::RunPlan {
-                            argv: vec![
-                                "/bin/sh".to_string(),
-                                "-c".to_string(),
-                                "grep -q ok check.txt".to_string(),
-                            ],
-                            tree: graft_core::TreePlan::WithOverlay {
-                                base: Box::new(graft_core::TreePlan::Application {
-                                    application: graft_core::ApplicationPlan::Current,
-                                    endpoint: graft_core::ApplicationEndpoint::Base,
-                                }),
-                                overlays: vec![graft_core::OverlayPlan::ReplaceFile {
-                                    path: "./check.txt".to_string(),
-                                    file: graft_core::FileRefPlan::TreeFile {
-                                        tree: Box::new(target_tree),
-                                        path: "./replacement.txt".to_string(),
-                                    },
-                                }],
-                            },
-                        },
-                        code: 0,
-                    },
-                    polarity: ProbePolarity::Success,
-                }],
-                &[],
-            ),
-        );
-        let target = ValidationTarget {
-            subject: ValidationSubject::new("candidate:demo"),
-            base_snapshot: Some(base_snapshot),
-            target_snapshot: Some(target_snapshot),
-            integrity: EvidenceResult::Passed,
-        };
-        let property =
-            workspace_property(config.properties["overlay_check"].property_ref().unwrap());
-
-        let records =
-            validate_property(&store, &config, &target, &property, &mut BTreeMap::new()).unwrap();
-
-        assert_eq!(records[0].result, EvidenceResult::Passed);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn v2_missing_tree_file_overlay_is_unknown_when_consumed() {
-        let dir = test_workspace("graft-cli-v2-overlay-missing-file-test");
-        let store = GraftStore::open(&dir);
-        store.init_storage().unwrap();
-        let base_snapshot = TreeSnapshot::new(Vec::new());
-        let target_snapshot = TreeSnapshot::new(Vec::new());
-        let mut config = crate::config::GraftConfig::default();
-        config.properties.insert(
-            "overlay_check".to_string(),
-            property_spec_with_checks(
-                "overlay_check",
-                vec![CheckPlan::Expect {
-                    probe: ProbePlan::RunExitCodeIs {
-                        run: graft_core::RunPlan {
-                            argv: vec!["/bin/sh".to_string(), "-c".to_string(), "true".to_string()],
-                            tree: graft_core::TreePlan::WithOverlay {
-                                base: Box::new(graft_core::TreePlan::Application {
-                                    application: graft_core::ApplicationPlan::Current,
-                                    endpoint: graft_core::ApplicationEndpoint::Base,
-                                }),
-                                overlays: vec![graft_core::OverlayPlan::ReplaceFile {
-                                    path: "check.txt".to_string(),
-                                    file: graft_core::FileRefPlan::TreeFile {
-                                        tree: Box::new(graft_core::TreePlan::Application {
-                                            application: graft_core::ApplicationPlan::Current,
-                                            endpoint: graft_core::ApplicationEndpoint::Target,
-                                        }),
-                                        path: "missing.txt".to_string(),
-                                    },
-                                }],
-                            },
-                        },
-                        code: 0,
-                    },
-                    polarity: ProbePolarity::Success,
-                }],
-                &[],
-            ),
-        );
-        let target = ValidationTarget {
-            subject: ValidationSubject::new("candidate:demo"),
-            base_snapshot: Some(base_snapshot),
-            target_snapshot: Some(target_snapshot),
-            integrity: EvidenceResult::Passed,
-        };
-        let property =
-            workspace_property(config.properties["overlay_check"].property_ref().unwrap());
-
-        let records =
-            validate_property(&store, &config, &target, &property, &mut BTreeMap::new()).unwrap();
-
-        assert!(matches!(
-            records[0].result,
-            EvidenceResult::Unknown { ref reason }
-                if reason.contains("file `missing.txt` was not found")
-        ));
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn v2_same_output_compares_stdout_and_post_file_selectors() {
-        let dir = test_workspace("graft-cli-v2-same-output-pass-test");
-        let store = GraftStore::open(&dir);
-        store.init_storage().unwrap();
-        let mut config = crate::config::GraftConfig::default();
-        let target_tree = graft_core::TreePlan::Application {
-            application: graft_core::ApplicationPlan::Current,
-            endpoint: graft_core::ApplicationEndpoint::Target,
-        };
-        config.properties.insert(
-            "same_output_check".to_string(),
-            property_spec_with_checks(
-                "same_output_check",
-                vec![CheckPlan::Expect {
-                    probe: ProbePlan::SameOutput {
-                        left: graft_core::RunPlan {
-                            argv: vec![
-                                "/bin/sh".to_string(),
-                                "-c".to_string(),
-                                "printf same; printf file > out.txt".to_string(),
-                            ],
-                            tree: target_tree.clone(),
-                        },
-                        right: graft_core::RunPlan {
-                            argv: vec![
-                                "/bin/sh".to_string(),
-                                "-c".to_string(),
-                                "printf same; printf file > out.txt".to_string(),
-                            ],
-                            tree: target_tree,
-                        },
-                        selectors: vec![
-                            graft_core::RunSelectorPlan::Stdout,
-                            graft_core::RunSelectorPlan::PostFile {
-                                path: "out.txt".to_string(),
-                            },
-                        ],
-                    },
-                    polarity: ProbePolarity::Success,
-                }],
-                &[],
-            ),
-        );
-        let target = ValidationTarget {
-            subject: ValidationSubject::new("candidate:demo"),
-            base_snapshot: None,
-            target_snapshot: Some(TreeSnapshot::new(Vec::new())),
-            integrity: EvidenceResult::Passed,
-        };
-        let property = workspace_property(
-            config.properties["same_output_check"]
-                .property_ref()
-                .unwrap(),
-        );
-
-        let records =
-            validate_property(&store, &config, &target, &property, &mut BTreeMap::new()).unwrap();
-
-        assert_eq!(records[0].result, EvidenceResult::Passed);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn v2_same_output_fails_on_selector_mismatch_and_unknown_on_missing_post_file() {
-        let dir = test_workspace("graft-cli-v2-same-output-fail-test");
-        let store = GraftStore::open(&dir);
-        store.init_storage().unwrap();
-        let mut config = crate::config::GraftConfig::default();
-        let target_tree = graft_core::TreePlan::Application {
-            application: graft_core::ApplicationPlan::Current,
-            endpoint: graft_core::ApplicationEndpoint::Target,
-        };
-        config.properties.insert(
-            "mismatch".to_string(),
-            property_spec_with_checks(
-                "mismatch",
-                vec![CheckPlan::Expect {
-                    probe: ProbePlan::SameOutput {
-                        left: graft_core::RunPlan {
-                            argv: vec![
-                                "/bin/sh".to_string(),
-                                "-c".to_string(),
-                                "printf left".to_string(),
-                            ],
-                            tree: target_tree.clone(),
-                        },
-                        right: graft_core::RunPlan {
-                            argv: vec![
-                                "/bin/sh".to_string(),
-                                "-c".to_string(),
-                                "printf right".to_string(),
-                            ],
-                            tree: target_tree.clone(),
-                        },
-                        selectors: vec![graft_core::RunSelectorPlan::Stdout],
-                    },
-                    polarity: ProbePolarity::Success,
-                }],
-                &[],
-            ),
-        );
-        config.properties.insert(
-            "missing_post_file".to_string(),
-            property_spec_with_checks(
-                "missing_post_file",
-                vec![CheckPlan::Expect {
-                    probe: ProbePlan::SameOutput {
-                        left: graft_core::RunPlan {
-                            argv: vec!["/bin/sh".to_string(), "-c".to_string(), "true".to_string()],
-                            tree: target_tree.clone(),
-                        },
-                        right: graft_core::RunPlan {
-                            argv: vec!["/bin/sh".to_string(), "-c".to_string(), "true".to_string()],
-                            tree: target_tree,
-                        },
-                        selectors: vec![graft_core::RunSelectorPlan::PostFile {
-                            path: "missing.txt".to_string(),
-                        }],
-                    },
-                    polarity: ProbePolarity::Success,
-                }],
-                &[],
-            ),
-        );
-        let target = ValidationTarget {
-            subject: ValidationSubject::new("candidate:demo"),
-            base_snapshot: None,
-            target_snapshot: Some(TreeSnapshot::new(Vec::new())),
-            integrity: EvidenceResult::Passed,
-        };
-        let mismatch = workspace_property(config.properties["mismatch"].property_ref().unwrap());
-        let missing = workspace_property(
-            config.properties["missing_post_file"]
-                .property_ref()
-                .unwrap(),
-        );
-
-        let mismatch_records =
-            validate_property(&store, &config, &target, &mismatch, &mut BTreeMap::new()).unwrap();
-        let missing_records =
-            validate_property(&store, &config, &target, &missing, &mut BTreeMap::new()).unwrap();
-
-        assert!(matches!(
-            mismatch_records[0].result,
-            EvidenceResult::Failed { .. }
-        ));
-        assert!(matches!(
-            missing_records[0].result,
-            EvidenceResult::Unknown { ref reason }
-                if reason.contains("post_file `missing.txt`")
-        ));
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn v2_previous_failure_last_resolves_target_tree_for_current_property() {
-        let dir = test_workspace("graft-cli-v2-previous-failure-last-test");
-        let store = GraftStore::open(&dir);
-        store.init_storage().unwrap();
-        let mut config = crate::config::GraftConfig::default();
-        let history_tree = TreePlan::Application {
-            application: ApplicationPlan::PreviousFailure {
-                selector: HistorySelector::Last,
-            },
-            endpoint: ApplicationEndpoint::Target,
-        };
-        let spec = property_spec_with_checks(
-            "history_check",
-            vec![CheckPlan::Expect {
-                probe: ProbePlan::RunExitCodeIs {
-                    run: RunPlan {
-                        argv: vec![
-                            "/bin/sh".to_string(),
-                            "-c".to_string(),
-                            "test -f selected.txt".to_string(),
-                        ],
-                        tree: history_tree,
-                    },
-                    code: 0,
-                },
-                polarity: ProbePolarity::Success,
-            }],
-            &[],
-        );
-        let property_ref = spec.property_ref().unwrap();
-        write_historical_failed_patch(&store, "patch:001", &property_ref, "old.txt", b"old\n");
-        write_historical_failed_patch(&store, "patch:999", &property_ref, "selected.txt", b"new\n");
-        config.properties.insert("history_check".to_string(), spec);
-        let property = workspace_property(property_ref);
-        let target = ValidationTarget {
-            subject: ValidationSubject::new("candidate:current"),
-            base_snapshot: None,
-            target_snapshot: None,
-            integrity: EvidenceResult::Passed,
-        };
-
-        let records =
-            validate_property(&store, &config, &target, &property, &mut BTreeMap::new()).unwrap();
-
-        assert_eq!(records[0].result, EvidenceResult::Passed);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn v2_previous_failure_missing_history_is_unknown_when_consumed() {
-        let dir = test_workspace("graft-cli-v2-previous-failure-missing-test");
-        let store = GraftStore::open(&dir);
-        store.init_storage().unwrap();
-        let mut config = crate::config::GraftConfig::default();
-        let spec = property_spec_with_checks(
-            "history_check",
-            vec![CheckPlan::Expect {
-                probe: ProbePlan::RunExitCodeIs {
-                    run: RunPlan {
-                        argv: vec!["/bin/sh".to_string(), "-c".to_string(), "true".to_string()],
-                        tree: TreePlan::Application {
-                            application: ApplicationPlan::PreviousFailure {
-                                selector: HistorySelector::First,
-                            },
-                            endpoint: ApplicationEndpoint::Target,
-                        },
-                    },
-                    code: 0,
-                },
-                polarity: ProbePolarity::Success,
-            }],
-            &[],
-        );
-        let property = workspace_property(spec.property_ref().unwrap());
-        config.properties.insert("history_check".to_string(), spec);
-        let target = ValidationTarget {
-            subject: ValidationSubject::new("candidate:current"),
-            base_snapshot: None,
-            target_snapshot: None,
-            integrity: EvidenceResult::Passed,
-        };
-
-        let records =
-            validate_property(&store, &config, &target, &property, &mut BTreeMap::new()).unwrap();
-
-        assert!(matches!(
-            records[0].result,
-            EvidenceResult::Unknown { ref reason }
-                if reason.contains("no previous failed application for property")
-        ));
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn v2_run_exit_code_empty_argv_is_unknown_not_panic() {
-        let dir = test_workspace("graft-cli-v2-run-probe-empty-argv-test");
-        let store = GraftStore::open(&dir);
-        store.init_storage().unwrap();
-        let mut config = crate::config::GraftConfig::default();
-        config.properties.insert(
-            "command_check".to_string(),
-            property_spec_with_checks(
-                "command_check",
-                vec![CheckPlan::Expect {
-                    probe: ProbePlan::RunExitCodeIs {
-                        run: graft_core::RunPlan {
-                            argv: Vec::new(),
-                            tree: graft_core::TreePlan::Application {
-                                application: graft_core::ApplicationPlan::Current,
-                                endpoint: graft_core::ApplicationEndpoint::Target,
-                            },
-                        },
-                        code: 0,
-                    },
-                    polarity: ProbePolarity::Success,
-                }],
-                &[],
-            ),
-        );
-        let target = ValidationTarget {
-            subject: ValidationSubject::new("candidate:demo"),
-            base_snapshot: None,
-            target_snapshot: Some(TreeSnapshot::new(Vec::new())),
-            integrity: EvidenceResult::Passed,
-        };
-        let property =
-            workspace_property(config.properties["command_check"].property_ref().unwrap());
-
-        let records =
-            validate_property(&store, &config, &target, &property, &mut BTreeMap::new()).unwrap();
-
-        assert!(matches!(
-            records[0].result,
-            EvidenceResult::Unknown { ref reason } if reason.contains("run argv must not be empty")
-        ));
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn v2_current_verifier_filter_rejects_stale_same_property_id_evidence() {
-        let mut config = crate::config::GraftConfig::default();
-        let spec = property_spec_with_checks("current", Vec::new(), &[]);
-        let property = workspace_property(spec.property_ref().unwrap());
-        let current_verifier = verifier_id_for_spec(&spec).unwrap();
-        config.properties.insert("current".to_string(), spec);
-        let subject = "candidate:demo";
-        let stale = EvidenceRecord::passed(
-            subject,
-            property.id.clone(),
-            "legacy-verifier-with-same-property-id",
-        )
-        .unwrap();
-        let current =
-            EvidenceRecord::passed(subject, property.id.clone(), current_verifier).unwrap();
-
-        let filtered = evidence_for_current_verifiers(
-            &config,
-            std::slice::from_ref(&property),
-            &[stale, current.clone()],
-            "candidate:demo",
-        )
-        .unwrap();
-
-        assert_eq!(filtered, vec![current]);
-    }
-
-    #[test]
-    fn v2_requires_skip_dependent_when_dependency_does_not_pass() {
-        let dir = test_workspace("graft-cli-v2-requires-skip-test");
-        let store = GraftStore::open(&dir);
-        store.init_storage().unwrap();
-        let mut config = crate::config::GraftConfig::default();
-        config.properties.insert(
-            "dependency".to_string(),
-            property_spec_with_checks(
-                "dependency",
-                vec![CheckPlan::Unavailable {
-                    reason: "dependency not available".to_string(),
-                }],
-                &[],
-            ),
-        );
-        config.properties.insert(
-            "dependent".to_string(),
-            property_spec_with_checks("dependent", Vec::new(), &["dependency"]),
-        );
-        let target = ValidationTarget {
-            subject: ValidationSubject::new("candidate:demo"),
-            base_snapshot: None,
-            target_snapshot: None,
-            integrity: EvidenceResult::Passed,
-        };
-        let dependent = workspace_property(config.properties["dependent"].property_ref().unwrap());
-        let mut memo = BTreeMap::new();
-
-        let records = validate_property(&store, &config, &target, &dependent, &mut memo).unwrap();
-
-        assert!(matches!(
-            records[0].result,
-            EvidenceResult::Skipped { ref reason }
-                if reason.contains("required properties did not pass")
-                    && reason.contains("dependency not available")
-        ));
-        let dependency =
-            workspace_property(config.properties["dependency"].property_ref().unwrap());
-        assert!(matches!(
-            memo.get(dependency.id.as_str()).unwrap()[0].result,
-            EvidenceResult::Unknown { ref reason } if reason.contains("dependency not available")
-        ));
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn v2_requires_allow_dependent_after_dependencies_pass() {
-        let dir = test_workspace("graft-cli-v2-requires-pass-test");
-        let store = GraftStore::open(&dir);
-        store.init_storage().unwrap();
-        let mut config = crate::config::GraftConfig::default();
-        config.properties.insert(
-            "dependency".to_string(),
-            property_spec_with_checks("dependency", Vec::new(), &[]),
-        );
-        config.properties.insert(
-            "dependent".to_string(),
-            property_spec_with_checks("dependent", Vec::new(), &["dependency"]),
-        );
-        let target = ValidationTarget {
-            subject: ValidationSubject::new("candidate:demo"),
-            base_snapshot: None,
-            target_snapshot: None,
-            integrity: EvidenceResult::Passed,
-        };
-        let dependent = workspace_property(config.properties["dependent"].property_ref().unwrap());
-        let mut memo = BTreeMap::new();
-
-        let records = validate_property(&store, &config, &target, &dependent, &mut memo).unwrap();
-
-        assert_eq!(records[0].result, EvidenceResult::Passed);
-        let dependency =
-            workspace_property(config.properties["dependency"].property_ref().unwrap());
-        assert_eq!(
-            memo.get(dependency.id.as_str()).unwrap()[0].result,
-            EvidenceResult::Passed
-        );
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    fn test_workspace(name: &str) -> PathBuf {
+    fn temp_store(name: &str) -> (PathBuf, GraftStore) {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("{name}-{}-{nanos}", std::process::id()))
+        let dir = std::env::temp_dir().join(format!(
+            "graft-runtime-validation-{name}-{}-{nanos}",
+            std::process::id()
+        ));
+        let store = GraftStore::open(&dir);
+        store.init().unwrap();
+        (dir, store)
+    }
+
+    fn target_with_paths(paths: &[&str]) -> ValidationTarget {
+        ValidationTarget {
+            subject: ValidationSubject::with_change(
+                "subject:demo".to_string(),
+                paths.iter().map(|path| path.to_string()).collect(),
+            ),
+            base_snapshot: Some(TreeSnapshot::new(Vec::new())),
+            target_snapshot: Some(TreeSnapshot::new(Vec::new())),
+            integrity: EvidenceResult::Passed,
+        }
+    }
+
+    fn config_with_plan(plan: Plan) -> (GraftConfig, PlanId) {
+        let plan_id = plan.plan_id().unwrap();
+        let mut config = GraftConfig::default();
+        config.plans.insert(plan_id.clone(), plan);
+        (config, plan_id)
+    }
+
+    #[test]
+    fn changed_paths_plan_honors_positive_and_negative_assertions() {
+        let (dir, store) = temp_store("changed-paths");
+        let target = target_with_paths(&["src/lib.rs", "README.md"]);
+        let mut memo = ValidationMemo::default();
+
+        let (config, plan_id) = config_with_plan(Plan {
+            observation: Observation::ChangedPaths {
+                patterns: vec!["src/**".to_string()],
+            },
+            assertion: Assertion::PathsAnyMatch,
+        });
+        let records = validate_plan(&store, &config, &target, &plan_id, &mut memo).unwrap();
+        assert_eq!(records[0].plan, plan_id);
+        assert_eq!(records[0].result, EvidenceResult::Passed);
+
+        let (config, plan_id) = config_with_plan(Plan {
+            observation: Observation::ChangedPaths {
+                patterns: vec!["target/**".to_string()],
+            },
+            assertion: Assertion::PathsNoMatch,
+        });
+        let records = validate_plan(
+            &store,
+            &config,
+            &target,
+            &plan_id,
+            &mut ValidationMemo::default(),
+        )
+        .unwrap();
+        assert_eq!(records[0].result, EvidenceResult::Passed);
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn run_plan_records_exit_code_result_against_plan_id() {
+        let (dir, store) = temp_store("run-plan");
+        let target = target_with_paths(&[]);
+        let (config, plan_id) = config_with_plan(Plan {
+            observation: Observation::Run {
+                run: RunPlan {
+                    argv: vec![
+                        "/bin/sh".to_string(),
+                        "-c".to_string(),
+                        "exit 0".to_string(),
+                    ],
+                    tree: TreePlan::Application {
+                        application: ApplicationPlan::Current,
+                        endpoint: ApplicationEndpoint::Target,
+                    },
+                },
+            },
+            assertion: Assertion::ExitCodeIs { code: 0 },
+        });
+
+        let records = validate_plan(
+            &store,
+            &config,
+            &target,
+            &plan_id,
+            &mut ValidationMemo::default(),
+        )
+        .unwrap();
+
+        assert_eq!(records[0].plan, plan_id);
+        assert_eq!(records[0].verifier, format!("plan@{}", records[0].plan));
+        assert_eq!(records[0].result, EvidenceResult::Passed);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_result_memo_reuses_same_observation_for_multiple_assertions() {
+        let (dir, store) = temp_store("run-result-memo");
+        let target = target_with_paths(&[]);
+        let counter = dir.join("counter.txt");
+        let script = format!(
+            "n=0; if test -f {0}; then n=$(cat {0}); fi; n=$((n + 1)); printf '%s' \"$n\" > {0}; exit 0",
+            counter.display()
+        );
+        let run = RunPlan {
+            argv: vec!["/bin/sh".to_string(), "-c".to_string(), script],
+            tree: TreePlan::Application {
+                application: ApplicationPlan::Current,
+                endpoint: ApplicationEndpoint::Target,
+            },
+        };
+        let first = Plan {
+            observation: Observation::Run { run: run.clone() },
+            assertion: Assertion::ExitCodeIs { code: 0 },
+        };
+        let second = Plan {
+            observation: Observation::Run { run },
+            assertion: Assertion::ExitCodeIsNot { code: 7 },
+        };
+        let first_id = first.plan_id().unwrap();
+        let second_id = second.plan_id().unwrap();
+        let mut config = GraftConfig::default();
+        config.plans.insert(first_id.clone(), first);
+        config.plans.insert(second_id.clone(), second);
+        let mut memo = ValidationMemo::default();
+
+        let first_records = validate_plan(&store, &config, &target, &first_id, &mut memo).unwrap();
+        let second_records =
+            validate_plan(&store, &config, &target, &second_id, &mut memo).unwrap();
+
+        assert_eq!(first_records[0].result, EvidenceResult::Passed);
+        assert_eq!(second_records[0].result, EvidenceResult::Passed);
+        assert_eq!(memo.run_results.len(), 1);
+        assert_eq!(std::fs::read_to_string(&counter).unwrap(), "1");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn evidence_for_current_verifiers_filters_subject_plan_and_verifier() {
+        let plan = PlanId::new("plan:demo");
+        let matching =
+            EvidenceRecord::passed("subject:demo", plan.clone(), "plan@plan:demo").unwrap();
+        let wrong_subject =
+            EvidenceRecord::passed("subject:other", plan.clone(), "plan@plan:demo").unwrap();
+        let wrong_verifier =
+            EvidenceRecord::passed("subject:demo", plan.clone(), "legacy").unwrap();
+
+        let filtered = evidence_for_current_verifiers(
+            &GraftConfig::default(),
+            std::slice::from_ref(&plan),
+            &[matching.clone(), wrong_subject, wrong_verifier],
+            "subject:demo",
+        )
+        .unwrap();
+
+        assert_eq!(filtered, vec![matching]);
     }
 }

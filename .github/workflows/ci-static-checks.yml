@@ -24,7 +24,13 @@ jobs:
       - uses: taiki-e/install-action@just
       - uses: astral-sh/setup-uv@v6
 
-      - name: Run rustfmt and clippy
+      - name: Install Lean
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
+            | sh -s -- -y --default-toolchain "$(cat lean-toolchain)"
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      - name: Run static checks
         run: just check
 
       - name: Run prek hooks

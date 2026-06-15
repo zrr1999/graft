@@ -14,7 +14,7 @@ use graft_store::{
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::WorkspaceCommand;
-use crate::config::{load_property_defs, read_property_lock, write_property_lock};
+use crate::config::{load_constraint_defs, read_constraint_lock, write_constraint_lock};
 use crate::ensure_workspace_initialized;
 use crate::view::{
     CommandEnvelope, CommandView, DaemonView, GcRegistryView, GcView, GcWorkspaceView, PsView,
@@ -112,7 +112,7 @@ pub(crate) fn run_init_command(store: &GraftStore, register_only: bool) -> Resul
         let registry_record = register_local_workspace(store)?;
         let message = if outcome.changed() || lock_created {
             format!(
-                "initialized .graft, graft.toml, properties.roto and graft.lock; registered {}",
+                "initialized .graft, graft.toml, constraints.roto and graft.lock; registered {}",
                 registry_record.id
             )
         } else {
@@ -146,9 +146,9 @@ pub(crate) fn init_workspace_files(store: &GraftStore) -> Result<(InitOutcome, b
         );
     }
     let outcome = store.init()?;
-    let defs = load_property_defs(store)?;
-    let lock_created = read_property_lock(store)?.is_none();
-    write_property_lock(store, &defs)?;
+    let defs = load_constraint_defs(store)?;
+    let lock_created = read_constraint_lock(store)?.is_none();
+    write_constraint_lock(store, &defs)?;
     Ok((outcome, lock_created))
 }
 

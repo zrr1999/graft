@@ -64,7 +64,7 @@ pub(crate) fn command_uses_cli_exec(command: &Command) -> bool {
         Command::Get { .. }
         | Command::Scratch { .. }
         | Command::Candidate { .. }
-        | Command::Property { .. }
+        | Command::Constraint { .. }
         | Command::Init { .. }
         | Command::Attach { .. }
         | Command::Detach
@@ -202,7 +202,7 @@ pub(crate) enum PatchCommandRoute<'a> {
     List {
         candidates: bool,
         all: bool,
-        property: &'a Option<String>,
+        constraint: &'a Option<String>,
         producer: &'a Option<String>,
     },
     FromScratch(&'a CandidateFromScratchArgs),
@@ -220,12 +220,12 @@ pub(crate) fn route_patch_command(command: &PatchCommand) -> PatchCommandRoute<'
         PatchCommand::List {
             candidates,
             all,
-            property,
+            constraint,
             producer,
         } => PatchCommandRoute::List {
             candidates: *candidates,
             all: *all,
-            property,
+            constraint,
             producer,
         },
         PatchCommand::FromScratch(args) => PatchCommandRoute::FromScratch(args),
@@ -251,12 +251,12 @@ pub(crate) fn route_patch_command(command: &PatchCommand) -> PatchCommandRoute<'
             required: required.clone(),
         }),
         PatchCommand::Search {
-            property,
+            constraint,
             base,
             producer,
             has_evidence,
         } => PatchCommandRoute::TopLevelAlias(Command::Search {
-            property: property.clone(),
+            constraint: constraint.clone(),
             base: base.clone(),
             producer: producer.clone(),
             has_evidence: has_evidence.clone(),

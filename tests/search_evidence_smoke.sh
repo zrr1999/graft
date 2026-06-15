@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # tests/search_evidence_smoke.sh
 #
-# `graft search --has-evidence <property>` promises passing evidence. Failed
+# `graft search --has-evidence <constraint>` promises passing evidence. Failed
 # evidence must remain visible on the patch record without being reported as a
-# proof that the patch has the property.
+# proof that the patch has the constraint.
 
 set -euo pipefail
 
@@ -17,32 +17,16 @@ trap cleanup_workspace EXIT
 
 cd "$WORKDIR"
 "$GRAFT_BIN" init >/dev/null
-write_properties_roto <<'ROTO'
-fn touches_file(app: Application) -> Property {
-    property(
-        [
-            app.changed_paths().any_match(["file.txt"]).success(),
-        ],
-        "change touches file.txt",
-        Severity.Blocking,
-        [],
-    )
+write_constraints_roto <<'ROTO'
+fn touches_file(app: Application) -> Constraint {
+    primitive(app.changed_paths(["file.txt"]), any_match, "change touches file.txt")
 }
 
-fn never_pass(app: Application) -> Property {
-    let run = call(["false"], app.target());
-
-    property(
-        [
-            run.exit_code_is(0).success(),
-        ],
-        "command verifier that intentionally fails",
-        Severity.Blocking,
-        [],
-    )
+fn never_pass(app: Application) -> Constraint {
+    primitive(app.run(["false"]), exit_zero, "command verifier that intentionally fails")
 }
 ROTO
-lock_properties
+lock_constraints
 
 printf 'x\n' > file.txt
 scratch_out=$("$GRAFT_BIN" scratch write --base graft:empty file.txt --content $'x\n')

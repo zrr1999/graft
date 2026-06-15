@@ -38,13 +38,13 @@ impl<'a> Explainable for EvidenceStatus<'a> {
 
     fn summary(&self) -> &'static str {
         match self.0 {
-            EvidenceResult::Passed => "verifier observed the property holding for this candidate",
+            EvidenceResult::Passed => "verifier observed the constraint holding for this candidate",
             EvidenceResult::Failed { .. } => {
-                "verifier observed the property violated for this candidate"
+                "verifier observed the constraint violated for this candidate"
             }
             EvidenceResult::Unknown { .. } => "verifier could not decide; treat as not-yet-proven",
             EvidenceResult::Skipped { .. } => {
-                "verifier intentionally did not run for this property"
+                "verifier intentionally did not run for this constraint"
             }
         }
     }
@@ -54,7 +54,7 @@ impl<'a> Explainable for EvidenceStatus<'a> {
             EvidenceResult::Passed => &["admit", "promote"],
             EvidenceResult::Failed { .. } => &["validate", "drafts"],
             EvidenceResult::Unknown { .. } => &["validate", "valid-patch", "V003"],
-            EvidenceResult::Skipped { .. } => &["validate", "properties"],
+            EvidenceResult::Skipped { .. } => &["validate", "constraints"],
         }
     }
 }

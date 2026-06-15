@@ -6,7 +6,6 @@ members = [
   "crates/graft-core",
   "crates/graft-daemon",
   "crates/graft-explain",
-  "crates/graft-git",
   "crates/graft-policy",
   "crates/graft-promote",
   "crates/graft-repo",
@@ -21,7 +20,7 @@ members = [
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
-description = "Property-aware patch runtime for agent changes"
+description = "Constraint-aware patch runtime for agent changes"
 repository = "https://github.com/zrr1999/graft"
 license = "MIT"
 

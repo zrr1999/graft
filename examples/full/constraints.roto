@@ -1,0 +1,84 @@
+// Example full workspace policy using the three-layer Roto constraint model.
+//
+// Each top-level `fn name(app: Application) -> Constraint` is a named
+// constraint definition. Primitive leaves point to content-addressed Plans;
+// names and descriptions are labels, not identity.
+
+fn empty_change(app: Application) -> Constraint {
+    primitive(app.changed_paths(["**"]), no_match, "the change touches no paths")
+}
+
+fn only_touches_docs(app: Application) -> Constraint {
+    primitive(
+        app.changed_paths([
+            "README.md",
+            "docs/**",
+            "**/*.md",
+        ]),
+        all_match,
+        "patch only touches documentation files",
+    )
+}
+
+fn no_generated_artifacts(app: Application) -> Constraint {
+    primitive(
+        app.changed_paths([
+            "target/**",
+            "dist/**",
+            "build/**",
+            "*.tmp",
+            "coverage/**",
+            "**/*.profraw",
+            "**/*.profdata",
+        ]),
+        no_match,
+        "patch does not contain generated build artifacts",
+    )
+}
+
+fn cargo_fmt_clean(app: Application) -> Constraint {
+    primitive(
+        app.run(["cargo", "fmt", "--all", "--", "--check"]),
+        exit_zero,
+        "cargo fmt --all -- --check is clean on the target tree",
+    )
+}
+
+fn cargo_clippy_clean(app: Application) -> Constraint {
+    primitive(
+        app.run([
+            "cargo",
+            "clippy",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ]),
+        exit_zero,
+        "cargo clippy reports no warnings on the target tree",
+    )
+}
+
+fn cargo_tests_pass(app: Application) -> Constraint {
+    primitive(
+        app.run(["cargo", "test", "--all-targets"]),
+        exit_zero,
+        "cargo test --all-targets passes on the target tree",
+    )
+}
+
+fn cargo_doc_tests_pass(app: Application) -> Constraint {
+    primitive(
+        app.run(["cargo", "test", "--doc", "--all-features"]),
+        exit_zero,
+        "cargo test --doc --all-features passes on the target tree",
+    )
+}
+
+fn safe_patch(app: Application) -> Constraint {
+    all_of([
+        no_generated_artifacts(app),
+        cargo_fmt_clean(app),
+        cargo_tests_pass(app),
+    ])
+}

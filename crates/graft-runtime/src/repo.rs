@@ -417,8 +417,8 @@ mod tests {
         );
         let store = GraftStore::open(&workspace);
         store.init().unwrap();
-        fs::write(workspace.join("properties.roto"), "").unwrap();
-        crate::config::write_property_lock(&store, &BTreeMap::new()).unwrap();
+        fs::write(workspace.join("constraints.roto"), "").unwrap();
+        crate::config::write_constraint_lock(&store, &BTreeMap::new()).unwrap();
 
         run_repo_command(
             &workspace,
@@ -449,8 +449,8 @@ mod tests {
         init_source_repo(&source_b, "b\n");
         let store = GraftStore::open(&workspace);
         store.init().unwrap();
-        fs::write(workspace.join("properties.roto"), "").unwrap();
-        crate::config::write_property_lock(&store, &BTreeMap::new()).unwrap();
+        fs::write(workspace.join("constraints.roto"), "").unwrap();
+        crate::config::write_constraint_lock(&store, &BTreeMap::new()).unwrap();
         let source_a_url = source_a.to_string_lossy().to_string();
         let source_b_url = source_b.to_string_lossy().to_string();
 
@@ -558,7 +558,7 @@ mod tests {
 
         let store = GraftStore::open(&workspace);
         store.init().unwrap();
-        crate::config::write_property_lock(&store, &BTreeMap::new()).unwrap();
+        crate::config::write_constraint_lock(&store, &BTreeMap::new()).unwrap();
         let url = source.to_string_lossy().to_string();
         crate::config::write_repo_lock_entry(&store, "demo", &url, "main", &base_tree).unwrap();
 
@@ -590,7 +590,7 @@ mod tests {
         fs::create_dir_all(&workspace).unwrap();
         let store = GraftStore::open(&workspace);
         store.init().unwrap();
-        crate::config::write_property_lock(&store, &BTreeMap::new()).unwrap();
+        crate::config::write_constraint_lock(&store, &BTreeMap::new()).unwrap();
         crate::config::write_repo_lock_entry(
             &store,
             "demo",
@@ -622,7 +622,7 @@ mod tests {
         fs::create_dir_all(&workspace).unwrap();
         let store = GraftStore::open(&workspace);
         store.init().unwrap();
-        crate::config::write_property_lock(&store, &BTreeMap::new()).unwrap();
+        crate::config::write_constraint_lock(&store, &BTreeMap::new()).unwrap();
         crate::config::write_repo_lock_entry(
             &store,
             "demo",

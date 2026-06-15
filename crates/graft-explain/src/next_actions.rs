@@ -26,7 +26,7 @@ pub struct CandidateContext {
     pub unknown: usize,
     /// Number of evidence records with `EvidenceResult::Skipped`.
     pub skipped: usize,
-    /// Property primitives present in the candidate constraint. Surfaced in the
+    /// Constraint primitives present in the candidate constraint. Surfaced in the
     /// recommended `admit --require <name>` invocation when the only
     /// passing primitive is unambiguous.
     pub constraint_primitives: Vec<String>,
@@ -42,7 +42,7 @@ impl CandidateContext {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PatchContext {
     pub id: String,
-    /// Property primitives present in the admitted patch constraint.
+    /// Constraint primitives present in the admitted patch constraint.
     pub constraint_primitives: Vec<String>,
     /// True when at least one materialization relation exists (the patch has
     /// produced a real Git object).
@@ -63,7 +63,7 @@ pub fn next_actions(ctx: &CandidateContext) -> Vec<NextAction> {
                 "admit",
                 format!("graft patch admit {}", ctx.id),
                 NextActionKind::Recommended,
-                "no property evidence is required; Graft checks application core integrity at admission",
+                "no constraint evidence is required; Graft checks application core integrity at admission",
             ));
         } else {
             out.push(NextAction::new(
@@ -94,7 +94,7 @@ pub fn next_actions(ctx: &CandidateContext) -> Vec<NextAction> {
             "show.evidence",
             format!("graft patch show {} --evidence", ctx.id),
             NextActionKind::Optional,
-            "inspect every evidence record to see which property failed and why",
+            "inspect every evidence record to see which constraint failed and why",
         ));
         return out;
     }
@@ -117,7 +117,7 @@ pub fn next_actions(ctx: &CandidateContext) -> Vec<NextAction> {
     }
 
     // Stage 4: at least one passed evidence; admission is on the table.
-    let admit = if let Some(name) = single_decisive_property(ctx) {
+    let admit = if let Some(name) = single_decisive_constraint(ctx) {
         format!("graft patch admit {} --require {name}", ctx.id)
     } else {
         format!("graft patch admit {}", ctx.id)
@@ -131,16 +131,16 @@ pub fn next_actions(ctx: &CandidateContext) -> Vec<NextAction> {
     if ctx.unknown > 0 {
         out.push(NextAction::new(
             "validate-additional",
-            format!("graft patch validate {} --expect <Property>", ctx.id),
+            format!("graft patch validate {} --expect <Constraint>", ctx.id),
             NextActionKind::Optional,
-            "some properties are still unknown; add `--expect` to revalidate them",
+            "some constraints are still unknown; add `--expect` to revalidate them",
         ));
     } else {
         out.push(NextAction::new(
             "validate-additional",
-            format!("graft patch validate {} --expect <Property>", ctx.id),
+            format!("graft patch validate {} --expect <Constraint>", ctx.id),
             NextActionKind::Optional,
-            "tighten the candidate by validating an additional property",
+            "tighten the candidate by validating an additional constraint",
         ));
     }
     out
@@ -166,10 +166,10 @@ pub fn next_actions_patch(ctx: &PatchContext) -> Vec<NextAction> {
         ));
         if let Some(prop) = ctx.constraint_primitives.first() {
             out.push(NextAction::new(
-                "search.same-property",
-                format!("graft patch search --property {prop}"),
+                "search.same-constraint",
+                format!("graft patch search --constraint {prop}"),
                 NextActionKind::Optional,
-                "find sibling patches admitted with the same property",
+                "find sibling patches admitted with the same constraint",
             ));
         }
         return out;
@@ -196,14 +196,14 @@ pub fn next_actions_patch(ctx: &PatchContext) -> Vec<NextAction> {
     out.push(NextAction::new(
         "search.related",
         format!(
-            "graft patch search --property {}",
+            "graft patch search --constraint {}",
             ctx.constraint_primitives
                 .first()
                 .map(String::as_str)
                 .unwrap_or("<P>"),
         ),
         NextActionKind::Optional,
-        "find related patches admitted with the same property",
+        "find related patches admitted with the same constraint",
     ));
     out.push(NextAction::new(
         "lifecycle.complete",
@@ -214,11 +214,11 @@ pub fn next_actions_patch(ctx: &PatchContext) -> Vec<NextAction> {
     out
 }
 
-/// When a candidate's evidence shows exactly one decisively-passing property
+/// When a candidate's evidence shows exactly one decisively-passing constraint
 /// primitive (and no failures), surface it as the `--require` argument in the
 /// recommended `admit` command. This lets users run a tighter admit without
-/// having to type the property name from memory.
-fn single_decisive_property(ctx: &CandidateContext) -> Option<&str> {
+/// having to type the constraint name from memory.
+fn single_decisive_constraint(ctx: &CandidateContext) -> Option<&str> {
     if ctx.failed == 0 && ctx.passed == 1 && ctx.constraint_primitives.len() == 1 {
         ctx.constraint_primitives.first().map(|s| s.as_str())
     } else {
@@ -318,7 +318,7 @@ mod tests {
     }
 
     #[test]
-    fn admit_recommendation_drops_require_when_property_is_ambiguous() {
+    fn admit_recommendation_drops_require_when_constraint_is_ambiguous() {
         let ctx = CandidateContext {
             passed: 2,
             constraint_primitives: vec!["ReviewPolicy".into(), "TestsPass".into()],
@@ -341,8 +341,8 @@ mod tests {
         assert_eq!(actions[0].id, "materialize.dry-run");
         assert_eq!(actions[0].kind, NextActionKind::Recommended);
         assert!(
-            actions.iter().any(|a| a.id == "search.same-property"),
-            "should offer sibling search when at least one property exists"
+            actions.iter().any(|a| a.id == "search.same-constraint"),
+            "should offer sibling search when at least one constraint exists"
         );
     }
 

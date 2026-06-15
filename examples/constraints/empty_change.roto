@@ -1,0 +1,8 @@
+// Pattern: structural predicate over the changed path set.
+//
+// `app.changed_paths(patterns)` observes the change; `no_match` asserts no
+// changed path matches any of the supplied patterns.
+
+fn empty_change(app: Application) -> Constraint {
+    primitive(app.changed_paths(["**"]), no_match, "the change touches no paths")
+}

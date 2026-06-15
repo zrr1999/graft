@@ -60,4 +60,12 @@ hooks = [
     types = ["rust"],
     pass_filenames = false
   },
+  {
+    id = "lean-kernel",
+    name = "lean-kernel",
+    entry = "lean formal/kernel.lean",
+    language = "system",
+    files = '^formal/kernel\.lean$',
+    pass_filenames = false
+  },
 ]

@@ -1,7 +1,7 @@
 # Graft 设计 · 生命周期（§4–§5）
 
 > 本文件是 Graft 设计文档的一个模块，从 [`../design.md`](../design.md)（索引）拆出。
-> 完整形式化 kernel 见 [`../graft-kernel.lean`](../graft-kernel.lean)。
+> 完整形式化 kernel 见 [`formal/kernel.lean`](../../formal/kernel.lean)。
 
 ## 4. Lifecycle
 
@@ -14,18 +14,18 @@ scratch                         daemon-backed draft, not synced, not a candidate
   -> graft patch from-scratch <scratch>
 candidate                       store/private, local-only
   -> graft patch validate       produces evidence (store/derived)
-  -> graft patch admit          gates: core integrity + [admission].required_properties
+  -> graft patch admit          gates: core integrity + [admission].required
 patch                           store/public, synced only when workspace [sync] enabled
-  -> graft patch promote        gates: core integrity + promotion/target/CLI required_properties
+  -> graft patch promote        gates: core integrity + promotion/target/CLI required
 target output                   outside Graft's patch graph (git ref / local file)
 ```
 
 每道关的语义：
 
 - **scratch**：临时草稿读写/编辑/删除，无 candidate/patch 写入、无 cwd 捕获。第一次操作显式给 `--base`，后续操作显式给 `--from`；rename 用 delete+write 表达。CLI 与 pi-graft 是两个 client，但共享同一 daemon wire protocol。
-- **candidate-from-scratch**：把 scratch 中的变更落成可寻址 candidate，无外部副作用。空 change 允许存在；若 workspace 要显式标记或拒绝它，应声明 `empty_change` / `non_empty_change` property。
-- **admit**：candidate 升 patch，等于「我（本地）愿意把这件事公开给团队」。门槛是 application core integrity（`apply(action, base, proof) == target` 且 `replay(base, change.ops) == target`）加 `[admission].required_properties`。**这不是 review gate**——review 在 sync 之后由每个 clone 自己决定。
-- **promote**：patch 投影到下游 target（当前实现为配置的外部 Git repo/ref 或显式 `--to <branch>`），等于「它能 ship 给非 Graft 用户或工具」。门槛 `[promotion].required_properties`、`[promote_targets.<target>].required_properties` 与 `--require`。
+- **candidate-from-scratch**：把 scratch 中的变更落成可寻址 candidate，无外部副作用。空 change 允许存在；若 workspace 要显式标记或拒绝它，应声明 `empty_change` / `non_empty_change` constraint。
+- **admit**：candidate 升 patch，等于「我（本地）愿意把这件事公开给团队」。门槛是 application core integrity（`apply(action, base, proof) == target` 且 `replay(base, change.ops) == target`）加 `[admission].required`。**这不是 review gate**——review 在 sync 之后由每个 clone 自己决定。
+- **promote**：patch 投影到下游 target（当前实现为配置的外部 Git repo/ref 或显式 `--to <branch>`），等于「它能 ship 给非 Graft 用户或工具」。门槛 `[promotion].required`、`[promote_targets.<target>].required` 与 `--require`。
 
 admit ≠ review。这点在分布式协作中至关重要：远端 patch 进入本地 store 不代表本地必须采用，alias 是否指向它由本地决定。
 
@@ -35,7 +35,7 @@ admit ≠ review。这点在分布式协作中至关重要：远端 patch 进入
 graft scratch write  [--repo <repo-id>] (--base <base> | --from <scratch-id>) <path> --content <bytes>
 graft scratch edit   [--repo <repo-id>] (--base <base> | --from <scratch-id>) <path> --edits <json>
 graft scratch delete [--repo <repo-id>] (--base <base> | --from <scratch-id>) <path>
-graft patch from-scratch <scratch-id> [--expect <property>...] [--producer <label>] [--message <msg>]
+graft patch from-scratch <scratch-id> [--expect <constraint>...] [--producer <label>] [--message <msg>]
 ```
 
 行为：
@@ -46,7 +46,7 @@ graft patch from-scratch <scratch-id> [--expect <property>...] [--producer <labe
   - `base` 与 `from` 互斥且必须提供其一。
 2. scratch 命令只改 daemon scratch graph，返回新的 `scratch:<digest>` 与 changed paths；不写 candidate、patch、git ref 或 cwd 文件。
 3. `graft patch from-scratch` 读取指定 scratch，把 scratch op chain lower 成 canonical `Action`，构造 `ApplicabilityProof`，应用到 base 得到 target，并派生 endpoint `Change`。
-4. 空 change 允许存在；若 workspace 要显式标记或拒绝它，应声明 `empty_change` / `non_empty_change` property。`Action::Sequence([])` 仍按 [§2.4](./model.md) 的 canonicalization 规则保存。
+4. 空 change 允许存在；若 workspace 要显式标记或拒绝它，应声明 `empty_change` / `non_empty_change` constraint。`Action::Sequence([])` 仍按 [§2.4](./model.md) 的 canonicalization 规则保存。
 5. 写入：
   - `store/public/blob/`（新增内容）
   - `store/public/tree/`（target tree）
@@ -62,27 +62,23 @@ graft patch from-scratch <scratch-id> [--expect <property>...] [--producer <labe
 ### 4.2 graft patch validate: 跑 verifier 产 evidence
 
 ```bash
-graft patch validate <id> [--expect <property>...]
+graft patch validate <id> [--expect <constraint>...]
 ```
 
-`<id>` 可以是 `candidate:...`、`patch:...`，或 `application:...`。当前主路径要求显式 id；先用 scratch 命令得到 `scratch:<digest>`，再用 `graft patch from-scratch <scratch>` 得到 candidate。`change:...` 只是 endpoint view，不是 property subject；若需要验证，必须通过拥有该 change 的 application / candidate / patch。旧的 `graft validate` 顶层入口是隐藏兼容 alias。
+`<id>` 可以是 `candidate:...`、`patch:...`，或 `application:...`。当前主路径要求显式 id；先用 scratch 命令得到 `scratch:<digest>`，再用 `graft patch from-scratch <scratch>` 得到 candidate。`change:...` 只是 endpoint view，不是 constraint subject；若需要验证，必须通过拥有该 change 的 application / candidate / patch。旧的 `graft validate` 顶层入口是隐藏兼容 alias。
 
 #### 流程
 
 ```text
 1. 解析 <id> 拿到目标 application，并从 application 读取 action/base/proof/target/change。
-2. 解析 candidate/patch 已声明的 expected properties，并把重复给出的 `--expect <property>` 列表追加为当前 PropertyId（通过 `properties.roto` 当前顶层函数名映射）。
-3. 对每个 (Application, property)：
-   a. 解析 property 的 `requires` 依赖闭包并按拓扑序评估，结果 memoize。
-   b. 对需要执行的 property/check，物化输入 tree 到 `.graft/store/derived/worktrees/<tree-id>/`。
-   c. 计算 ValidationRunKey（property/check、runtime primitive、execution contract、relevant output spec）。
-   d. 若已有 canonical EvaluationRecord 且 reuse policy 允许，直接复用；否则在物化 tree 根目录作为 cwd 执行对应 run。
-   e. 默认执行契约：无 timeout、允许网络、允许 host 文件系统访问；validation 不读写用户 cwd，除非 property 命令本身通过 host 文件系统访问它。
-   f. 收集并规范化 result / relevant output / declared output digests，构造 canonical EvaluationRecord。
-   g. hash 得 evidence:E；检查 store/derived/evidence/E.json：
-      存在 -> noop（content-addressed，重复跑得同 ID）。
-      不存在 -> 写入 store/derived/evidence/E.json。
-   h. append E 到 evidence_refs[<id>].evidence（如果不在）。
+2. 解析 candidate/patch 自带的 `constraint`，并把重复给出的 `--expect <constraint>` 名称按当前 `constraints.roto` / `graft.lock` 解析为额外 `Constraint`。
+3. 遍历 required `Constraint` 的 primitive leaves；每个 primitive 是一个 `PlanId`。
+   a. 读取 `Plan { observation, assertion }`。
+   b. 对需要执行的 observation，物化输入 tree 到 `.graft/store/derived/worktrees/<tree-id>/`；同一 `RunPlan` 可按 `(argv, materialized tree id)` memoize。
+   c. 运行或复用 observation，随后对 canonical result 执行 assertion。
+   d. 构造 `EvidenceRecord { subject, plan, verifier, result, ... }`。
+   e. 检查 store/derived/evidence/E.json：存在 -> noop；不存在 -> 写入。
+   f. append E 到 evidence_refs[<id>].evidence（如果不在）。
 4. 保留 derived worktree cache；store/derived 可由 gc 安全清理。
 5. 渲染结果；若 force rerun 与已有 evidence_refs 不匹配，报告本地复现差异。
 ```
@@ -102,17 +98,17 @@ patch body 永远不变；evidence_refs 是 append-only。post-admit 追加 evid
 ### 4.3 graft patch admit: candidate → patch
 
 ```bash
-graft patch admit <candidate-id> [--require <property>...]
+graft patch admit <candidate-id> [--require <constraint>...]
 ```
 
 ```text
 1. 解析 candidate:C。
 2. 检查 application core integrity：`apply(action, base, proof) == target` 且 `replay(base, change.ops) == target`，失败 -> `[E_CHANGE_INTEGRITY]`。
-3. required = `[admission].required_properties` ⊓ candidate.constraint ⊓ repeatable `--require <property>` additions。
+3. required = `[admission].required` ⊓ candidate.constraint ⊓ repeatable `--require <constraint>` additions。
 4. 对 required constraint 递归执行 `satisfy`（§2.6）；每个 primitive 查询 evidence_refs[C]:
    ∃ E ∈ refs[C].evidence:
-     E.application == C.application
-     AND E.property == primitive.id
+     E.subject == C
+     AND E.plan == primitive.plan
      AND E.result == passed
    失败任何一条 -> [E_CONSTRAINT_UNMET] / [E_ADMISSION_UNMET]。
 5. 通过：
@@ -137,27 +133,27 @@ admit 保持纯粹：只接受已有 candidate，不捕获 cwd，不 materialize
   required Constraint 的某 primitive 找不到 passed evidence。
   原因：本地 evidence body 缺失（refs 有但 store/derived 中没有重建）
         或本地从未跑过该 verifier。
-  提示：graft patch validate <candidate> --expect <property>
+  提示：graft patch validate <candidate> --expect <constraint>
 
-[E_PROPERTY_DRIFT]
-  required primitive 的 PropertyId 与 candidate.constraint 中对应 primitive 不一致。
-  原因：properties.roto 中对应顶层 property 函数在 candidate 创建后被修改或改名。
-  解决：要么用现行 PropertyId 跑新 evidence，
-        要么 revert properties.roto 改动并刷新 graft.lock。
+[E_CONSTRAINT_DRIFT]
+  required primitive 的 PlanId 与 candidate.constraint 中对应 primitive 不一致。
+  原因：constraints.roto 中对应顶层 constraint 函数在 candidate 创建后被修改或改名。
+  解决：要么用现行 PlanId 跑新 evidence，
+        要么 revert constraints.roto 改动并刷新 graft.lock。
 ```
 
 ### 4.4 graft patch promote: patch → target projection
 
 ```bash
-graft patch promote <patch-id> --to <target-or-branch> [--require <property>...]
+graft patch promote <patch-id> --to <target-or-branch> [--require <constraint>...]
 ```
 
 #### 流程
 
 ```text
 1. 解析 patch:P；检查 application core integrity。
-2. 若 --to 命中 [promote_targets.<target>]，再解析该 target 的 path/branch/required_properties。
-3. required = `--require <property>` 给出 ∪ `[promotion].required_properties` ∪ `[promote_targets.<target>].required_properties`。
+2. 若 --to 命中 [promote_targets.<target>]，再解析该 target 的 path/branch/required。
+3. required = `--require <constraint>` 给出 ∪ `[promotion].required` ∪ `[promote_targets.<target>].required`。
 4. 对 required 跑 admission 算法（与 admit 同；查 evidence_refs[P]）。
    失败 -> [E_PROMOTION_UNMET]
 5. 构造目标 Git commit/ref；默认 dry-run，仅 --yes 写外部 Git repo/ref。
@@ -181,7 +177,7 @@ Invariant 4.4.1  (PromotionIsTheOnlyTargetProjection)
 #### Failure modes
 
 ```text
-[E_PROMOTION_UNMET]            required_properties 不满足。
+[E_PROMOTION_UNMET]            required 不满足。
 [E_PROMOTION_NOT_FF]           remote-push target 不能 fast-forward；用户决定 force / abort。
 [E_PROMOTION_DIRTY_TARGET]     local-git-commit target dirty；先清理或提交本地改动。
 [E_PROMOTION_TARGET_UNKNOWN]   --to <target> 在 graft.toml 的 [promote_targets] 中找不到，且不能作为普通 branch 处理。
@@ -196,6 +192,28 @@ graft patch revert <patch:a>                     # 输出新 candidate
 ```
 
 语义在 op list 上工作（[§2.4](./model.md)）。每条命令产出新 candidate，并在 candidate provenance 中记录 pending relation；candidate admit 成 patch 后再写 public relation（[§2.8](./admission.md)）。
+
+#### compose-admission 的 stable evidence reuse
+
+`compose a b` 生成的 candidate 是新 `Application` / 新 id。默认仍需为 required primitive 查询或重跑 evidence；但对 [§2.5](./property.md) 定义的可复用 primitive，可把父 patch 的已通过 evidence 作为复合体 admission 的派生依据。
+
+复合 candidate 自动携带的可复用约束是：
+
+```text
+all_of(
+  primitive p
+  where p is required by both parent patches
+    and (p is target-only or p is explicitly stable_under_composition)
+)
+```
+
+其中：
+
+- **target-only** primitive 只观察 `app.target()` 派生的 tree/run/file；由 `targetCompose` 知道复合体 target = 右侧父 patch target，因此可复用右侧父 patch 的 evidence。
+- **explicit stable** primitive 是后续实现可加入的 constraint-source 声明；只有两个父 patch 都有 passing evidence 时，才能用 kernel 的 `certifyComposedShared` 推导复合体满足该 primitive。当前实现尚不自动执行这类 stable reuse。
+- `extra` 约束不自动传播：若 parent constraints 是 `p ⊓ extra_a` 与 `p ⊓ extra_b`，只自动携带共享且可复用的 `p`；`extra_a` / `extra_b` 对复合体仍需 fresh evidence 或显式要求。
+
+`stable` 不进入 `PlanId` 哈希，是 admission-time policy。验证复合 patch 时，Graft 通过 public Compose relation、父 evidence 与当前 constraint policy 重新推导可复用 primitive；若 constraint drift、stable 被撤回、父 evidence 缺失/不可复现，重推 **fail loud**，按 [§10.2](./reference.md) 的 `[E_CONSTRAINT_DRIFT]` 处理，并提示对复合体运行 `graft patch validate <candidate-or-patch> --expect <constraint>` 补 fresh evidence。
 
 **v1 不建模 conflict**：上述命令在不可解时**直接 fail**，不产出 conflict 对象。错误信息提供具体冲突位置：
 
@@ -231,7 +249,7 @@ cwd 不是 view。cwd 只用于命令路由（[§12](./workspace.md)）。`State
 ```text
 <workspace-root>/.worktrees/<state-slug>/
   graft.toml
-  properties.roto
+  constraints.roto
   worktrees/A/
   worktrees/B/
 ```
@@ -304,7 +322,7 @@ graft run <state-ref> [--cwd <path>] -- <cmd> [args...]
 
 `<state-ref>` 和 materialize 使用同一套解析逻辑。run 在 `$GRAFT_HOME/run/tmp/<run-id>/` 下物化完整 state root；默认 cwd 是 state root，`--cwd` 必须是 state root 内的相对路径。命令允许写临时目录，但写入在命令结束后丢弃；run 不形成 scratch/candidate/evidence/promotion。`--json` 返回 resolved state、cwd、argv、exit code、stdout、stderr。
 
-`call([...], app.target())` 与 `graft run <state-ref> -- ...` 使用同一个 state materialization + command execution model；区别是 validate 会为 property 生成 evidence，run 只返回一次性命令结果。
+`call([...], app.target())` 与 `graft run <state-ref> -- ...` 使用同一个 state materialization + command execution model；区别是 validate 会为 constraint 生成 evidence，run 只返回一次性命令结果。
 
 #### 辅助命令
 

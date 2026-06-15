@@ -1,16 +1,16 @@
 schema = 1
 
-# Bare property names enforced before a candidate can become an admitted patch.
-# Names must resolve to `fn <name>(app: Application) -> Property` definitions
-# in `properties.roto`. An empty table means admission relies only on
+# Bare constraint names enforced before a candidate can become an admitted patch.
+# Names must resolve to `fn <name>(app: Application) -> Constraint` definitions
+# in `constraints.roto`. An empty table means admission relies only on
 # application core integrity (`apply(action, base, proof) == target` and
 # `replay(base, change.ops) == target`).
-[admission.required_properties]
+[admission.required]
 
-# Bare property names enforced before an admitted patch can be projected onto a
+# Bare constraint names enforced before an admitted patch can be projected onto a
 # promotion target (e.g. a Git ref or local file). An empty table means any
 # admitted patch can be promoted.
-[promotion.required_properties]
+[promotion.required]
 
 # Whether this workspace participates in remote sync. Enabled by default;
 # set this to false for machine-local-only workspaces.

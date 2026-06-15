@@ -1,15 +1,12 @@
-use graft_core::{ApplicationRef, Constraint, EvidenceId, EvidenceRecord, PropertyRef};
-use graft_explain::diagnostics::{
-    a001_missing_required_evidence_at, a002_failed_required_evidence_at,
-};
+use graft_core::{ApplicationRef, Constraint, EvidenceId, EvidenceRecord, PlanId};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConstraintFailure {
     Missing {
-        primitive: PropertyRef,
+        primitive: PlanId,
     },
     NotPassed {
-        primitive: PropertyRef,
+        primitive: PlanId,
         evidence: EvidenceId,
     },
     BothBranch {
@@ -26,7 +23,7 @@ impl ConstraintFailure {
     pub fn first_primitive_name(&self) -> Option<&str> {
         match self {
             Self::Missing { primitive } | Self::NotPassed { primitive, .. } => {
-                Some(&primitive.name)
+                Some(primitive.as_str())
             }
             Self::BothBranch { inner, .. } => inner.first_primitive_name(),
             Self::EitherExhausted { branches } => {
@@ -45,7 +42,7 @@ impl ConstraintFailure {
     fn push_path_segments(&self, segments: &mut Vec<String>) {
         match self {
             Self::Missing { primitive } | Self::NotPassed { primitive, .. } => {
-                segments.push(format!("primitive {}", primitive.name));
+                segments.push(format!("primitive {}", primitive));
             }
             Self::BothBranch {
                 branch_index,
@@ -65,11 +62,15 @@ impl ConstraintFailure {
 
 #[derive(Debug, thiserror::Error)]
 pub enum PolicyError {
-    #[error("{}", a001_missing_required_evidence_at(property, path).format_reason())]
-    MissingEvidence { property: String, path: String },
-    #[error("{}", a002_failed_required_evidence_at(property, evidence, path).format_reason())]
+    #[error(
+        "[E_CONSTRAINT_UNMET] missing required evidence for `{constraint}` @ Constraint failed at: {path}"
+    )]
+    MissingEvidence { constraint: String, path: String },
+    #[error(
+        "[E_CONSTRAINT_UNMET] evidence `{evidence}` for `{constraint}` did not pass @ Constraint failed at: {path}"
+    )]
     EvidenceNotPassed {
-        property: String,
+        constraint: String,
         evidence: String,
         path: String,
     },
@@ -116,31 +117,31 @@ pub fn satisfies_subject(
 fn policy_error_from_failure(failure: ConstraintFailure) -> PolicyError {
     match failure {
         ConstraintFailure::Missing { primitive } => PolicyError::MissingEvidence {
-            property: primitive.name.clone(),
-            path: format!("primitive {}", primitive.name),
+            constraint: primitive.to_string(),
+            path: format!("primitive {}", primitive),
         },
         ConstraintFailure::NotPassed {
             primitive,
             evidence,
         } => PolicyError::EvidenceNotPassed {
-            property: primitive.name.clone(),
+            constraint: primitive.to_string(),
             evidence: evidence.to_string(),
-            path: format!("primitive {}", primitive.name),
+            path: format!("primitive {}", primitive),
         },
         ConstraintFailure::BothBranch {
             branch_index,
             inner,
         } => match policy_error_from_failure(*inner) {
-            PolicyError::MissingEvidence { property, path } => PolicyError::MissingEvidence {
-                property,
+            PolicyError::MissingEvidence { constraint, path } => PolicyError::MissingEvidence {
+                constraint,
                 path: format!("all_of/[{branch_index}]/{path}"),
             },
             PolicyError::EvidenceNotPassed {
-                property,
+                constraint,
                 evidence,
                 path,
             } => PolicyError::EvidenceNotPassed {
-                property,
+                constraint,
                 evidence,
                 path: format!("all_of/[{branch_index}]/{path}"),
             },
@@ -176,7 +177,7 @@ fn evaluate(
     match constraint {
         Constraint::Top => Ok(()),
         Constraint::Bottom => Err(ConstraintFailure::BottomReached),
-        Constraint::Primitive { property } => evaluate_primitive(subject, property, evidence),
+        Constraint::Primitive { plan } => evaluate_primitive(subject, plan, evidence),
         Constraint::Both { left, right } => {
             evaluate(subject, left, evidence).map_err(|inner| ConstraintFailure::BothBranch {
                 branch_index: 0,
@@ -205,12 +206,12 @@ fn evaluate(
 
 fn evaluate_primitive(
     subject: &str,
-    primitive: &PropertyRef,
+    primitive: &PlanId,
     evidence: &[EvidenceRecord],
 ) -> std::result::Result<(), ConstraintFailure> {
     let mut matching = evidence
         .iter()
-        .filter(|record| record.subject == subject && record.property == primitive.id);
+        .filter(|record| record.subject == subject && record.plan == *primitive);
     let Some(first) = matching.next() else {
         return Err(ConstraintFailure::Missing {
             primitive: primitive.clone(),
@@ -243,14 +244,14 @@ impl ApplicationSubject for ApplicationRef {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use graft_core::{ApplicationId, PropertyId, PropertyRef};
+    use graft_core::{ApplicationId, PlanId};
 
-    fn property(name: &str) -> PropertyRef {
-        PropertyRef::new(PropertyId::new(format!("property:{name}")), name)
+    fn plan(name: &str) -> PlanId {
+        PlanId::new(format!("plan:{name}"))
     }
 
     fn primitive(name: &str) -> Constraint {
-        Constraint::primitive(property(name))
+        Constraint::primitive(plan(name))
     }
 
     fn application() -> ApplicationRef {
@@ -258,15 +259,13 @@ mod tests {
     }
 
     fn passed(name: &str) -> EvidenceRecord {
-        let property = property(name);
-        EvidenceRecord::passed("application:demo", property.id.clone(), "test-verifier").unwrap()
+        EvidenceRecord::passed("application:demo", plan(name), "test-verifier").unwrap()
     }
 
     fn failed(name: &str) -> EvidenceRecord {
-        let property = property(name);
         EvidenceRecord::failed(
             "application:demo",
-            property.id.clone(),
+            plan(name),
             "test-verifier",
             "test failed",
         )
@@ -305,9 +304,8 @@ mod tests {
 
     #[test]
     fn primitive_requires_matching_application_subject() {
-        let property = property("TestsPass");
         let evidence = vec![
-            EvidenceRecord::passed("candidate:demo", property.id.clone(), "test-verifier").unwrap(),
+            EvidenceRecord::passed("candidate:demo", plan("TestsPass"), "test-verifier").unwrap(),
         ];
 
         let err = satisfies(&application(), &primitive("TestsPass"), &evidence).unwrap_err();
@@ -322,9 +320,9 @@ mod tests {
         let rendered = err.to_string();
 
         assert!(matches!(err, PolicyError::MissingEvidence { .. }));
-        assert!(rendered.starts_with("[A001]"), "{rendered}");
+        assert!(rendered.starts_with("[E_CONSTRAINT_UNMET]"), "{rendered}");
         assert!(
-            rendered.contains("Constraint failed at: all_of/[0]/primitive TestsPass"),
+            rendered.contains("Constraint failed at: all_of/[0]/primitive plan:TestsPass"),
             "{rendered}"
         );
     }
@@ -339,10 +337,10 @@ mod tests {
         let rendered = err.to_string();
 
         assert!(matches!(err, PolicyError::EvidenceNotPassed { .. }));
-        assert!(rendered.starts_with("[A002]"), "{rendered}");
+        assert!(rendered.starts_with("[E_CONSTRAINT_UNMET]"), "{rendered}");
         assert!(rendered.contains(&evidence_id), "{rendered}");
         assert!(
-            rendered.contains("Constraint failed at: all_of/[1]/primitive FormatPass"),
+            rendered.contains("Constraint failed at: all_of/[1]/primitive plan:FormatPass"),
             "{rendered}"
         );
     }

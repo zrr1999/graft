@@ -9,5 +9,4 @@ license.workspace = true
 
 [dependencies]
 graft-core = { path = "../graft-core" }
-graft-explain = { path = "../graft-explain" }
 thiserror.workspace = true

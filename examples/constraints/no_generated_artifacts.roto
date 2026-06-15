@@ -1,0 +1,20 @@
+// Pattern: structural denylist over the changed path set.
+//
+// `no_match` reads as "no changed path matches any of these patterns" — i.e.
+// the change does not include build outputs or coverage artifacts.
+
+fn no_generated_artifacts(app: Application) -> Constraint {
+    primitive(
+        app.changed_paths([
+            "target/**",
+            "dist/**",
+            "build/**",
+            "*.tmp",
+            "coverage/**",
+            "**/*.profraw",
+            "**/*.profdata",
+        ]),
+        no_match,
+        "patch does not contain generated build artifacts",
+    )
+}

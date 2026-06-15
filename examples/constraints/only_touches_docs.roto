@@ -1,0 +1,15 @@
+// Pattern: structural allowlist over the changed path set.
+//
+// `all_match` asserts every changed path matches at least one allowed pattern.
+
+fn only_touches_docs(app: Application) -> Constraint {
+    primitive(
+        app.changed_paths([
+            "README.md",
+            "docs/**",
+            "**/*.md",
+        ]),
+        all_match,
+        "patch only touches documentation files",
+    )
+}

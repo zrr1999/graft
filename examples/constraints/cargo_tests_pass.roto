@@ -1,0 +1,11 @@
+// Pattern: command oracle on `app.target()`.
+//
+// `app.run(argv)` constructs a deferred Run node anchored at the target tree.
+
+fn cargo_tests_pass(app: Application) -> Constraint {
+    primitive(
+        app.run(["cargo", "test", "--all-targets"]),
+        exit_zero,
+        "cargo test --all-targets passes on the target tree",
+    )
+}

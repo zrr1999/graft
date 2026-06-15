@@ -43,7 +43,7 @@ done
 # Hidden compatibility aliases still parse for existing automation, but the
 # canonical docs/help should prefer the grouped forms checked below.
 for sub in init clone candidate candidates show validate admit status diff discard incoming search compose migrate \
-           revert materialize promote property registry cache verify-pending evidence gc; do
+           revert materialize promote constraint registry cache verify-pending evidence gc; do
   check_help "$sub"
 done
 
@@ -52,7 +52,7 @@ for nest in \
   "workspace init" "workspace status" "workspace attach" "workspace detach" "workspace ps" "workspace doctor" "workspace gc" \
   "patch list" "patch from-scratch" "patch show" "patch validate" "patch admit" "patch incoming" "patch search" \
   "patch diff" "patch compose" "patch migrate" "patch revert" "patch materialize" "patch promote" \
-  "property lock" "property check" "property list" "property show" \
+  "constraint lock" "constraint check" "constraint list" "constraint show" \
   "repo add" "repo list" "repo sync" "repo lock" "repo update" \
   "scratch status" "scratch read" "scratch write" "scratch edit" "scratch delete" "scratch rm" \
   "scratch capture" "scratch diff" "scratch drop" "scratch pin" "scratch unpin" \
@@ -62,7 +62,7 @@ done
 
 top_help=$("$GRAFT" --help 2>&1) || report "graft --help" "exited non-zero"
 for hidden_top in init clone candidate candidates show validate admit status diff discard incoming search compose migrate \
-                  revert materialize promote property registry cache verify-pending evidence gc create learn; do
+                  revert materialize promote constraint registry cache verify-pending evidence gc create learn; do
   if grep -qE "^[[:space:]]+${hidden_top}[[:space:]]" <<<"$top_help"; then
     report "graft --help" "hidden/removed top-level command must not be user-facing: $hidden_top"
   fi
@@ -105,7 +105,7 @@ for hidden_materialize_flag in '--as-commit' '--ref'; do
   fi
 done
 
-# Flag presence check: curated from README.md / docs/design.md command references.
+# Flag presence check: curated from README.md / docs/design/reference.md command references.
 check_flag() {
   local sub="$1"
   local flag="$2"
@@ -143,15 +143,15 @@ check_flag "patch from-scratch" "--producer"
 check_flag "patch from-scratch" "--message"
 check_flag "patch list" "--candidates"
 check_flag "patch list" "--all"
-check_flag "patch list" "--property"
+check_flag "patch list" "--constraint"
 check_flag "patch list" "--producer"
 check_flag "patch show" "--evidence"
 check_flag "patch show" "--change"
 check_flag "patch validate" "--expect"
 check_flag "patch admit" "--require"
 check_help_contains "patch admit" "one-shot admission requirement"
-check_help_contains "patch admit" "append to [admission.required_properties]"
-check_flag "patch search" "--property"
+check_help_contains "patch admit" "append to [admission.required]"
+check_flag "patch search" "--constraint"
 check_flag "patch search" "--base"
 check_flag "patch search" "--producer"
 check_flag "patch search" "--has-evidence"
@@ -193,7 +193,7 @@ check_flag "scratch delete" "--repo"
 check_flag "scratch capture" "--base"
 check_flag "scratch capture" "--repo"
 check_flag "scratch capture" "--dry-run"
-check_flag "cache search" "--property"
+check_flag "cache search" "--constraint"
 check_flag "cache search" "--failed"
 
 if [[ $fail -gt 0 ]]; then
@@ -203,4 +203,4 @@ if [[ $fail -gt 0 ]]; then
 fi
 
 echo
-echo "OK: README/docs/design.md CLI references match visible command groups and hidden compatibility expectations"
+echo "OK: README/docs/design/reference.md CLI references match visible command groups and hidden compatibility expectations"

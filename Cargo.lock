@@ -1595,21 +1595,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "graft-git"
-version = "0.1.0"
-dependencies = [
- "graft-core",
- "graft-promote",
- "graft-repo",
- "thiserror",
-]
-
-[[package]]
 name = "graft-policy"
 version = "0.1.0"
 dependencies = [
  "graft-core",
- "graft-explain",
  "thiserror",
 ]
 

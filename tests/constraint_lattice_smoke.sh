@@ -18,41 +18,20 @@ trap cleanup_workspace EXIT
 cd "$WORKDIR"
 "$GRAFT" init >/dev/null
 
-write_properties_roto <<'ROTO'
-fn b(app: Application) -> Property {
-    property(
-        [
-            app.changed_paths().any_match(["a.txt"]).success(),
-        ],
-        "admission branch b is satisfied by the smoke change",
-        Severity.Blocking,
-        [],
-    )
+write_constraints_roto <<'ROTO'
+fn b(app: Application) -> Constraint {
+    primitive(app.changed_paths(["a.txt"]), any_match, "admission branch b is satisfied by the smoke change")
 }
 
-fn x(app: Application) -> Property {
-    property(
-        [
-            app.changed_paths().any_match(["a.txt"]).success(),
-        ],
-        "promotion branch x is satisfied by the smoke change",
-        Severity.Blocking,
-        [],
-    )
+fn x(app: Application) -> Constraint {
+    primitive(app.changed_paths(["a.txt"]), any_match, "promotion branch x is satisfied by the smoke change")
 }
 
-fn y(app: Application) -> Property {
-    property(
-        [
-            app.changed_paths().any_match(["never-y.txt"]).success(),
-        ],
-        "promotion branch y remains unsatisfied in this smoke",
-        Severity.Blocking,
-        [],
-    )
+fn y(app: Application) -> Constraint {
+    primitive(app.changed_paths(["never-y.txt"]), any_match, "promotion branch y remains unsatisfied in this smoke")
 }
 ROTO
-lock_properties
+lock_constraints
 
 scratch_out=$("$GRAFT" scratch write --base graft:empty a.txt --content $'a\n')
 scratch=$(last_graft_id scratch "$scratch_out")
@@ -98,7 +77,7 @@ cat >> graft.toml <<TOML
 [promote_targets.out]
 path = "$TARGET"
 branch = "constraint-out"
-required_properties = { any_of = ["x", "y"] }
+required = { any_of = ["x", "y"] }
 TOML
 
 promote_out=$("$GRAFT" patch promote "$patch" --to out --yes)
