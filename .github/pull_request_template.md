@@ -1,11 +1,11 @@
-## Summary
+## 摘要
 
-Describe the change in 2-5 bullets.
+请用 2–5 条要点说明本次变更。
 
-## Validation
+## 验证
 
-List the commands, checks, or CI evidence that validate this PR.
+请列出验证本 PR 的命令、检查结果或 CI 证据。
 
-## Notes
+## 备注
 
-Add any context that helps reviewers focus on the important details.
+请补充有助于评审者聚焦重点的上下文。

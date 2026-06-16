@@ -139,7 +139,7 @@ pub(crate) fn next_actions_for_patch(
 ) -> Vec<NextAction> {
     let ctx = graft_explain::next_actions::PatchContext {
         id: patch.id.to_string(),
-        constraint_primitives: constraint_primitives(&patch.constraint)
+        constraint_labels: constraint_primitives(&patch.constraint)
             .iter()
             .map(plan_label)
             .collect(),
@@ -160,7 +160,7 @@ pub(crate) fn next_actions_for_candidate(
         failed: counts.failed,
         unknown: counts.unknown,
         skipped: counts.skipped,
-        constraint_primitives: constraint_primitives(&candidate.constraint)
+        constraint_labels: constraint_primitives(&candidate.constraint)
             .iter()
             .map(plan_label)
             .collect(),

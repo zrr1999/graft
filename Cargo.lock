@@ -1648,10 +1648,8 @@ name = "graft-scratch"
 version = "0.1.0"
 dependencies = [
  "blake3",
- "graft-client",
  "graft-core",
  "graft-store",
- "serde_json",
  "thiserror",
 ]
 

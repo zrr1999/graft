@@ -1,16 +1,17 @@
 pub mod cli;
+mod scratch_wire;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use graft_client::{WireRequest, WireResponse, parse_frame};
-use graft_core::{PlanId, ScratchId};
-use graft_scratch::{ScratchEngine, wire};
+use graft_core::{Constraint, ScratchId};
+use graft_scratch::ScratchEngine;
 use graft_store::{GraftStore, RegistryStore, normalize_workspace_path};
 use serde_json::{Value, json};
 
-pub type Result<T> = graft_client::WireResult<T>;
+pub(crate) type Result<T> = graft_client::WireResult<T>;
 type HandlerResult<T> = std::result::Result<T, Box<WireResponse>>;
 type OpHandler = fn(&ScratchEngine, String, &Value) -> (WireResponse, bool);
 
@@ -87,18 +88,18 @@ const SCRATCH_HANDLE_FIELDS: &[ParamField] = &[required("scratch")];
 const SCRATCH_UNPIN_FIELDS: &[ParamField] = &[required("lease")];
 
 #[derive(Debug)]
-pub struct DaemonState {
+pub(crate) struct DaemonState {
     default_workspace_root: PathBuf,
     registry: RegistryStore,
     engines: Mutex<HashMap<PathBuf, Arc<ScratchEngine>>>,
 }
 
 impl DaemonState {
-    pub fn new(default_store: GraftStore) -> Self {
+    pub(crate) fn new(default_store: GraftStore) -> Self {
         Self::new_with_registry(default_store, RegistryStore::from_env())
     }
 
-    pub fn new_with_registry(default_store: GraftStore, registry: RegistryStore) -> Self {
+    pub(crate) fn new_with_registry(default_store: GraftStore, registry: RegistryStore) -> Self {
         let default_workspace_root = normalize_workspace_path(default_store.paths().workspace());
         let default_engine = Arc::new(ScratchEngine::new(GraftStore::open(
             &default_workspace_root,
@@ -186,12 +187,15 @@ impl DaemonState {
     }
 }
 
-pub fn handle_frame(state: &DaemonState, line: &str) -> Result<(WireResponse, bool)> {
+pub(crate) fn handle_frame(state: &DaemonState, line: &str) -> Result<(WireResponse, bool)> {
     let request = parse_frame(line)?;
     Ok(handle_routed_request(state, request))
 }
 
-pub fn handle_routed_request(state: &DaemonState, request: WireRequest) -> (WireResponse, bool) {
+pub(crate) fn handle_routed_request(
+    state: &DaemonState,
+    request: WireRequest,
+) -> (WireResponse, bool) {
     let Some(spec) = op_spec(request.op.as_str()) else {
         let WireRequest { id, op, .. } = request;
         return (unknown_op_response(id, op.as_str()), false);
@@ -267,42 +271,42 @@ const OP_SPECS: &[OpSpec] = &[
         scope: OpScope::Routed,
         routing_fields: ROUTING_FIELDS,
         fields: SCRATCH_OPEN_FIELDS,
-        handler: wire::scratch_open_response,
+        handler: scratch_wire::scratch_open_response,
     },
     OpSpec {
         op: "scratch_read",
         scope: OpScope::Routed,
         routing_fields: ROUTING_FIELDS,
         fields: SCRATCH_READ_FIELDS,
-        handler: wire::scratch_read_response,
+        handler: scratch_wire::scratch_read_response,
     },
     OpSpec {
         op: "scratch_write",
         scope: OpScope::Routed,
         routing_fields: ROUTING_FIELDS,
         fields: SCRATCH_WRITE_FIELDS,
-        handler: wire::scratch_write_response,
+        handler: scratch_wire::scratch_write_response,
     },
     OpSpec {
         op: "scratch_delete",
         scope: OpScope::Routed,
         routing_fields: ROUTING_FIELDS,
         fields: SCRATCH_DELETE_FIELDS,
-        handler: wire::scratch_delete_response,
+        handler: scratch_wire::scratch_delete_response,
     },
     OpSpec {
         op: "scratch_edit",
         scope: OpScope::Routed,
         routing_fields: ROUTING_FIELDS,
         fields: SCRATCH_EDIT_FIELDS,
-        handler: wire::scratch_edit_response,
+        handler: scratch_wire::scratch_edit_response,
     },
     OpSpec {
         op: "scratch_capture",
         scope: OpScope::Routed,
         routing_fields: ROUTING_FIELDS,
         fields: SCRATCH_CAPTURE_FIELDS,
-        handler: wire::scratch_capture_response,
+        handler: scratch_wire::scratch_capture_response,
     },
     OpSpec {
         op: "candidate_from_scratch",
@@ -312,39 +316,32 @@ const OP_SPECS: &[OpSpec] = &[
         handler: candidate_from_scratch_wire_response,
     },
     OpSpec {
-        op: "scratch_promote",
-        scope: OpScope::Routed,
-        routing_fields: ROUTING_FIELDS,
-        fields: CANDIDATE_FROM_SCRATCH_FIELDS,
-        handler: scratch_promote_response,
-    },
-    OpSpec {
         op: "scratch_diff",
         scope: OpScope::Routed,
         routing_fields: ROUTING_FIELDS,
         fields: SCRATCH_DIFF_FIELDS,
-        handler: wire::scratch_diff_response,
+        handler: scratch_wire::scratch_diff_response,
     },
     OpSpec {
         op: "scratch_drop",
         scope: OpScope::Routed,
         routing_fields: ROUTING_FIELDS,
         fields: SCRATCH_HANDLE_FIELDS,
-        handler: wire::scratch_drop_response,
+        handler: scratch_wire::scratch_drop_response,
     },
     OpSpec {
         op: "scratch_pin",
         scope: OpScope::Routed,
         routing_fields: ROUTING_FIELDS,
         fields: SCRATCH_HANDLE_FIELDS,
-        handler: wire::scratch_pin_response,
+        handler: scratch_wire::scratch_pin_response,
     },
     OpSpec {
         op: "scratch_unpin",
         scope: OpScope::Routed,
         routing_fields: ROUTING_FIELDS,
         fields: SCRATCH_UNPIN_FIELDS,
-        handler: wire::scratch_unpin_response,
+        handler: scratch_wire::scratch_unpin_response,
     },
 ];
 
@@ -471,58 +468,30 @@ fn candidate_from_scratch_wire_response(
     id: String,
     params: &Value,
 ) -> (WireResponse, bool) {
-    candidate_from_scratch_response(engine, id, params, None)
-}
-
-fn scratch_promote_response(
-    engine: &ScratchEngine,
-    id: String,
-    params: &Value,
-) -> (WireResponse, bool) {
-    candidate_from_scratch_response(
-        engine,
-        id,
-        params,
-        Some("scratch_promote is deprecated; use candidate_from_scratch"),
-    )
-}
-
-fn candidate_from_scratch_response(
-    engine: &ScratchEngine,
-    id: String,
-    params: &Value,
-    deprecated: Option<&str>,
-) -> (WireResponse, bool) {
     let scratch = required_str(params, "scratch").map(ScratchId::new);
-    let constraint_primitives = constraint_primitives(engine, params);
+    let constraint = constraint_requirement(engine, params);
     let producer =
         optional_non_blank_str(params, "producer").map(|value| value.unwrap_or("graftd"));
     let message =
         optional_non_blank_str(params, "message").map(|value| value.map(ToString::to_string));
-    match (scratch, constraint_primitives, producer, message) {
-        (Ok(scratch), Ok(constraint_primitives), Ok(producer), Ok(message)) => {
-            match engine.candidate_from_scratch(
-                &scratch,
-                constraint_primitives,
-                producer.to_string(),
-                message,
-            ) {
-                Ok(result) => {
-                    let mut payload = json!({
-                        "scratch": result.scratch,
-                        "candidate": result.candidate,
-                        "changed_paths": result.changed_paths,
-                        "registry_changed": false,
-                        "git_changed": false
-                    });
-                    if let Some(message) = deprecated
-                        && let Some(object) = payload.as_object_mut()
-                    {
-                        object.insert("deprecated".to_string(), json!(message));
-                    }
-                    (WireResponse::ok(id, payload), false)
-                }
-                Err(error) => wire::scratch_error_response(id, error),
+    match (scratch, constraint, producer, message) {
+        (Ok(scratch), Ok(constraint), Ok(producer), Ok(message)) => {
+            match engine.candidate_from_scratch(&scratch, constraint, producer.to_string(), message)
+            {
+                Ok(result) => (
+                    WireResponse::ok(
+                        id,
+                        json!({
+                            "scratch": result.scratch,
+                            "candidate": result.candidate,
+                            "changed_paths": result.changed_paths,
+                            "registry_changed": false,
+                            "git_changed": false
+                        }),
+                    ),
+                    false,
+                ),
+                Err(error) => scratch_wire::scratch_error_response(id, error),
             }
         }
         (Err(response), _, _, _)
@@ -564,13 +533,13 @@ fn op_field_allowed(spec: OpSpec, field: &str) -> bool {
         || spec.routing_fields.iter().any(|route| route.name == field)
 }
 
-fn constraint_primitives(engine: &ScratchEngine, params: &Value) -> HandlerResult<Vec<PlanId>> {
+fn constraint_requirement(engine: &ScratchEngine, params: &Value) -> HandlerResult<Constraint> {
     let names = params
         .get("constraint")
         .cloned()
         .map(|value| serde_json::from_value::<Vec<String>>(value).map_err(bad_params))
         .unwrap_or_else(|| Ok(Vec::new()))?;
-    graft_runtime::resolve_candidate_constraint_primitives(engine.store(), &names)
+    graft_runtime::resolve_candidate_constraint_requirement(engine.store(), &names)
         .map_err(|error| Box::new(WireResponse::error("", "E_BAD_PARAMS", error.to_string())))
 }
 
@@ -1890,6 +1859,29 @@ mod tests {
             },
         );
         assert!(drop_free.ok);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn maps_lost_scratch_to_retry_from_base_error() {
+        let (dir, engine, tree_id) = seeded_engine("lost_scratch");
+        let root = engine.open(VirtualBaseRef::Tree(tree_id)).unwrap();
+        let restarted = ScratchEngine::new(GraftStore::open(&dir));
+
+        let (response, _) = handle_request(
+            &restarted,
+            WireRequest {
+                id: "lost".to_string(),
+                op: "scratch_read".to_string(),
+                params: json!({"from": root, "path":"hello.txt", "mode":"text"}),
+            },
+        );
+
+        assert!(!response.ok);
+        let error = response.error.unwrap();
+        assert_eq!(error.code, "E_SCRATCH_LOST");
+        assert!(error.message.contains("retry from --base"));
 
         let _ = std::fs::remove_dir_all(dir);
     }

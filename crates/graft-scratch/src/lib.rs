@@ -1,7 +1,6 @@
 mod engine;
 mod hashlines;
 mod ops;
-pub mod wire;
 
 #[cfg(test)]
 use hashlines::{HASHLINE_ALPHABET, line_hash, logical_lines, render_hashlines};
@@ -11,7 +10,7 @@ use std::sync::Mutex;
 
 use graft_core::{
     CanonicalScratchOp, Change, Constraint, FileViewHash, FileViewHashSeed, GraftCandidate,
-    HashlineEdit, PlanId, ScratchId, ScratchNode, StateId, TreeEntry, TreeSnapshot, candidate_id,
+    HashlineEdit, ScratchId, ScratchNode, StateId, TreeEntry, TreeSnapshot, candidate_id,
     file_view_hash, materialize_application, scratch_id,
 };
 use graft_store::{GraftStore, StoreError, VirtualBaseRef, VirtualFile};
@@ -106,9 +105,6 @@ pub struct CandidateFromScratch {
     pub candidate: graft_core::CandidateId,
     pub changed_paths: Vec<String>,
 }
-
-#[deprecated(note = "use CandidateFromScratch")]
-pub type ScratchPromotion = CandidateFromScratch;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScratchDiff {

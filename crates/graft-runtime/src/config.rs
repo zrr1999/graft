@@ -152,7 +152,7 @@ pub(crate) enum ConstraintTermConfig {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ConstraintConfig {
-    pub(crate) primitive: Option<String>,
+    pub(crate) constraint: Option<String>,
     pub(crate) all_of: Option<Vec<ConstraintTermConfig>>,
     pub(crate) any_of: Option<Vec<ConstraintTermConfig>>,
     pub(crate) both: Option<Vec<ConstraintTermConfig>>,
@@ -536,7 +536,7 @@ pub(crate) fn required_constraints_constraint(
     match required {
         RequiredConstraintsConfig::Names(names) => names
             .iter()
-            .map(|name| constraint_primitive(config, name))
+            .map(|name| named_constraint(config, name))
             .collect::<Result<Vec<_>>>()
             .map(Constraint::all_of),
         RequiredConstraintsConfig::Expr(expr) => constraint_expr(config, expr),
@@ -545,7 +545,7 @@ pub(crate) fn required_constraints_constraint(
 
 fn constraint_expr(config: &GraftConfig, expr: &ConstraintConfig) -> Result<Constraint> {
     let present = [
-        expr.primitive.is_some(),
+        expr.constraint.is_some(),
         expr.all_of.is_some(),
         expr.any_of.is_some(),
         expr.both.is_some(),
@@ -559,11 +559,11 @@ fn constraint_expr(config: &GraftConfig, expr: &ConstraintConfig) -> Result<Cons
     }
     if present != 1 {
         bail!(
-            "[E_INVALID_CONSTRAINT] constraint expression must set exactly one of primitive/all_of/any_of/both/either"
+            "[E_INVALID_CONSTRAINT] constraint expression must set exactly one of constraint/all_of/any_of/both/either"
         );
     }
-    if let Some(primitive) = &expr.primitive {
-        return constraint_primitive(config, primitive);
+    if let Some(constraint) = &expr.constraint {
+        return named_constraint(config, constraint);
     }
     if let Some(items) = &expr.all_of {
         return items
@@ -602,12 +602,12 @@ fn constraint_expr(config: &GraftConfig, expr: &ConstraintConfig) -> Result<Cons
 
 fn constraint_term(config: &GraftConfig, term: &ConstraintTermConfig) -> Result<Constraint> {
     match term {
-        ConstraintTermConfig::Name(name) => constraint_primitive(config, name),
+        ConstraintTermConfig::Name(name) => named_constraint(config, name),
         ConstraintTermConfig::Expr(expr) => constraint_expr(config, expr),
     }
 }
 
-fn constraint_primitive(config: &GraftConfig, value: &str) -> Result<Constraint> {
+fn named_constraint(config: &GraftConfig, value: &str) -> Result<Constraint> {
     validate_constraint_name("constraint requirement", value)?;
     resolve_constraint(config, value)
 }
@@ -638,8 +638,8 @@ fn validate_constraint_expr_names(label: &str, expr: &ConstraintConfig) -> Resul
     {
         validate_constraint_term_names(label, item)?;
     }
-    if let Some(primitive) = &expr.primitive {
-        validate_constraint_name(label, primitive)?;
+    if let Some(constraint) = &expr.constraint {
+        validate_constraint_name(label, constraint)?;
     }
     Ok(())
 }
@@ -710,7 +710,7 @@ fn resolve_config_path(workspace: &Path, path: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use graft_core::{Assertion, Observation};
+    use graft_core::{Assertion, ObservationPlan};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn parse_config(text: &str) -> GraftConfig {
@@ -771,6 +771,25 @@ required = ["fmt_clean", "tests_pass"]
                 resolve_constraint(&config, "fmt_clean").unwrap(),
                 resolve_constraint(&config, "tests_pass").unwrap(),
             ])
+        );
+    }
+
+    #[test]
+    fn required_tagged_constraint_lowers_to_named_constraint_body() {
+        let config = config_with_constraints(
+            r#"
+[admission.required]
+constraint = "safe_patch"
+"#,
+            &["safe_patch"],
+        );
+
+        let constraint =
+            required_constraints_constraint(&config, &config.admission.required).unwrap();
+
+        assert_eq!(
+            constraint,
+            resolve_constraint(&config, "safe_patch").unwrap()
         );
     }
 
@@ -993,7 +1012,7 @@ fn cargo_tests_pass(app: Application) -> Constraint {
         let store = GraftStore::open(&dir);
         store.init().unwrap();
         let plan = Plan {
-            observation: Observation::ChangedPaths {
+            observation: ObservationPlan::ChangedPaths {
                 patterns: vec!["src/**".to_string()],
             },
             assertion: Assertion::PathsAnyMatch,

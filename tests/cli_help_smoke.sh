@@ -54,7 +54,7 @@ for nest in \
   "patch diff" "patch compose" "patch migrate" "patch revert" "patch materialize" "patch promote" \
   "constraint lock" "constraint check" "constraint list" "constraint show" \
   "repo add" "repo list" "repo sync" "repo lock" "repo update" \
-  "scratch status" "scratch read" "scratch write" "scratch edit" "scratch delete" "scratch rm" \
+  "scratch status" "scratch open" "scratch read" "scratch write" "scratch edit" "scratch delete" "scratch rm" \
   "scratch capture" "scratch diff" "scratch drop" "scratch pin" "scratch unpin" \
   "bundle export" "bundle import" "registry export" "registry import" "cache search" "candidate from-scratch"; do
   check_help "$nest"
@@ -74,14 +74,12 @@ for removed_top in create learn; do
 done
 
 scratch_help=$("$GRAFT" scratch --help 2>&1) || report "graft scratch --help" "exited non-zero"
-if grep -qE '^[[:space:]]+(open|promote)[[:space:]]' <<<"$scratch_help"; then
-  report "graft scratch --help" "scratch open/promote must not be user-facing scratch commands"
+if grep -qE '^[[:space:]]+promote[[:space:]]' <<<"$scratch_help"; then
+  report "graft scratch --help" "scratch promote must not be user-facing scratch command"
 fi
-for removed in "scratch open" "scratch promote"; do
-  if "$GRAFT" $removed --help >/tmp/graft-removed-help.out 2>&1; then
-    report "graft $removed --help" "removed scratch subcommand unexpectedly parsed"
-  fi
-done
+if "$GRAFT" scratch promote --help >/tmp/graft-removed-help.out 2>&1; then
+  report "graft scratch promote --help" "removed scratch subcommand unexpectedly parsed"
+fi
 
 repo_add_help=$("$GRAFT" repo add --help 2>&1) || report "graft repo add --help" "exited non-zero"
 if grep -q -- '--path' <<<"$repo_add_help"; then
@@ -91,17 +89,13 @@ if grep -q -- '--no-auto-clone' <<<"$repo_add_help"; then
   report "graft repo add --help" "repo add auto-locks, so --no-auto-clone must not be user-facing"
 fi
 
-# Hidden compatibility no-op: accepted for old scripts, intentionally absent
-# from normal help output.
-if ! "$GRAFT" patch materialize --discard --help >/tmp/graft-materialize-discard-help.out 2>&1; then
-  report "graft patch materialize --discard --help" "hidden --discard compatibility flag no longer parses"
-fi
-if grep -q -- '--discard' <<<"$("$GRAFT" patch materialize --help 2>&1)"; then
-  report "graft patch materialize --help" "hidden --discard compatibility flag leaked into help"
-fi
-for hidden_materialize_flag in '--as-commit' '--ref'; do
-  if grep -q -- "$hidden_materialize_flag" <<<"$("$GRAFT" patch materialize --help 2>&1)"; then
-    report "graft patch materialize --help" "unsupported Git flag leaked into help: $hidden_materialize_flag"
+# Removed compatibility/Git-ref flags must be rejected, not silently accepted.
+for removed_materialize_flag in '--discard' '--as-commit' '--ref'; do
+  if grep -q -- "$removed_materialize_flag" <<<"$("$GRAFT" patch materialize --help 2>&1)"; then
+    report "graft patch materialize --help" "removed flag leaked into help: $removed_materialize_flag"
+  fi
+  if "$GRAFT" patch materialize patch:demo "$removed_materialize_flag" >/tmp/graft-materialize-removed-flag.out 2>&1; then
+    report "graft patch materialize $removed_materialize_flag" "removed flag unexpectedly parsed"
   fi
 done
 
@@ -175,6 +169,7 @@ check_flag "sync" "--push-only"
 check_flag "sync" "--on-divergence"
 check_flag "verify-pending" "--patch"
 check_flag "verify-pending" "--limit"
+check_flag "scratch open" "--base"
 check_flag "scratch read" "--base"
 check_flag "scratch read" "--from"
 check_flag "scratch read" "--repo"
@@ -183,10 +178,12 @@ check_flag "scratch write" "--base"
 check_flag "scratch write" "--from"
 check_flag "scratch write" "--repo"
 check_flag "scratch write" "--content"
+check_flag "scratch write" "--content-stdin"
 check_flag "scratch edit" "--base"
 check_flag "scratch edit" "--from"
 check_flag "scratch edit" "--repo"
 check_flag "scratch edit" "--edits"
+check_flag "scratch edit" "--edits-stdin"
 check_flag "scratch delete" "--base"
 check_flag "scratch delete" "--from"
 check_flag "scratch delete" "--repo"

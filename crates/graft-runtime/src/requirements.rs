@@ -31,10 +31,6 @@ impl PromotionRequirementSource {
     }
 }
 
-pub(crate) fn parse_constraints(config: &GraftConfig, names: &[String]) -> Result<Vec<PlanId>> {
-    parse_constraint_requirement(config, names).map(|constraint| constraint_primitives(&constraint))
-}
-
 pub(crate) fn parse_constraint_requirement(
     config: &GraftConfig,
     names: &[String],
@@ -60,10 +56,6 @@ pub(crate) fn resolve_named_constraint(config: &GraftConfig, value: &str) -> Res
         .get(value)
         .map(|def| def.body.clone())
         .with_context(|| format!("[E_UNKNOWN_CONSTRAINT] constraint {value} is not configured"))
-}
-
-pub(crate) fn constraint_from_plans(constraints: &[PlanId]) -> Constraint {
-    Constraint::all_of(constraints.iter().cloned().map(Constraint::primitive))
 }
 
 pub(crate) fn constraint_primitives(constraint: &Constraint) -> Vec<PlanId> {
@@ -101,10 +93,6 @@ pub(crate) fn admission_requirement_constraint(
     let configured = required_constraints_constraint(config, &config.admission.required)?;
     let requested = parse_constraint_requirement(config, cli_constraints)?;
     Ok(Constraint::all_of(vec![configured, requested]))
-}
-
-pub(crate) fn needs_revalidation_or(config: &GraftConfig, names: &[String]) -> Result<Vec<PlanId>> {
-    resolve_candidate_constraint_primitives(config, names)
 }
 
 pub(crate) fn admission_required_constraint(
@@ -220,19 +208,19 @@ pub(crate) fn promotion_requirement_plan_with_target(
     })
 }
 
-pub(crate) fn resolve_candidate_constraint_primitives(
+pub(crate) fn candidate_constraint_requirement(
     config: &GraftConfig,
     names: &[String],
-) -> Result<Vec<PlanId>> {
+) -> Result<Constraint> {
     if names.is_empty() {
-        Ok(Vec::new())
+        Ok(Constraint::Top)
     } else {
-        parse_constraints(config, names)
+        parse_constraint_requirement(config, names)
     }
 }
 
 pub(crate) fn resolve_constraint_ref(config: &GraftConfig, name: &str) -> Result<PlanId> {
-    let plans = parse_constraints(config, &[name.to_string()])?;
+    let plans = constraint_primitives(&parse_constraint_requirement(config, &[name.to_string()])?);
     plans
         .into_iter()
         .next()
@@ -272,4 +260,39 @@ fn dedupe_plans(constraints: Vec<PlanId>) -> Vec<PlanId> {
         }
     }
     deduped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use graft_core::ConstraintDef;
+
+    fn plan(name: &str) -> PlanId {
+        PlanId::new(format!("plan:{name}"))
+    }
+
+    fn constraint_def(name: &str, body: Constraint) -> ConstraintDef {
+        ConstraintDef {
+            name: name.to_string(),
+            description: format!("{name} constraint"),
+            body,
+        }
+    }
+
+    #[test]
+    fn candidate_constraint_requirement_preserves_named_composite() {
+        let first = Constraint::primitive(plan("fast_check"));
+        let second = Constraint::primitive(plan("slow_check"));
+        let composite = Constraint::any_of(vec![first.clone(), second.clone()]);
+        let mut config = GraftConfig::default();
+        config.constraints.insert(
+            "either_check".to_string(),
+            constraint_def("either_check", composite.clone()),
+        );
+
+        let requirement =
+            candidate_constraint_requirement(&config, &["either_check".to_string()]).unwrap();
+
+        assert_eq!(requirement, composite);
+    }
 }

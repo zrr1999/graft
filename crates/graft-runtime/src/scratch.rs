@@ -1,3 +1,4 @@
+use std::io::{self, Read};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -46,6 +47,15 @@ pub(crate) struct ScratchSource {
 pub(crate) enum ScratchCommand {
     /// Check whether graftd is reachable
     Status,
+    /// Open a base ref as a scratch without editing it
+    Open {
+        #[arg(
+            long,
+            value_name = "BASE",
+            help = "Base ref to open: graft:empty, tree:<id>, candidate:<id>, or patch:<id>"
+        )]
+        base: String,
+    },
     /// Read a file from a base tree or scratch
     Read {
         #[command(flatten)]
@@ -59,16 +69,30 @@ pub(crate) enum ScratchCommand {
         #[command(flatten)]
         source: ScratchSource,
         path: String,
-        #[arg(long, help = "Text content to write")]
-        content: String,
+        #[arg(
+            long,
+            required_unless_present = "content_stdin",
+            conflicts_with = "content_stdin",
+            help = "Text content to write"
+        )]
+        content: Option<String>,
+        #[arg(long, help = "Read text content to write from stdin")]
+        content_stdin: bool,
     },
     /// Apply raw JSON HashlineEdit array to a file in a new or existing scratch
     Edit {
         #[command(flatten)]
         source: ScratchSource,
         path: String,
-        #[arg(long, help = "JSON array of graft_core::HashlineEdit records")]
-        edits: String,
+        #[arg(
+            long,
+            required_unless_present = "edits_stdin",
+            conflicts_with = "edits_stdin",
+            help = "JSON array of graft_core::HashlineEdit records"
+        )]
+        edits: Option<String>,
+        #[arg(long, help = "Read JSON HashlineEdit array from stdin")]
+        edits_stdin: bool,
     },
     /// Delete a file from a new or existing scratch
     #[command(alias = "rm")]
@@ -122,6 +146,11 @@ pub(crate) fn run_scratch_command(
             let result = request_result_or_spawn(workspace_root, &socket, "status", json!({}))?;
             return result_to_envelope(result, ScratchResultContract::Status);
         }
+        ScratchCommand::Open { base } => (
+            "scratch_open",
+            json!({"base": base}),
+            ScratchResultContract::Open,
+        ),
         ScratchCommand::Read { source, path, mode } => (
             "scratch_read",
             params_with_source(
@@ -135,21 +164,33 @@ pub(crate) fn run_scratch_command(
             source,
             path,
             content,
-        } => (
-            "scratch_write",
-            params_with_source(
-                workspace_root,
-                source,
-                [("path", json!(path)), ("content", json!(content))],
-            )?,
-            ScratchResultContract::Write,
-        ),
+            content_stdin,
+        } => {
+            let content = payload_or_stdin(
+                content.as_deref(),
+                *content_stdin,
+                "--content",
+                "--content-stdin",
+            )?;
+            (
+                "scratch_write",
+                params_with_source(
+                    workspace_root,
+                    source,
+                    [("path", json!(path)), ("content", json!(content))],
+                )?,
+                ScratchResultContract::Write,
+            )
+        }
         ScratchCommand::Edit {
             source,
             path,
             edits,
+            edits_stdin,
         } => {
-            let edits: Value = serde_json::from_str(edits).context("parse --edits JSON")?;
+            let edits =
+                payload_or_stdin(edits.as_deref(), *edits_stdin, "--edits", "--edits-stdin")?;
+            let edits: Value = serde_json::from_str(&edits).context("parse --edits JSON")?;
             (
                 "scratch_edit",
                 params_with_source(
@@ -214,9 +255,32 @@ pub(crate) fn run_scratch_status(cwd: &Path, socket: Option<&Path>) -> Result<Co
     result_to_envelope(result, ScratchResultContract::Status)
 }
 
+fn payload_or_stdin(
+    literal: Option<&str>,
+    read_stdin: bool,
+    literal_flag: &str,
+    stdin_flag: &str,
+) -> Result<String> {
+    match (literal, read_stdin) {
+        (Some(_), true) => {
+            bail!("[E_BAD_PARAMS] {literal_flag} and {stdin_flag} cannot be used together")
+        }
+        (Some(value), false) => Ok(value.to_string()),
+        (None, true) => {
+            let mut value = String::new();
+            io::stdin()
+                .read_to_string(&mut value)
+                .with_context(|| format!("read {stdin_flag} from stdin"))?;
+            Ok(value)
+        }
+        (None, false) => bail!("[E_BAD_PARAMS] provide {literal_flag} or {stdin_flag}"),
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum ScratchResultContract {
     Status,
+    Open,
     Read,
     Write,
     Edit,
@@ -400,6 +464,7 @@ fn result_to_envelope(result: Value, contract: ScratchResultContract) -> Result<
         .map(ToString::to_string);
     Ok(CommandEnvelope {
         message: Some(render_result(&result)?),
+        result: Some(result.clone()),
         candidate_id,
         cache_changed: result.get("candidate").is_some(),
         registry_changed: false,
@@ -412,6 +477,9 @@ fn validate_result_contract(result: &Value, contract: ScratchResultContract) -> 
     match contract {
         ScratchResultContract::Status => {
             require_status_fields(result)?;
+        }
+        ScratchResultContract::Open => {
+            required_string_field(result, "scratch_open", "scratch")?;
         }
         ScratchResultContract::Read => {
             require_scratch_path_fields(result, "scratch_read")?;
@@ -534,6 +602,20 @@ mod tests {
     }
 
     #[test]
+    fn result_to_envelope_accepts_valid_open_payload() {
+        let envelope = result_to_envelope(
+            json!({
+                "scratch": "scratch:next"
+            }),
+            ScratchResultContract::Open,
+        )
+        .unwrap();
+
+        assert_eq!(envelope.result.as_ref().unwrap()["scratch"], "scratch:next");
+        assert!(envelope.message.unwrap().contains("scratch:next"));
+    }
+
+    #[test]
     fn result_to_envelope_accepts_valid_write_payload() {
         let envelope = result_to_envelope(
             json!({
@@ -548,6 +630,7 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(envelope.result.as_ref().unwrap()["scratch"], "scratch:next");
         assert!(envelope.message.unwrap().contains("scratch:next"));
         assert!(envelope.candidate_id.is_none());
     }
@@ -563,6 +646,7 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(envelope.result.as_ref().unwrap()["dropped"], true);
         assert!(envelope.message.unwrap().contains("\"dropped\": true"));
     }
 
@@ -580,6 +664,7 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(envelope.result.as_ref().unwrap()["scratch"], "scratch:next");
         assert!(envelope.message.unwrap().contains("updated_anchors"));
     }
 
@@ -596,6 +681,7 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(envelope.result.as_ref().unwrap()["scratch"], "scratch:next");
         assert!(envelope.message.unwrap().contains("scratch:next"));
         assert!(envelope.candidate_id.is_none());
     }
@@ -612,6 +698,7 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(envelope.result.as_ref().unwrap()["lease"], "lease:1");
         assert!(envelope.message.unwrap().contains("\"pinned\": 1"));
     }
 
@@ -622,6 +709,11 @@ mod tests {
                 ScratchResultContract::Status,
                 json!({"status": "ok"}),
                 "missing string field `daemon`",
+            ),
+            (
+                ScratchResultContract::Open,
+                json!({}),
+                "missing string field `scratch`",
             ),
             (
                 ScratchResultContract::Read,

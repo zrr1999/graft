@@ -91,12 +91,12 @@ pub fn verifier_id_for_plan(plan_id: &PlanId) -> String {
 mod tests {
     use super::*;
     use graft_core::{
-        ApplicationEndpoint, ApplicationPlan, Assertion, Observation, RunPlan, TreePlan,
+        ApplicationEndpoint, ApplicationPlan, Assertion, ObservationPlan, RunPlan, TreePlan,
     };
 
     fn run_plan(argv: &[&str]) -> Plan {
         Plan {
-            observation: Observation::Run {
+            observation: ObservationPlan::Run {
                 run: RunPlan {
                     argv: argv.iter().map(|value| (*value).to_string()).collect(),
                     tree: TreePlan::Application {

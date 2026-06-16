@@ -1,11 +1,11 @@
 # Graft
 
-Graft 是一个 Git-compatible、但 Git-independent 的 constraint-aware patch runtime。它不把当前目录当作 Git worktree，也不维护 `main` view；`.graft/` 是唯一事实空间，远端 Git 仓库只作为 `refs/graft/*` 的 content-addressed storage partition。
+Graft 是兼容 Git、但不依赖 Git 的约束感知补丁运行时。它不把当前目录当作 Git worktree，也不维护 `main` 视图；`.graft/` 是唯一事实空间，远端 Git 仓库只作为 `refs/graft/*` 的内容寻址存储分区。
 
 核心问题：
 
 ```text
-一组人类/agent 产生的文件修改，什么时候可以被认为是可信 patch？
+一组人类或智能体产生的文件修改，什么时候可以被认为是可信 patch？
 ```
 
 Graft 的生命周期回答是：
@@ -16,7 +16,7 @@ scratch operation -> candidate -> validate evidence -> admit patch -> materializ
 
 一句话：Graft 管「变更为什么可信」，Git 只在显式 `graft patch promote` 时承载「可信变更如何进入外部版本历史」。
 
-## 帮助入口 / agent workflow
+## 帮助入口 / 智能体流程
 
 仓库维护的推荐使用流程入口是：
 
@@ -24,11 +24,11 @@ scratch operation -> candidate -> validate evidence -> admit patch -> materializ
 graft explain agent-workflow
 ```
 
-pi-graft 的 `graft_help` tool 应默认展示这个 topic；具体概念继续用 `graft explain scratch`、`graft explain candidate`、`graft explain admit`、`graft explain materialize` 等查询。高频 agent 主路径是 scratch 草稿（`graft scratch read|write|edit|delete --base/--from ...`）→ `graft patch from-scratch` → `graft patch validate` → `graft patch admit` → `graft patch materialize` / `graft run` 检查输出；如果已有 cwd dirty state，才用 `graft scratch capture --base <ref>` 显式桥接并恢复 cwd。外部 `graft patch promote`、sync、compose/migrate/revert、`repo add/sync/lock/update`、`bundle import`、`workspace gc --apply` 等低频写命令可通过手动 CLI 或 pi-graft `graft_cli_exec` argv 显式执行，读/检查命令保留本地 CLI 路径。
+pi-graft 的 `graft_help` 工具应默认展示这个 topic；具体概念继续用 `graft explain scratch`、`graft explain candidate`、`graft explain admit`、`graft explain materialize` 等查询。高频智能体主路径是 scratch 草稿（`graft scratch read|write|edit|delete --base/--from ...`）→ `graft patch from-scratch` → `graft patch validate` → `graft patch admit` → `graft patch materialize` / `graft run` 检查输出；只有在已有当前目录 dirty state 时，才用 `graft scratch capture --base <ref>` 显式桥接并恢复当前目录。外部 `graft patch promote`、sync、compose/migrate/revert、`repo add/sync/lock/update`、`bundle import`、`workspace gc --apply` 等低频写命令可通过手动 CLI 或 pi-graft `graft_cli_exec` argv 显式执行，读/检查命令保留本地 CLI 路径。
 
 ## 当前状态
 
-这是一个正在迭代的 Rust 项目，当前实现已覆盖 v2 store-tier 主路径：
+这是一个正在迭代的 Rust 项目，已覆盖三层存储主路径：
 
 - workspace 是用户级对象：`$GRAFT_HOME` 默认 `~/.graft`，cwd 只是 attach/discovery key；Graft workspace root 拒绝 `.git/`，外部 Git 只通过 repo/promote 边界进入。
 - `.graft/store/{public,private,derived}` 分层：candidate local-only；admitted patch / relation / promotion / evidence_refs 位于 public；evidence body 位于 derived，不参与 sync。
@@ -100,7 +100,7 @@ graft run "$patch" -- test -f hello.txt
 graft workspace status
 ```
 
-## Workspace layout
+## 工作区布局
 
 ```text
 .graft/
@@ -115,10 +115,10 @@ graft workspace status
 graft.toml
 constraints.roto
 graft.lock
-worktrees/         # local managed-repo checkout/output area; cwd capture ignores it
+worktrees/         # 本地受管仓库 checkout/output 区域；cwd capture 会忽略它
 ```
 
-`graft.lock` 是 derived anchor：`[constraints]` 固定 constraint content IDs，`[repos.<id>]` 固定外部 repo treeish 解析结果。它属于 Graft 跟踪的 workspace 元配置锁，确保 clone/get 后解析一致。
+`graft.lock` 是派生锚点：`[constraints]` 固定 constraint content IDs，`[repos.<id>]` 固定外部 repo treeish 解析结果。它属于 Graft 跟踪的 workspace 元配置锁，确保 clone/get 后解析一致。
 
 ## ID 形式
 
@@ -139,7 +139,7 @@ manifest:<digest>
 
 `blob` 使用 raw bytes blake3，不带 typed prefix。旧 `gr_/grc_/ev_/ch_/gt_` 输入会以 `[E_LEGACY_ID]` 失败。
 
-## Constraints
+## 约束
 
 Constraint 定义位于单个 `constraints.roto`。每个顶层 `fn name(app: Application) -> Constraint` 都是一个命名约束；函数名是配置和 CLI 里使用的名字，没有 PascalCase alias，也没有 `constraint_registry()`。primitive 叶子由 `Plan { observation, assertion }` 内容寻址，函数名和描述只是标签。例如：
 
@@ -193,7 +193,7 @@ graftd status --socket "$GRAFT_HOME/run/daemon.sock"
 graftd stop   --socket "$GRAFT_HOME/run/daemon.sock"
 ```
 
-## Sync / clone
+## 同步 / 克隆
 
 Graft remote 是 Git 仓库，但只使用固定 storage refs：
 
@@ -217,14 +217,11 @@ graft patch incoming
 graft verify-pending
 ```
 
-`ws:default` never syncs. Other workspaces sync by default unless
-`[sync] enabled = false` is set in `graft.toml`.
-The first explicit `graft sync <remote>` records the workspace's default
-remote; later `graft sync` uses that recorded remote.
+`ws:default` 永不同步。其他工作区默认同步，除非在 `graft.toml` 中设置 `[sync] enabled = false`。第一次显式执行 `graft sync <remote>` 会记录该工作区的默认 remote；后续 `graft sync` 使用这个已记录 remote。
 
-`evidence_refs` 会 sync；`store/derived/evidence/` 不 sync，fresh clone 需要 `graft verify-pending` 本地重建。
+`evidence_refs` 会同步；`store/derived/evidence/` 不同步，新 clone 需要通过 `graft verify-pending` 在本地重建。
 
-Clone 不 materialize cwd：
+克隆不物化当前目录：
 
 ```bash
 graft get /path/to/storage.git ./clone
@@ -233,7 +230,7 @@ graft patch incoming
 graft patch materialize patch:<digest>
 ```
 
-## Promote
+## 推广
 
 `graft patch promote` 是唯一会写外部 Git repo 的路径。推荐在 `graft.toml` 配置 target：
 
@@ -252,9 +249,9 @@ required = ['only_touches_docs']
 graft patch promote patch:<digest> --to docs --yes
 ```
 
-## Scratch
+## Scratch 草稿
 
-`scratch` 是 daemon-backed 临时草稿状态图。第一次读/写/编辑/删除直接用 `--base`，后续草稿变更用 `--from` 续写；`--repo <id>` 只用于指定 `--base` 的 repo 上下文，不写就是 workspace。candidate 生成不属于 `scratch` namespace，而是独立的 candidate lifecycle 入口：
+`scratch` 是由 daemon 支持的临时草稿状态图。第一次读、写、编辑或删除直接用 `--base`，后续草稿变更用 `--from` 续写；`--repo <id>` 只用于指定 `--base` 的 repo 上下文，不写则使用 workspace。candidate 生成不属于 `scratch` namespace，而是独立的 candidate 生命周期入口：
 
 ```bash
 graft scratch read --base patch:<digest> path/to/file --mode hashlines
@@ -271,11 +268,11 @@ graft scratch drop scratch:<digest>
 graft patch from-scratch scratch:<digest> --expect only_touches_docs --message 'ready for validation'
 ```
 
-`graft patch from-scratch` 调用 daemon `candidate_from_scratch` protocol；CLI 与 pi-graft 插件共享这个 canonical op 来写 change、candidate 与空 evidence index。旧的 `graft candidate from-scratch` 仍作为隐藏兼容入口接受，但 README 使用当前 help 暴露的 `patch` namespace。Rename 用 `scratch delete --from <scratch> old/path` 加 `scratch write --from <scratch> new/path --content ...` 表达。
+`graft patch from-scratch` 调用 daemon `candidate_from_scratch` protocol；CLI 与 pi-graft 插件共享这个规范 op 来写 change、candidate 与空 evidence index。旧的 `graft candidate from-scratch` 仍作为隐藏兼容入口接受，但 README 使用当前 help 暴露的 `patch` namespace。Rename 用 `scratch delete --from <scratch> old/path` 加 `scratch write --from <scratch> new/path --content ...` 表达。
 
 ## 开发检查
 
-本地与 PR gate 使用同一组入口：
+本地与 PR 门禁使用同一组入口：
 
 ```bash
 just check      # cargo fmt --all -- --check + cargo clippy --locked --workspace --all-targets -- -D warnings
@@ -285,4 +282,4 @@ just prek       # uvx prek run --all-files
 just cov        # cargo llvm-cov test --locked --workspace --all-targets，生成 lcov.info
 ```
 
-`just smoke` 会逐个执行 `tests/*.sh`，任一 smoke 失败即停止。CI 的 static/test workflows 调用同一组 `just` recipes（test workflow 额外用 `just cov` 生成覆盖率上传）；PR 还会运行标题与正文模板检查。
+`just smoke` 会逐个执行 `tests/*.sh`，任一 smoke 失败即停止。CI 的 static/test workflow 调用同一组 `just` recipe；test workflow 额外用 `just cov` 生成覆盖率上传。PR 还会运行标题与正文模板检查。

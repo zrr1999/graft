@@ -101,30 +101,25 @@ pub enum StateId {
     GraftTree(String),
 }
 
-/// User-facing parsed form of a base reference.
+/// 面向用户的 base reference 解析结果。
 ///
-/// Runtime base-like CLI arguments and `graftd` scratch `base` params share one
-/// parser here. Scratch accepts the immediately materializable subset
-/// (`graft:empty`, `tree:`, `candidate:`, `patch:`); higher-level runtime paths
-/// may also resolve Git and configured repo refs. Each variant
-/// only carries the data the parser is sure about; resolving it to a concrete
-/// [`StateId`] (which may require a Git repo, a clone, or a registry lookup)
-/// is the consumer's responsibility.
+/// 类似 base 的 CLI 参数与 `graftd` scratch `base` 参数共用这里的解析器。
+/// Scratch 只接受可立即物化的子集（`graft:empty`、`tree:`、`candidate:`、`patch:`）；
+/// 更高层运行时路径还可以解析 Git 与已配置 repo 引用。每个变体只携带解析器能够确定的数据；
+/// 将其解析为具体 [`StateId`]（可能需要 Git repo、clone 或 registry lookup）是调用方责任。
 ///
-/// Supported forms:
+/// 支持形式：
 ///
-/// - `HEAD`, any other Git treeish (e.g. `main`, `abc1234`, `refs/heads/x`)
-///   parses to [`BaseRefSpec::GitTreeish`].
-/// - `repo:<id>@<treeish>` parses to [`BaseRefSpec::Repo`]; the `<id>` must be
-///   declared in `[repos.<id>]`.
-/// - `tree:<digest>` parses to [`BaseRefSpec::GraftTree`].
-/// - `candidate:<digest>` parses to [`BaseRefSpec::Candidate`].
-/// - `patch:<digest>` parses to [`BaseRefSpec::Patch`].
-/// - `graft:empty` parses to [`BaseRefSpec::Empty`], an explicit "start from
-///   nothing" sentinel for environments without a Git base.
+/// - `HEAD` 或任意其他 Git treeish（例如 `main`、`abc1234`、`refs/heads/x`）
+///   解析为 [`BaseRefSpec::GitTreeish`]。
+/// - `repo:<id>@<treeish>` 解析为 [`BaseRefSpec::Repo`]；`<id>` 必须在 `[repos.<id>]` 中声明。
+/// - `tree:<digest>` 解析为 [`BaseRefSpec::GraftTree`]。
+/// - `candidate:<digest>` 解析为 [`BaseRefSpec::Candidate`]。
+/// - `patch:<digest>` 解析为 [`BaseRefSpec::Patch`]。
+/// - `graft:empty` 解析为 [`BaseRefSpec::Empty`]，表示没有 Git base 时显式从空状态开始。
 ///
-/// Legacy display IDs such as `gt_<digest>`, `grc_<digest>`, and `gr_<digest>`
-/// are rejected with [`BaseRefParseError::LegacyId`].
+/// `gt_<digest>`、`grc_<digest>` 和 `gr_<digest>` 等旧显示 ID
+/// 会以 [`BaseRefParseError::LegacyId`] 拒绝。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BaseRefSpec {
     GitTreeish(String),
@@ -166,9 +161,8 @@ fn legacy_id_prefix(value: &str) -> Option<(&'static str, &'static str)> {
 }
 
 impl BaseRefSpec {
-    /// Parses a single `--from`-style string. See [`BaseRefSpec`] for the
-    /// supported forms. Unknown free-form input is treated as a Git treeish so
-    /// existing flows like `--from main` keep working.
+    /// 解析一个 `--from` 风格字符串。支持形式见 [`BaseRefSpec`]。
+    /// 未知自由输入按 Git treeish 处理，以保留 `--from main` 等既有流程。
     pub fn parse(value: &str) -> std::result::Result<Self, BaseRefParseError> {
         let trimmed = value.trim();
         if trimmed.is_empty() {
@@ -220,7 +214,7 @@ impl BaseRefSpec {
         Ok(Self::GitTreeish(trimmed.to_string()))
     }
 
-    /// Pretty form suitable for logs and error messages.
+    /// 适合日志和错误消息的展示形式。
     pub fn display(&self) -> String {
         match self {
             Self::GitTreeish(value) => value.clone(),
@@ -496,7 +490,7 @@ impl std::fmt::Display for ConstraintName {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Plan {
-    pub observation: Observation,
+    pub observation: ObservationPlan,
     pub assertion: Assertion,
 }
 
@@ -508,7 +502,7 @@ impl Plan {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum Observation {
+pub enum ObservationPlan {
     ChangedPaths {
         patterns: Vec<String>,
     },
@@ -900,7 +894,7 @@ mod tests {
 
     fn run_exit_zero_plan(argv: &[&str]) -> Plan {
         Plan {
-            observation: Observation::Run {
+            observation: ObservationPlan::Run {
                 run: RunPlan {
                     argv: argv.iter().map(|value| (*value).to_string()).collect(),
                     tree: current_target_tree(),
@@ -989,7 +983,7 @@ mod tests {
     fn constraint_def_name_and_description_do_not_enter_body_identity() {
         let test_plan = run_exit_zero_plan(&["cargo", "test"]);
         let artifact_plan = Plan {
-            observation: Observation::ChangedPaths {
+            observation: ObservationPlan::ChangedPaths {
                 patterns: vec!["target/**".to_string()],
             },
             assertion: Assertion::PathsNoMatch,
@@ -1050,11 +1044,11 @@ mod tests {
 
         let plans = vec![
             Plan {
-                observation: Observation::Run { run: bad_run },
+                observation: ObservationPlan::Run { run: bad_run },
                 assertion: Assertion::ExitCodeIs { code: 0 },
             },
             Plan {
-                observation: Observation::SameOutput {
+                observation: ObservationPlan::SameOutput {
                     left: base_run,
                     right: target_run,
                     selectors: vec![
@@ -1442,20 +1436,17 @@ mod tests {
         );
     }
 
-    /// Property-style coverage for ScratchId derivation.
+    /// ScratchId 派生的性质覆盖。
     ///
-    /// We sweep N pseudo-random `(base, ordered ops)` tuples and check that:
+    /// 遍历 N 组伪随机 `(base, ordered ops)` 元组，并检查：
     ///
-    /// 1. The same input deterministically produces the same `ScratchId`
-    ///    (replay equivalence; `scratch_id` is a pure function).
-    /// 2. Reordering two distinct leading ops in the same chain changes the
-    ///    chain `ScratchId` even though the final tree digest may stay the
-    ///    same (history is part of the identity).
+    /// 1. 同一输入确定性地产生同一个 `ScratchId`
+    ///    （重放等价；`scratch_id` 是纯函数）。
+    /// 2. 同一链中两个不同前导 op 的顺序变化会改变链 `ScratchId`，
+    ///    即使最终 tree digest 可能保持不变（历史属于身份的一部分）。
     ///
-    /// Inputs are derived from a deterministic counter so the test is fully
-    /// reproducible; we still cover enough variation in path / size / op
-    /// kind to exercise the canonical serialization, not just the trivial
-    /// path.
+    /// 输入由确定性计数器派生，因此测试完全可复现；同时覆盖足够多的
+    /// path、size 和 op kind 变化，以锻炼规范序列化，而不只覆盖平凡路径。
     #[test]
     fn scratch_id_is_replay_equivalent_and_order_sensitive() {
         const CASES: usize = 50;

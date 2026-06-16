@@ -42,16 +42,34 @@ grep -q '"daemon": "graftd"' <<<"$status_no_workspace" || {
   echo "FAIL: scratch status should not require workspace discovery"; echo "$status_no_workspace"; exit 1;
 }
 
+open_out=$("$GRAFT" --cwd "$PROJECT" --json scratch open --base "$candidate")
+open_scratch=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["scratch"])' <<<"$open_out")
+[[ $open_scratch == scratch:* ]] || { echo "FAIL: scratch open did not return result.scratch"; echo "$open_out"; exit 1; }
+
 read_out=$("$GRAFT" --cwd "$PROJECT" scratch read --base "$candidate" hello.txt --mode text)
 grep -q 'hello' <<<"$read_out" || { echo "FAIL: scratch read missing content"; echo "$read_out"; exit 1; }
+if LC_ALL=C printf '\377' | "$GRAFT" --cwd "$PROJECT" scratch write --base "$candidate" bad.txt --content-stdin >/tmp/graft-scratch-write-bad-stdin.out 2>&1; then
+  echo "FAIL: invalid UTF-8 stdin content unexpectedly succeeded"; exit 1
+fi
+if grep -qE 'scratch:[0-9a-f]+' /tmp/graft-scratch-write-bad-stdin.out; then
+  echo "FAIL: invalid UTF-8 stdin content produced a scratch id"; cat /tmp/graft-scratch-write-bad-stdin.out; exit 1;
+fi
 
-write=$("$GRAFT" --cwd "$PROJECT" scratch write --base "$candidate" bye.txt --content $'bye\n')
+write=$(printf 'bye\n' | "$GRAFT" --cwd "$PROJECT" scratch write --base "$candidate" bye.txt --content-stdin)
 scratch2=$(grep -oE 'scratch:[0-9a-f]+' <<<"$write" | tail -n1)
-[[ -n $scratch2 ]] || { echo "FAIL: no scratch id after write"; echo "$write"; exit 1; }
+[[ -n $scratch2 ]] || { echo "FAIL: no scratch id after stdin write"; echo "$write"; exit 1; }
 
-edit=$("$GRAFT" --cwd "$PROJECT" scratch edit --from "$scratch2" bye.txt --edits '[{"kind":"replace_text","old_text":"bye","new_text":"ciao"}]')
+edit=$(printf '[{"kind":"replace_text","old_text":"bye","new_text":"ciao"}]' | "$GRAFT" --cwd "$PROJECT" scratch edit --from "$scratch2" bye.txt --edits-stdin)
 scratch3=$(grep -oE 'scratch:[0-9a-f]+' <<<"$edit" | tail -n1)
 [[ -n $scratch3 ]] || { echo "FAIL: no scratch id after edit"; echo "$edit"; exit 1; }
+if printf 'not-json' | "$GRAFT" --cwd "$PROJECT" scratch edit --from "$scratch2" bye.txt --edits-stdin >/tmp/graft-scratch-edit-bad-stdin.out 2>&1; then
+  echo "FAIL: invalid stdin edits unexpectedly succeeded"; exit 1
+fi
+if grep -qE 'scratch:[0-9a-f]+' /tmp/graft-scratch-edit-bad-stdin.out; then
+  echo "FAIL: invalid stdin edits produced a scratch id"; cat /tmp/graft-scratch-edit-bad-stdin.out; exit 1;
+fi
+read_after_bad=$("$GRAFT" --cwd "$PROJECT" scratch read --from "$scratch2" bye.txt --mode text)
+grep -q 'bye' <<<"$read_after_bad" || { echo "FAIL: invalid stdin edits changed parent scratch"; echo "$read_after_bad"; exit 1; }
 
 read_edit=$("$GRAFT" --cwd "$PROJECT" scratch read --from "$scratch3" bye.txt --mode text)
 grep -q 'ciao' <<<"$read_edit" || { echo "FAIL: scratch read after edit missing content"; echo "$read_edit"; exit 1; }

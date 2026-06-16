@@ -296,19 +296,12 @@ pub(crate) fn route_patch_command(command: &PatchCommand) -> PatchCommandRoute<'
             constraint_primitives: constraint_primitives.clone(),
             validate: *validate,
         }),
-        PatchCommand::Materialize {
-            id,
-            dry_run,
-            discard,
-            as_commit,
-            ref_name,
-        } => PatchCommandRoute::TopLevelAlias(Command::Materialize {
-            id: id.clone(),
-            dry_run: *dry_run,
-            discard: *discard,
-            as_commit: *as_commit,
-            ref_name: ref_name.clone(),
-        }),
+        PatchCommand::Materialize { id, dry_run } => {
+            PatchCommandRoute::TopLevelAlias(Command::Materialize {
+                id: id.clone(),
+                dry_run: *dry_run,
+            })
+        }
         PatchCommand::Promote {
             id,
             to,

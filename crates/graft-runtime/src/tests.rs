@@ -272,6 +272,91 @@ fn new_and_hidden_compatibility_commands_parse() {
         }
     ));
     assert!(matches!(
+        Cli::try_parse_from(["graft", "scratch", "open", "--base", "graft:empty"])
+            .unwrap()
+            .command,
+        Command::Scratch {
+            command: ScratchCommand::Open { .. },
+            ..
+        }
+    ));
+    match Cli::try_parse_from([
+        "graft",
+        "scratch",
+        "write",
+        "--base",
+        "graft:empty",
+        "note.txt",
+        "--content",
+        "-",
+    ])
+    .unwrap()
+    .command
+    {
+        Command::Scratch {
+            command:
+                ScratchCommand::Write {
+                    content,
+                    content_stdin,
+                    ..
+                },
+            ..
+        } => {
+            assert_eq!(content.as_deref(), Some("-"));
+            assert!(!content_stdin);
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+    match Cli::try_parse_from([
+        "graft",
+        "scratch",
+        "write",
+        "--base",
+        "graft:empty",
+        "note.txt",
+        "--content-stdin",
+    ])
+    .unwrap()
+    .command
+    {
+        Command::Scratch {
+            command:
+                ScratchCommand::Write {
+                    content,
+                    content_stdin,
+                    ..
+                },
+            ..
+        } => {
+            assert!(content.is_none());
+            assert!(content_stdin);
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+    match Cli::try_parse_from([
+        "graft",
+        "scratch",
+        "edit",
+        "--from",
+        "scratch:abc",
+        "note.txt",
+        "--edits-stdin",
+    ])
+    .unwrap()
+    .command
+    {
+        Command::Scratch {
+            command: ScratchCommand::Edit {
+                edits, edits_stdin, ..
+            },
+            ..
+        } => {
+            assert!(edits.is_none());
+            assert!(edits_stdin);
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+    assert!(matches!(
         Cli::try_parse_from(["graft", "patch", "list", "--candidates"])
             .unwrap()
             .command,
@@ -481,6 +566,12 @@ fn top_level_router_classifies_workspace_boundary_commands() {
             false,
         ),
         (
+            "scratch open",
+            &["graft", "scratch", "open", "--base", "graft:empty"],
+            TopLevelRoute::Local,
+            false,
+        ),
+        (
             "scratch read",
             &["graft", "scratch", "read", "--base", "graft:empty", "a.txt"],
             TopLevelRoute::Local,
@@ -512,6 +603,34 @@ fn top_level_router_classifies_workspace_boundary_commands() {
                 "a.txt",
                 "--edits",
                 "[]",
+            ],
+            TopLevelRoute::Local,
+            false,
+        ),
+        (
+            "scratch write stdin",
+            &[
+                "graft",
+                "scratch",
+                "write",
+                "--base",
+                "graft:empty",
+                "a.txt",
+                "--content-stdin",
+            ],
+            TopLevelRoute::Local,
+            false,
+        ),
+        (
+            "scratch edit stdin",
+            &[
+                "graft",
+                "scratch",
+                "edit",
+                "--from",
+                "scratch:abc",
+                "a.txt",
+                "--edits-stdin",
             ],
             TopLevelRoute::Local,
             false,
@@ -1217,39 +1336,95 @@ fn promote_rejects_blank_ref_args_before_patch_lookup() {
 }
 
 #[test]
-fn materialize_rejects_git_ref_mode_before_state_resolution() {
-    let _lock = env_lock();
-    let dir = test_workspace("graft-cli-materialize-blank-ref-test");
-    let home = test_workspace("graft-cli-materialize-blank-ref-home");
-    fs::create_dir_all(&dir).unwrap();
-    fs::create_dir_all(&home).unwrap();
-    let _guard = EnvGuard::set("GRAFT_HOME", &home);
-    let store = GraftStore::open(&dir);
-    run_init_command(&store, false).unwrap();
+fn scratch_payload_flags_require_exactly_one_input_source() {
+    for (args, expected) in [
+        (
+            vec![
+                "graft",
+                "scratch",
+                "write",
+                "--base",
+                "graft:empty",
+                "note.txt",
+            ],
+            "--content",
+        ),
+        (
+            vec![
+                "graft",
+                "scratch",
+                "write",
+                "--base",
+                "graft:empty",
+                "note.txt",
+                "--content",
+                "literal",
+                "--content-stdin",
+            ],
+            "cannot be used with",
+        ),
+        (
+            vec![
+                "graft",
+                "scratch",
+                "edit",
+                "--from",
+                "scratch:abc",
+                "note.txt",
+            ],
+            "--edits",
+        ),
+        (
+            vec![
+                "graft",
+                "scratch",
+                "edit",
+                "--from",
+                "scratch:abc",
+                "note.txt",
+                "--edits",
+                "[]",
+                "--edits-stdin",
+            ],
+            "cannot be used with",
+        ),
+    ] {
+        let error = Cli::try_parse_from(args).unwrap_err().to_string();
+        assert!(error.contains(expected), "{error}");
+    }
+}
 
-    let message = error_chain_text(
-        run_local(&Cli {
-            command: Command::Materialize {
-                id: "patch:missing".to_string(),
-                dry_run: false,
-                discard: false,
-                as_commit: false,
-                ref_name: Some(" \t".to_string()),
-            },
-            json: false,
-            cwd: dir.clone(),
-        })
-        .unwrap_err(),
-    );
-
-    assert!(message.contains("[E_MATERIALIZE_STATE_ONLY]"), "{message}");
-    assert!(
-        !message.contains("read patch record"),
-        "materialize ref rejection must run before patch lookup: {message}"
-    );
-
-    let _ = fs::remove_dir_all(&dir);
-    let _ = fs::remove_dir_all(&home);
+#[test]
+fn materialize_rejects_removed_compatibility_and_git_ref_flags() {
+    for (args, flag) in [
+        (
+            vec!["graft", "materialize", "patch:abc", "--discard"],
+            "--discard",
+        ),
+        (
+            vec!["graft", "materialize", "patch:abc", "--as-commit"],
+            "--as-commit",
+        ),
+        (
+            vec!["graft", "materialize", "patch:abc", "--ref", "x"],
+            "--ref",
+        ),
+        (
+            vec!["graft", "patch", "materialize", "patch:abc", "--discard"],
+            "--discard",
+        ),
+        (
+            vec!["graft", "patch", "materialize", "patch:abc", "--as-commit"],
+            "--as-commit",
+        ),
+        (
+            vec!["graft", "patch", "materialize", "patch:abc", "--ref", "x"],
+            "--ref",
+        ),
+    ] {
+        let error = Cli::try_parse_from(args).unwrap_err().to_string();
+        assert!(error.contains(flag), "{error}");
+    }
 }
 
 #[test]
@@ -3104,9 +3279,6 @@ fn materialize_writes_isolated_worktree_without_touching_cwd() {
         command: Command::Materialize {
             id: patch.id.to_string(),
             dry_run: false,
-            discard: false,
-            as_commit: false,
-            ref_name: None,
         },
         json: false,
         cwd: cwd.clone(),
@@ -3203,9 +3375,6 @@ fn show_validate_and_materialize_surface_application_integrity_failures() {
             command: Command::Materialize {
                 id: patch.id.to_string(),
                 dry_run: true,
-                discard: false,
-                as_commit: false,
-                ref_name: None,
             },
             json: false,
             cwd: cwd.clone(),
@@ -3220,64 +3389,6 @@ fn show_validate_and_materialize_surface_application_integrity_failures() {
         materialize_error.contains("action id"),
         "{materialize_error}"
     );
-
-    let _ = fs::remove_dir_all(&cwd);
-    let _ = fs::remove_dir_all(&home);
-}
-
-#[test]
-fn materialize_rejects_as_commit() {
-    let _lock = env_lock();
-    let cwd = test_workspace("graft-cli-materialize-commit-test");
-    let home = test_workspace("graft-cli-materialize-commit-home");
-    fs::create_dir_all(&cwd).unwrap();
-    fs::create_dir_all(&home).unwrap();
-    let _guard = EnvGuard::set("GRAFT_HOME", &home);
-    let store = GraftStore::open(&cwd);
-    run_init_command(&store, false).unwrap();
-    write_constraint_lock(&store, &std::collections::BTreeMap::new()).unwrap();
-
-    let base_snapshot = TreeSnapshot::new(Vec::new());
-    let target_blob = store.write_blob(b"detached\n").unwrap();
-    let target_snapshot = TreeSnapshot::new(vec![TreeEntry {
-        path: "detached.txt".to_string(),
-        hash: target_blob.clone(),
-        size: 9,
-    }]);
-    let (base_tree_id, _) = store.write_tree_snapshot(&base_snapshot).unwrap();
-    let (_target_tree_id, _) = store.write_tree_snapshot(&target_snapshot).unwrap();
-    let application = write_test_application_from_trees(
-        &store,
-        StateId::GraftTree(base_tree_id.clone()),
-        &base_snapshot,
-        &target_snapshot,
-    );
-    let patch = PatchRecord {
-        id: graft_core::PatchId::new("patch:materialize-commit-test"),
-        application,
-        constraint: Constraint::Top,
-        provenance: Provenance::now("test", None),
-        admission: empty_admission(),
-    };
-    store.write_patch(&patch).unwrap();
-
-    let message = error_chain_text(
-        run_local(&Cli {
-            command: Command::Materialize {
-                id: patch.id.to_string(),
-                dry_run: false,
-                discard: false,
-                as_commit: true,
-                ref_name: None,
-            },
-            json: false,
-            cwd: cwd.clone(),
-        })
-        .unwrap_err(),
-    );
-
-    assert!(message.contains("[E_MATERIALIZE_STATE_ONLY]"), "{message}");
-    assert!(!cwd.join(".git/refs/graft").exists());
 
     let _ = fs::remove_dir_all(&cwd);
     let _ = fs::remove_dir_all(&home);

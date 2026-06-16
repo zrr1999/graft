@@ -1,5 +1,5 @@
 use super::*;
-use graft_core::{FileChangeKind, PlanId, TreeEntry, TreeSnapshot};
+use graft_core::{Constraint, FileChangeKind, PlanId, TreeEntry, TreeSnapshot};
 
 fn temp_dir(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("graft-scratch-{name}-{}", std::process::id()));
@@ -260,7 +260,7 @@ fn candidate_from_scratch_allows_empty_diff() {
         )
         .unwrap();
     let result = engine
-        .candidate_from_scratch(&write.scratch, Vec::new(), "test", None)
+        .candidate_from_scratch(&write.scratch, Constraint::Top, "test", None)
         .unwrap();
 
     assert!(result.changed_paths.is_empty());
@@ -396,10 +396,14 @@ fn candidate_from_scratch_writes_candidate_change_and_empty_evidence_index() {
         .write(&modified.scratch, "src/main.rs", b"fn main() {}\n")
         .unwrap();
     let deleted = engine.delete(&added.scratch, "README.md").unwrap();
+    let review_constraint = Constraint::any_of(vec![
+        Constraint::primitive(PlanId::new("plan:fast-review")),
+        Constraint::primitive(PlanId::new("plan:slow-review")),
+    ]);
     let result = engine
         .candidate_from_scratch(
             &deleted.scratch,
-            vec![PlanId::new("plan:review-policy")],
+            review_constraint.clone(),
             "test",
             Some("demo".to_string()),
         )
@@ -420,10 +424,7 @@ fn candidate_from_scratch_writes_candidate_change_and_empty_evidence_index() {
         .store
         .read_candidate(result.candidate.as_str())
         .unwrap();
-    assert_eq!(
-        candidate.constraint,
-        Constraint::primitive(PlanId::new("plan:review-policy"))
-    );
+    assert_eq!(candidate.constraint, review_constraint);
     let resolved = engine
         .store
         .resolve_application(&candidate.application)

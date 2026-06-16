@@ -274,7 +274,7 @@ impl ScratchEngine {
     pub fn candidate_from_scratch(
         &self,
         scratch: &ScratchId,
-        constraint_primitives: Vec<PlanId>,
+        constraint: Constraint,
         producer: impl Into<String>,
         message: Option<String>,
     ) -> Result<CandidateFromScratch> {
@@ -297,12 +297,7 @@ impl ScratchEngine {
         let mut candidate = GraftCandidate {
             id: graft_core::CandidateId::new("candidate:pending"),
             application,
-            constraint: Constraint::all_of(
-                constraint_primitives
-                    .into_iter()
-                    .map(|plan| Constraint::Primitive { plan })
-                    .collect::<Vec<_>>(),
-            ),
+            constraint,
             provenance: graft_core::Provenance::now(producer, message),
         };
         candidate.id = candidate_id(&candidate)?;
@@ -314,17 +309,6 @@ impl ScratchEngine {
             candidate: candidate.id,
             changed_paths,
         })
-    }
-
-    #[deprecated(note = "use candidate_from_scratch")]
-    pub fn promote(
-        &self,
-        scratch: &ScratchId,
-        constraint_primitives: Vec<PlanId>,
-        producer: impl Into<String>,
-        message: Option<String>,
-    ) -> Result<CandidateFromScratch> {
-        self.candidate_from_scratch(scratch, constraint_primitives, producer, message)
     }
 
     pub fn store(&self) -> &GraftStore {

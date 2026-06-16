@@ -89,6 +89,7 @@ fn result_to_envelope(result: Value) -> Result<CommandEnvelope> {
     require_string_array_field(&result, "candidate_from_scratch", "changed_paths")?;
     Ok(CommandEnvelope {
         message: Some(render_json_result(&result)?),
+        result: Some(result.clone()),
         candidate_id: Some(candidate_id),
         cache_changed: true,
         registry_changed: false,
@@ -111,6 +112,11 @@ mod tests {
         }))
         .unwrap();
 
+        assert_eq!(
+            envelope.result.as_ref().unwrap()["candidate"],
+            "candidate:def"
+        );
+        assert_eq!(envelope.result.as_ref().unwrap()["scratch"], "scratch:abc");
         assert_eq!(envelope.candidate_id.as_deref(), Some("candidate:def"));
         assert!(envelope.cache_changed);
     }

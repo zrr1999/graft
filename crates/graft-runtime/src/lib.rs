@@ -41,9 +41,11 @@ use daemon_wire::{
 #[cfg(test)]
 use explain_catalog::promote_requirement_explain_line;
 use explain_catalog::{build_concept_catalog, plan_labels_or_core_only};
+#[cfg(test)]
+use graft_core::PlanId;
 use graft_core::{
-    AdmissionSummary, ApplicationRef, Change, EvidenceRecord, EvidenceResult, FileChangeKind,
-    GraftCandidate, PatchRecord, PatchRelation, PatchRelationKind, PlanId, PromotionRecord,
+    AdmissionSummary, ApplicationRef, Change, Constraint, EvidenceRecord, EvidenceResult,
+    FileChangeKind, GraftCandidate, PatchRecord, PatchRelation, PatchRelationKind, PromotionRecord,
     Provenance, StateId, TreeEntry, TreeSnapshot, application_from_change, candidate_id, patch_id,
     promotion_id, relation_id,
 };
@@ -73,9 +75,9 @@ use promotion::{
 use registry::{RegistryCommand, run_registry_command};
 use repo::{RepoCommand, base_snapshot_for_state, resolve_base_state, run_repo_command};
 use requirements::{
-    admission_required_constraint, constraint_from_plans, constraint_matches_request,
-    constraint_primitives, needs_revalidation_or, plan_label,
-    promotion_requirement_plan_with_target, validation_constraint_with_base,
+    admission_required_constraint, candidate_constraint_requirement, constraint_matches_request,
+    constraint_primitives, plan_label, promotion_requirement_plan_with_target,
+    validation_constraint_with_base,
 };
 use routing::{
     DaemonCliExecRouter, PatchCommandRoute, TopLevelRoute, command_is_gc,
@@ -390,24 +392,6 @@ enum Command {
             help = "Plan the materialization but do not write the inspection state or Git objects"
         )]
         dry_run: bool,
-        #[arg(
-            long,
-            hide = true,
-            help = "Accepted for compatibility; materialize no longer writes cwd"
-        )]
-        discard: bool,
-        #[arg(
-            long,
-            hide = true,
-            help = "Unsupported; materialize only writes inspection states"
-        )]
-        as_commit: bool,
-        #[arg(
-            long = "ref",
-            hide = true,
-            help = "Unsupported; promote writes Git refs"
-        )]
-        ref_name: Option<String>,
     },
     /// Promote an admitted patch target state to a Git branch, PR or release
     #[command(hide = true)]
@@ -677,24 +661,6 @@ enum PatchCommand {
             help = "Plan the materialization but do not write the inspection state"
         )]
         dry_run: bool,
-        #[arg(
-            long,
-            hide = true,
-            help = "Accepted for compatibility; materialize no longer writes cwd"
-        )]
-        discard: bool,
-        #[arg(
-            long,
-            hide = true,
-            help = "Unsupported; materialize only writes inspection states"
-        )]
-        as_commit: bool,
-        #[arg(
-            long = "ref",
-            hide = true,
-            help = "Unsupported; promote writes Git refs"
-        )]
-        ref_name: Option<String>,
     },
     /// Promote a patch to a Git branch, PR or release; the only command that mutates Git refs
     Promote {
@@ -807,12 +773,12 @@ pub fn run_daemon_argv_to_value_for_workspace(
     )?)?)
 }
 
-pub fn resolve_candidate_constraint_primitives(
+pub fn resolve_candidate_constraint_requirement(
     store: &GraftStore,
     names: &[String],
-) -> Result<Vec<PlanId>> {
+) -> Result<Constraint> {
     let config = load_graft_config(store)?;
-    needs_revalidation_or(&config, names)
+    candidate_constraint_requirement(&config, names)
 }
 
 pub fn workspace_attach_to_value(
@@ -1301,7 +1267,7 @@ impl LocalCommandRouter<'_> {
                 let (candidate, evidence) = write_candidate_from_change(
                     store,
                     change,
-                    needs_revalidation_or(&config, constraint_primitives)?,
+                    candidate_constraint_requirement(&config, constraint_primitives)?,
                     "composer",
                     Some(format!("compose {first} {second}")),
                     *validate,
@@ -1351,7 +1317,7 @@ impl LocalCommandRouter<'_> {
                 let (candidate, evidence) = write_candidate_from_change(
                     store,
                     migrated,
-                    needs_revalidation_or(&config, constraint_primitives)?,
+                    candidate_constraint_requirement(&config, constraint_primitives)?,
                     "migrator",
                     Some(format!("migrate {id} onto {onto}")),
                     *validate,
@@ -1384,7 +1350,7 @@ impl LocalCommandRouter<'_> {
                 let (candidate, evidence) = write_candidate_from_change(
                     store,
                     change,
-                    needs_revalidation_or(&config, constraint_primitives)?,
+                    candidate_constraint_requirement(&config, constraint_primitives)?,
                     "reverter",
                     Some(format!("revert {id}")),
                     *validate,
@@ -1402,18 +1368,7 @@ impl LocalCommandRouter<'_> {
                     "created revert candidate",
                 )?)
             }
-            Command::Materialize {
-                id,
-                dry_run,
-                discard: _,
-                as_commit,
-                ref_name,
-            } => {
-                if *as_commit || ref_name.is_some() {
-                    bail!(
-                        "[E_MATERIALIZE_STATE_ONLY] graft patch materialize only writes an isolated inspection state under .worktrees/; use `graft patch promote` for Git refs, branches, PRs, or releases"
-                    );
-                }
+            Command::Materialize { id, dry_run } => {
                 let config = load_graft_config(store)?;
                 materialize_state(store, &config, id, *dry_run)
             }
@@ -1984,7 +1939,7 @@ fn ensure_candidate_constraint_current(
 fn write_candidate_from_change(
     store: &GraftStore,
     change: Change,
-    constraint_primitives: Vec<PlanId>,
+    constraint: Constraint,
     producer: &str,
     message: Option<String>,
     validate: bool,
@@ -1995,7 +1950,7 @@ fn write_candidate_from_change(
     let mut candidate = GraftCandidate {
         id: graft_core::CandidateId::new("candidate:pending"),
         application,
-        constraint: constraint_from_plans(&constraint_primitives),
+        constraint,
         provenance: Provenance::now(producer, message),
     };
     candidate.id = candidate_id(&candidate)?;

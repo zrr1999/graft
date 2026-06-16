@@ -1,21 +1,19 @@
-# Default workspace template
+# 默认工作区模板
 
-The minimal layout `graft init` produces:
+`graft init` 生成的最小布局：
 
 ```text
-graft.toml          # workspace config (admission, promotion, sync)
-graft.lock          # constraint/repo resolution lock (commit this)
-constraints.roto     # constraint source (empty by default)
-.gitignore          # ignores only local Graft state
+graft.toml          # 工作区配置（admission、promotion、sync）
+graft.lock          # constraint/repo 解析锁（应提交）
+constraints.roto     # 约束源文件（默认空）
+.gitignore          # 只忽略本地 Graft 状态
 ```
 
-This template is what a fresh workspace looks like before any policy is
-declared. It is gated only by Graft's application core integrity invariant
-(`apply(action, base, proof) == target` and `replay(base, change.ops) == target`).
+该模板表示声明任何策略前的新工作区形态。它只受 Graft application core integrity 不变量约束：`apply(action, base, proof) == target` 且 `replay(base, change.ops) == target`。
 
-## Adding a constraint
+## 添加约束
 
-1. Add a function to `constraints.roto`:
+1. 在 `constraints.roto` 中添加函数：
 
    ```roto
    fn empty_change(app: Application) -> Constraint {
@@ -23,18 +21,17 @@ declared. It is gated only by Graft's application core integrity invariant
    }
    ```
 
-2. Reference it in `graft.toml`:
+2. 在 `graft.toml` 中引用它：
 
    ```toml
    admission.required = ["empty_change"]
    ```
 
-3. Refresh the lock and re-run admission:
+3. 刷新 lock 并重新运行 admission：
 
    ```sh
    graft constraint lock
    graft patch validate <candidate>
    ```
 
-See `examples/constraints/` for idiomatic single-pattern files and
-`examples/full/` for a fully wired workspace.
+`examples/constraints/` 提供可复用的单模式约束示例。

@@ -3,6 +3,7 @@ use std::fmt::Display;
 use graft_core::EvidenceRecord;
 use graft_explain::NextAction;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// Structured command result shared by local handlers, daemon cli_exec, JSON output,
 /// and human rendering. Handlers should prefer typed fields (including `view` for
@@ -19,6 +20,8 @@ pub(crate) struct CommandEnvelope {
     pub(crate) status: String,
     pub(crate) message: Option<String>,
     pub(crate) view: Option<CommandView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) result: Option<Value>,
     pub(crate) candidate_id: Option<String>,
     pub(crate) patch_id: Option<String>,
     pub(crate) evidence_ids: Vec<String>,
@@ -40,6 +43,7 @@ impl CommandEnvelope {
             status: "ok".to_string(),
             message: None,
             view: None,
+            result: None,
             candidate_id: None,
             patch_id: None,
             evidence_ids: Vec::new(),

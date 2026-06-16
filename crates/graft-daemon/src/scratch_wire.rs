@@ -1,20 +1,18 @@
-//! Wire-level scratch operation handlers.
+//! Daemon wire-level scratch operation handlers.
 //!
 //! This module is the boundary between daemon routing and the in-memory scratch
-//! state machine. The daemon validates/routs workspace identity, then delegates
-//! scratch parameter interpretation, state transitions, success payloads, and
-//! scratch error mapping here.
+//! state machine. `graft-scratch` owns scratch state transitions; the daemon owns
+//! JSON parameter interpretation, success payloads, and wire error mapping.
 
 use graft_client::WireResponse;
 use graft_core::{BaseRefSpec, HashlineEdit, ScratchId, StateId};
+use graft_scratch::{ReadMode, ScratchEngine, ScratchError};
 use graft_store::VirtualBaseRef;
 use serde_json::{Value, json};
 
-use crate::{ReadMode, ScratchEngine, ScratchError};
+use crate::{HandlerResult, WithId, bad_field_type, bad_params, missing_field};
 
-type HandlerResult<T> = std::result::Result<T, Box<WireResponse>>;
-
-pub fn scratch_open_response(
+pub(crate) fn scratch_open_response(
     engine: &ScratchEngine,
     id: String,
     params: &Value,
@@ -28,7 +26,7 @@ pub fn scratch_open_response(
     }
 }
 
-pub fn scratch_read_response(
+pub(crate) fn scratch_read_response(
     engine: &ScratchEngine,
     id: String,
     params: &Value,
@@ -62,7 +60,7 @@ pub fn scratch_read_response(
     }
 }
 
-pub fn scratch_write_response(
+pub(crate) fn scratch_write_response(
     engine: &ScratchEngine,
     id: String,
     params: &Value,
@@ -96,7 +94,7 @@ pub fn scratch_write_response(
     }
 }
 
-pub fn scratch_delete_response(
+pub(crate) fn scratch_delete_response(
     engine: &ScratchEngine,
     id: String,
     params: &Value,
@@ -125,7 +123,7 @@ pub fn scratch_delete_response(
     }
 }
 
-pub fn scratch_edit_response(
+pub(crate) fn scratch_edit_response(
     engine: &ScratchEngine,
     id: String,
     params: &Value,
@@ -162,7 +160,7 @@ pub fn scratch_edit_response(
     }
 }
 
-pub fn scratch_capture_response(
+pub(crate) fn scratch_capture_response(
     engine: &ScratchEngine,
     id: String,
     params: &Value,
@@ -194,7 +192,7 @@ pub fn scratch_capture_response(
     }
 }
 
-pub fn scratch_diff_response(
+pub(crate) fn scratch_diff_response(
     engine: &ScratchEngine,
     id: String,
     params: &Value,
@@ -216,7 +214,7 @@ pub fn scratch_diff_response(
     }
 }
 
-pub fn scratch_drop_response(
+pub(crate) fn scratch_drop_response(
     engine: &ScratchEngine,
     id: String,
     params: &Value,
@@ -233,7 +231,7 @@ pub fn scratch_drop_response(
     }
 }
 
-pub fn scratch_pin_response(
+pub(crate) fn scratch_pin_response(
     engine: &ScratchEngine,
     id: String,
     params: &Value,
@@ -253,7 +251,7 @@ pub fn scratch_pin_response(
     }
 }
 
-pub fn scratch_unpin_response(
+pub(crate) fn scratch_unpin_response(
     engine: &ScratchEngine,
     id: String,
     params: &Value,
@@ -273,7 +271,7 @@ pub fn scratch_unpin_response(
     }
 }
 
-pub fn scratch_error_response(id: String, error: ScratchError) -> (WireResponse, bool) {
+pub(crate) fn scratch_error_response(id: String, error: ScratchError) -> (WireResponse, bool) {
     let response = match error {
         ScratchError::UnknownScratch(scratch) => WireResponse::error(
             id,
@@ -380,7 +378,7 @@ fn materialized_base(params: &Value) -> HandlerResult<Option<(StateId, String)>>
 fn resolve_scratch_source(
     engine: &ScratchEngine,
     source: ScratchSourceParam,
-) -> crate::Result<ScratchId> {
+) -> graft_scratch::Result<ScratchId> {
     match source {
         ScratchSourceParam::Base(base) => engine.open(base),
         ScratchSourceParam::Materialized {
@@ -447,147 +445,4 @@ fn optional_str<'a>(params: &'a Value, field: &str) -> HandlerResult<Option<&'a 
 fn required_state_id(params: &Value, field: &str) -> HandlerResult<StateId> {
     let value = params.get(field).ok_or_else(|| missing_field(field))?;
     serde_json::from_value::<StateId>(value.clone()).map_err(bad_params)
-}
-
-fn missing_field(field: &str) -> Box<WireResponse> {
-    Box::new(WireResponse::error(
-        "",
-        "E_MISSING_FIELD",
-        format!("missing field {field}"),
-    ))
-}
-
-fn bad_params(error: serde_json::Error) -> Box<WireResponse> {
-    Box::new(WireResponse::error("", "E_BAD_PARAMS", error.to_string()))
-}
-
-fn bad_field_type(field: &str, expected: &str) -> Box<WireResponse> {
-    Box::new(WireResponse::error(
-        "",
-        "E_BAD_PARAMS",
-        format!("field {field} must be {expected}"),
-    ))
-}
-
-trait WithId {
-    fn with_id(self, id: String) -> WireResponse;
-}
-
-impl WithId for Box<WireResponse> {
-    fn with_id(mut self, id: String) -> WireResponse {
-        self.id = id;
-        *self
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use graft_core::{TreeEntry, TreeSnapshot};
-    use graft_store::GraftStore;
-
-    fn seeded_engine(name: &str) -> (std::path::PathBuf, ScratchEngine, String) {
-        let dir =
-            std::env::temp_dir().join(format!("graft-scratch-wire-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let store = GraftStore::open(&dir);
-        store.init().unwrap();
-        let hash = store.write_blob(b"hello\n").unwrap();
-        let snapshot = TreeSnapshot::new(vec![TreeEntry {
-            path: "hello.txt".to_string(),
-            hash,
-            size: 6,
-        }]);
-        let (tree_id, _) = store.write_tree_snapshot(&snapshot).unwrap();
-        (dir, ScratchEngine::new(store), tree_id)
-    }
-
-    #[test]
-    fn wire_source_params_reject_missing_and_ambiguous_sources() {
-        let (dir, engine, tree_id) = seeded_engine("source_params");
-
-        let (missing, _) = scratch_read_response(
-            &engine,
-            "missing-source".to_string(),
-            &json!({"path":"hello.txt"}),
-        );
-        assert!(!missing.ok);
-        assert_eq!(missing.error.unwrap().code, "E_MISSING_FIELD");
-
-        let (ambiguous, _) = scratch_read_response(
-            &engine,
-            "ambiguous-source".to_string(),
-            &json!({"base": tree_id, "from":"scratch:deadbeef", "path":"hello.txt"}),
-        );
-        assert!(!ambiguous.ok);
-        assert_eq!(ambiguous.error.unwrap().code, "E_BAD_PARAMS");
-
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn wire_read_rejects_non_string_mode_instead_of_defaulting() {
-        let (dir, engine, tree_id) = seeded_engine("bad_read_mode_type");
-
-        let (response, _) = scratch_read_response(
-            &engine,
-            "read".to_string(),
-            &json!({"base": tree_id, "path":"hello.txt", "mode": true}),
-        );
-
-        assert!(!response.ok);
-        let error = response.error.unwrap();
-        assert_eq!(error.code, "E_BAD_PARAMS");
-        assert_eq!(error.message, "field mode must be string");
-
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn wire_maps_lost_scratch_to_retry_from_base_error() {
-        let (dir, engine, tree_id) = seeded_engine("lost_scratch");
-        let root = engine.open(VirtualBaseRef::Tree(tree_id)).unwrap();
-        let restarted = ScratchEngine::new(GraftStore::open(&dir));
-
-        let (response, _) = scratch_read_response(
-            &restarted,
-            "lost".to_string(),
-            &json!({"from": root, "path":"hello.txt", "mode":"text"}),
-        );
-
-        assert!(!response.ok);
-        let error = response.error.unwrap();
-        assert_eq!(error.code, "E_SCRATCH_LOST");
-        assert!(error.message.contains("retry from --base"));
-
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn wire_maps_stale_anchor_to_structured_retry_error() {
-        let (dir, engine, tree_id) = seeded_engine("stale_anchor");
-        let scratch = engine.open(VirtualBaseRef::Tree(tree_id)).unwrap();
-
-        let (response, _) = scratch_edit_response(
-            &engine,
-            "edit".to_string(),
-            &json!({
-                "from": scratch,
-                "path":"hello.txt",
-                "edits":[{"kind":"replace_line","line":1,"hash":"ZZ","old":"hello","new":"hi"}]
-            }),
-        );
-
-        assert!(!response.ok);
-        let error = response.error.unwrap();
-        assert_eq!(error.code, "E_STALE_ANCHOR");
-        assert!(
-            error.retry.unwrap()["fresh_anchors"]
-                .as_str()
-                .unwrap()
-                .contains(">>>")
-        );
-
-        let _ = std::fs::remove_dir_all(dir);
-    }
 }

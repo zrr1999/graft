@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use graft_core::{
     ApplicationEndpoint, ApplicationPlan, ApplicationRef, Assertion, Change, EvidenceRecord,
     EvidenceResult, FileChange, FileChangeKind, FileRefPlan, GraftCandidate, HistorySelector,
-    Observation, OverlayPlan, PatchRecord, Plan, PlanId, RunPlan, RunSelectorPlan, StateId,
+    ObservationPlan, OverlayPlan, PatchRecord, Plan, PlanId, RunPlan, RunSelectorPlan, StateId,
     TreeEntry, TreePlan, TreeSnapshot, stable_typed_id,
 };
 use graft_store::GraftStore;
@@ -159,7 +159,7 @@ fn evaluate_plan(
     memo: &mut ValidationMemo,
 ) -> EvidenceResult {
     match (&plan.observation, &plan.assertion) {
-        (Observation::ChangedPaths { patterns }, Assertion::PathsAnyMatch) => {
+        (ObservationPlan::ChangedPaths { patterns }, Assertion::PathsAnyMatch) => {
             if changed_paths_match_any(&target.subject.changed_paths, patterns) {
                 EvidenceResult::Passed
             } else {
@@ -168,7 +168,7 @@ fn evaluate_plan(
                 }
             }
         }
-        (Observation::ChangedPaths { patterns }, Assertion::PathsAllMatch) => {
+        (ObservationPlan::ChangedPaths { patterns }, Assertion::PathsAllMatch) => {
             if changed_paths_all_match(&target.subject.changed_paths, patterns) {
                 EvidenceResult::Passed
             } else {
@@ -177,7 +177,7 @@ fn evaluate_plan(
                 }
             }
         }
-        (Observation::ChangedPaths { patterns }, Assertion::PathsNoMatch) => {
+        (ObservationPlan::ChangedPaths { patterns }, Assertion::PathsNoMatch) => {
             if changed_paths_match_any(&target.subject.changed_paths, patterns) {
                 EvidenceResult::Failed {
                     reason: "at least one changed path matched a forbidden pattern".to_string(),
@@ -186,7 +186,7 @@ fn evaluate_plan(
                 EvidenceResult::Passed
             }
         }
-        (Observation::ChangedPaths { patterns }, Assertion::PathsNotAllMatch) => {
+        (ObservationPlan::ChangedPaths { patterns }, Assertion::PathsNotAllMatch) => {
             if changed_paths_all_match(&target.subject.changed_paths, patterns) {
                 EvidenceResult::Failed {
                     reason: "all changed paths matched the patterns".to_string(),
@@ -195,7 +195,7 @@ fn evaluate_plan(
                 EvidenceResult::Passed
             }
         }
-        (Observation::Run { run }, Assertion::ExitCodeIs { code }) => {
+        (ObservationPlan::Run { run }, Assertion::ExitCodeIs { code }) => {
             match execute_run_plan(store, config, target, plan_id, run, memo) {
                 Ok(run) if run.output.status.code() == Some(*code) => EvidenceResult::Passed,
                 Ok(run) => EvidenceResult::Failed {
@@ -207,7 +207,7 @@ fn evaluate_plan(
                 Err(reason) => EvidenceResult::Unknown { reason },
             }
         }
-        (Observation::Run { run }, Assertion::ExitCodeIsNot { code }) => {
+        (ObservationPlan::Run { run }, Assertion::ExitCodeIsNot { code }) => {
             match execute_run_plan(store, config, target, plan_id, run, memo) {
                 Ok(run) if run.output.status.code() != Some(*code) => EvidenceResult::Passed,
                 Ok(run) => EvidenceResult::Failed {
@@ -220,7 +220,7 @@ fn evaluate_plan(
             }
         }
         (
-            Observation::SameOutput {
+            ObservationPlan::SameOutput {
                 left,
                 right,
                 selectors,
@@ -247,7 +247,7 @@ fn evaluate_plan(
             }
         }
         (
-            Observation::SameOutput {
+            ObservationPlan::SameOutput {
                 left,
                 right,
                 selectors,
@@ -273,9 +273,11 @@ fn evaluate_plan(
                 SameOutputEvaluation::Error(reason) => EvidenceResult::Unknown { reason },
             }
         }
-        (Observation::Unavailable { reason }, Assertion::Unavailable) => EvidenceResult::Unknown {
-            reason: reason.clone(),
-        },
+        (ObservationPlan::Unavailable { reason }, Assertion::Unavailable) => {
+            EvidenceResult::Unknown {
+                reason: reason.clone(),
+            }
+        }
         _ => EvidenceResult::Unknown {
             reason: format!(
                 "observation {:?} cannot satisfy assertion {:?}",
@@ -1029,7 +1031,7 @@ fn snapshot_mismatch_reason(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use graft_core::{Assertion, Observation};
+    use graft_core::{Assertion, ObservationPlan};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_store(name: &str) -> (PathBuf, GraftStore) {
@@ -1072,7 +1074,7 @@ mod tests {
         let mut memo = ValidationMemo::default();
 
         let (config, plan_id) = config_with_plan(Plan {
-            observation: Observation::ChangedPaths {
+            observation: ObservationPlan::ChangedPaths {
                 patterns: vec!["src/**".to_string()],
             },
             assertion: Assertion::PathsAnyMatch,
@@ -1082,7 +1084,7 @@ mod tests {
         assert_eq!(records[0].result, EvidenceResult::Passed);
 
         let (config, plan_id) = config_with_plan(Plan {
-            observation: Observation::ChangedPaths {
+            observation: ObservationPlan::ChangedPaths {
                 patterns: vec!["target/**".to_string()],
             },
             assertion: Assertion::PathsNoMatch,
@@ -1105,7 +1107,7 @@ mod tests {
         let (dir, store) = temp_store("run-plan");
         let target = target_with_paths(&[]);
         let (config, plan_id) = config_with_plan(Plan {
-            observation: Observation::Run {
+            observation: ObservationPlan::Run {
                 run: RunPlan {
                     argv: vec![
                         "/bin/sh".to_string(),
@@ -1154,11 +1156,11 @@ mod tests {
             },
         };
         let first = Plan {
-            observation: Observation::Run { run: run.clone() },
+            observation: ObservationPlan::Run { run: run.clone() },
             assertion: Assertion::ExitCodeIs { code: 0 },
         };
         let second = Plan {
-            observation: Observation::Run { run },
+            observation: ObservationPlan::Run { run },
             assertion: Assertion::ExitCodeIsNot { code: 7 },
         };
         let first_id = first.plan_id().unwrap();

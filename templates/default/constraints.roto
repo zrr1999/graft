@@ -9,5 +9,4 @@
 // workspace gated only by application core integrity:
 // `apply(action, base, proof) == target` and
 // `replay(base, change.ops) == target`.
-// See `examples/constraints/` and `examples/full/constraints.roto` for
-// idiomatic patterns.
+// See `examples/constraints/` for idiomatic patterns.

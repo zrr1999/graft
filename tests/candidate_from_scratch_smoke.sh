@@ -73,7 +73,7 @@ admit_out=$("$GRAFT" patch admit "$candidate")
 patch=$(first_graft_id patch "$admit_out")
 [[ -n $patch ]] || { echo "FAIL: admit did not return patch id"; echo "$admit_out"; exit 1; }
 
-materialize_out=$("$GRAFT" patch materialize "$patch" --dry-run --discard)
+materialize_out=$("$GRAFT" patch materialize "$patch" --dry-run)
 grep -q 'materialization dry-run' <<<"$materialize_out" || { echo "FAIL: materialize dry-run did not report plan"; echo "$materialize_out"; exit 1; }
 materialized_path=$(extract_materialize_path <<<"$materialize_out")
 [[ -n $materialized_path ]] || { echo "FAIL: materialize dry-run did not report output path"; echo "$materialize_out"; exit 1; }

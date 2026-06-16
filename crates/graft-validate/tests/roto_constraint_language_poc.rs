@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use graft_core::{
     ApplicationEndpoint, ApplicationPlan, Assertion, Constraint, FileRefPlan, HistorySelector,
-    Observation, OverlayPlan, Plan, PlanId, RunPlan, RunSelectorPlan, TreePlan,
+    ObservationPlan, OverlayPlan, Plan, PlanId, RunPlan, RunSelectorPlan, TreePlan,
 };
 use roto::{List, NoCtx, RotoString, Runtime, Val, library};
 
@@ -19,7 +19,7 @@ struct ConstraintValue {
 }
 
 impl ConstraintValue {
-    fn primitive(observation: Observation, assertion: Assertion) -> Self {
+    fn primitive(observation: ObservationPlan, assertion: Assertion) -> Self {
         let plan = Plan {
             observation,
             assertion,
@@ -68,7 +68,7 @@ fn runtime() -> Runtime<NoCtx> {
     Runtime::from_lib(library! {
         #[clone] type Application = Val<Application>;
         #[clone] type Constraint = Val<ConstraintValue>;
-        #[clone] type Observation = Val<Observation>;
+        #[clone] type Observation = Val<ObservationPlan>;
         #[clone] type Assertion = Val<Assertion>;
         #[clone] type Tree = Val<TreePlan>;
         #[clone] type Run = Val<RunPlan>;
@@ -113,14 +113,14 @@ fn runtime() -> Runtime<NoCtx> {
                 })
             }
 
-            fn changed_paths(_app: Val<Application>, patterns: List<RotoString>) -> Val<Observation> {
-                Val(Observation::ChangedPaths {
+            fn changed_paths(_app: Val<Application>, patterns: List<RotoString>) -> Val<ObservationPlan> {
+                Val(ObservationPlan::ChangedPaths {
                     patterns: strings(patterns),
                 })
             }
 
-            fn run(app: Val<Application>, argv: List<RotoString>) -> Val<Observation> {
-                Val(Observation::Run {
+            fn run(app: Val<Application>, argv: List<RotoString>) -> Val<ObservationPlan> {
+                Val(ObservationPlan::Run {
                     run: RunPlan {
                         argv: strings(argv),
                         tree: TreePlan::Application {
@@ -167,16 +167,16 @@ fn runtime() -> Runtime<NoCtx> {
             })
         }
 
-        fn observe_run(run: Val<RunPlan>) -> Val<Observation> {
-            Val(Observation::Run { run: run.0 })
+        fn observe_run(run: Val<RunPlan>) -> Val<ObservationPlan> {
+            Val(ObservationPlan::Run { run: run.0 })
         }
 
         fn same_output(
             left: Val<RunPlan>,
             right: Val<RunPlan>,
             selectors: List<Val<RunSelectorPlan>>,
-        ) -> Val<Observation> {
-            Val(Observation::SameOutput {
+        ) -> Val<ObservationPlan> {
+            Val(ObservationPlan::SameOutput {
                 left: left.0,
                 right: right.0,
                 selectors: collect_selectors(selectors),
@@ -197,7 +197,7 @@ fn runtime() -> Runtime<NoCtx> {
         }
 
         fn primitive(
-            observation: Val<Observation>,
+            observation: Val<ObservationPlan>,
             assertion: Val<Assertion>,
             _description: RotoString,
         ) -> Val<ConstraintValue> {
@@ -252,7 +252,7 @@ fn roto_constraint_functions_return_primitive_plan_leaves() {
     let plan = no_generated.plans.values().next().unwrap();
     assert_eq!(
         plan.observation,
-        Observation::ChangedPaths {
+        ObservationPlan::ChangedPaths {
             patterns: vec![
                 "target/**".to_string(),
                 "dist/**".to_string(),
@@ -269,7 +269,7 @@ fn roto_constraint_functions_return_primitive_plan_leaves() {
         .0;
     let plan = cargo_tests.plans.values().next().unwrap();
     assert_eq!(plan.assertion, Assertion::ExitCodeIs { code: 0 });
-    assert!(matches!(plan.observation, Observation::Run { .. }));
+    assert!(matches!(plan.observation, ObservationPlan::Run { .. }));
 }
 
 #[test]
@@ -306,7 +306,7 @@ fn roto_relational_and_historical_plans_are_symbolic() {
     assert_eq!(plan.assertion, Assertion::OutputsSame);
     assert!(matches!(
         plan.observation,
-        Observation::SameOutput { ref selectors, .. } if selectors == &vec![
+        ObservationPlan::SameOutput { ref selectors, .. } if selectors == &vec![
             RunSelectorPlan::PostFile { path: "./alignment/expected.json".to_string() },
             RunSelectorPlan::Stdout,
         ]
@@ -321,7 +321,7 @@ fn roto_relational_and_historical_plans_are_symbolic() {
     assert!(matches!(training.body, Constraint::Both { .. }));
     assert!(training.plans.values().any(|plan| matches!(
         plan.observation,
-        Observation::Run {
+        ObservationPlan::Run {
             run: RunPlan {
                 tree: TreePlan::WithOverlay { .. },
                 ..
@@ -331,7 +331,7 @@ fn roto_relational_and_historical_plans_are_symbolic() {
     assert!(training.plans.values().any(|plan| {
         matches!(
             plan.observation,
-            Observation::Run {
+            ObservationPlan::Run {
                 run: RunPlan {
                     tree: TreePlan::WithOverlay { ref base, .. },
                     ..

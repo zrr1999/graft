@@ -5,14 +5,15 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use graft_core::{
     ApplicationEndpoint, ApplicationPlan, Assertion, Constraint, ConstraintDef, FileRefPlan,
-    HistorySelector, Observation, OverlayPlan, Plan, PlanId, RunPlan, RunSelectorPlan, TreePlan,
+    HistorySelector, ObservationPlan, OverlayPlan, Plan, PlanId, RunPlan, RunSelectorPlan,
+    TreePlan,
 };
 use roto::{List, NoCtx, RotoString, Runtime, Val, library};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Application {
     plan: ApplicationPlan,
-    // Roto 0.11 custom-value interop is unsafe for zero-sized host values.
+    // Roto 0.11 的 custom-value 互操作不适用于零大小宿主值。
     _non_zero: u8,
 }
 
@@ -141,7 +142,7 @@ fn collect_overlays(list: List<Val<OverlayPlan>>) -> Vec<OverlayPlan> {
 }
 
 fn make_primitive_constraint(
-    observation: Val<Observation>,
+    observation: Val<ObservationPlan>,
     assertion: Val<Assertion>,
     description: RotoString,
 ) -> Val<ConstraintValue> {
@@ -184,7 +185,7 @@ fn runtime() -> Runtime<NoCtx> {
     Runtime::from_lib(library! {
         #[clone] type Application = Val<Application>;
         #[clone] type Constraint = Val<ConstraintValue>;
-        #[clone] type Observation = Val<Observation>;
+        #[clone] type Observation = Val<ObservationPlan>;
         #[clone] type Assertion = Val<Assertion>;
         #[clone] type Tree = Val<TreePlan>;
         #[clone] type Run = Val<RunPlan>;
@@ -230,8 +231,8 @@ fn runtime() -> Runtime<NoCtx> {
                 })
             }
 
-            fn run(app: Val<Application>, argv: List<RotoString>) -> Val<Observation> {
-                Val(Observation::Run {
+            fn run(app: Val<Application>, argv: List<RotoString>) -> Val<ObservationPlan> {
+                Val(ObservationPlan::Run {
                     run: RunPlan {
                         argv: strings(argv),
                         tree: TreePlan::Application {
@@ -242,8 +243,8 @@ fn runtime() -> Runtime<NoCtx> {
                 })
             }
 
-            fn changed_paths(_app: Val<Application>, patterns: List<RotoString>) -> Val<Observation> {
-                Val(Observation::ChangedPaths {
+            fn changed_paths(_app: Val<Application>, patterns: List<RotoString>) -> Val<ObservationPlan> {
+                Val(ObservationPlan::ChangedPaths {
                     patterns: strings(patterns),
                 })
             }
@@ -284,16 +285,16 @@ fn runtime() -> Runtime<NoCtx> {
             })
         }
 
-        fn observe_run(run: Val<RunPlan>) -> Val<Observation> {
-            Val(Observation::Run { run: run.0 })
+        fn observe_run(run: Val<RunPlan>) -> Val<ObservationPlan> {
+            Val(ObservationPlan::Run { run: run.0 })
         }
 
         fn same_output(
             left: Val<RunPlan>,
             right: Val<RunPlan>,
             selectors: List<Val<RunSelectorPlan>>,
-        ) -> Val<Observation> {
-            Val(Observation::SameOutput {
+        ) -> Val<ObservationPlan> {
+            Val(ObservationPlan::SameOutput {
                 left: left.0,
                 right: right.0,
                 selectors: collect_selectors(selectors),
@@ -322,7 +323,7 @@ fn runtime() -> Runtime<NoCtx> {
         }
 
         fn primitive(
-            observation: Val<Observation>,
+            observation: Val<ObservationPlan>,
             assertion: Val<Assertion>,
             description: RotoString,
         ) -> Val<ConstraintValue> {
@@ -357,7 +358,7 @@ fn runtime() -> Runtime<NoCtx> {
 
         fn unavailable(reason: RotoString) -> Val<ConstraintValue> {
             make_primitive_constraint(
-                Val(Observation::Unavailable { reason: reason.to_string() }),
+                Val(ObservationPlan::Unavailable { reason: reason.to_string() }),
                 Val(Assertion::Unavailable),
                 reason,
             )
@@ -529,7 +530,7 @@ mod tests {
     fn registered_roto_host_values_are_not_zero_sized() {
         assert_ne!(std::mem::size_of::<Application>(), 0);
         assert_ne!(std::mem::size_of::<ConstraintValue>(), 0);
-        assert_ne!(std::mem::size_of::<Observation>(), 0);
+        assert_ne!(std::mem::size_of::<ObservationPlan>(), 0);
         assert_ne!(std::mem::size_of::<Assertion>(), 0);
         assert_ne!(std::mem::size_of::<TreePlan>(), 0);
         assert_ne!(std::mem::size_of::<RunPlan>(), 0);

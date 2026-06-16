@@ -26,10 +26,10 @@ pub struct CandidateContext {
     pub unknown: usize,
     /// Number of evidence records with `EvidenceResult::Skipped`.
     pub skipped: usize,
-    /// Constraint primitives present in the candidate constraint. Surfaced in the
-    /// recommended `admit --require <name>` invocation when the only
-    /// passing primitive is unambiguous.
-    pub constraint_primitives: Vec<String>,
+    /// User-facing labels for constraint leaves present in the candidate
+    /// constraint. Surfaced in the recommended `admit --require <name>`
+    /// invocation when the only passing label is unambiguous.
+    pub constraint_labels: Vec<String>,
 }
 
 impl CandidateContext {
@@ -42,8 +42,8 @@ impl CandidateContext {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PatchContext {
     pub id: String,
-    /// Constraint primitives present in the admitted patch constraint.
-    pub constraint_primitives: Vec<String>,
+    /// User-facing labels for constraint leaves present in the admitted patch constraint.
+    pub constraint_labels: Vec<String>,
     /// True when at least one materialization relation exists (the patch has
     /// produced a real Git object).
     pub materialized: bool,
@@ -56,9 +56,9 @@ pub fn next_actions(ctx: &CandidateContext) -> Vec<NextAction> {
     let mut out = Vec::new();
 
     if ctx.total_evidence() == 0 {
-        // Stage 1: drafted, no evidence yet. With no constraint primitive,
+        // Stage 1: drafted, no evidence yet. With no constraint label,
         // application core integrity is the only default gate, so admission is available.
-        if ctx.constraint_primitives.is_empty() {
+        if ctx.constraint_labels.is_empty() {
             out.push(NextAction::new(
                 "admit",
                 format!("graft patch admit {}", ctx.id),
@@ -164,7 +164,7 @@ pub fn next_actions_patch(ctx: &PatchContext) -> Vec<NextAction> {
             NextActionKind::Optional,
             "write the isolated state inspection output under .worktrees/",
         ));
-        if let Some(prop) = ctx.constraint_primitives.first() {
+        if let Some(prop) = ctx.constraint_labels.first() {
             out.push(NextAction::new(
                 "search.same-constraint",
                 format!("graft patch search --constraint {prop}"),
@@ -197,7 +197,7 @@ pub fn next_actions_patch(ctx: &PatchContext) -> Vec<NextAction> {
         "search.related",
         format!(
             "graft patch search --constraint {}",
-            ctx.constraint_primitives
+            ctx.constraint_labels
                 .first()
                 .map(String::as_str)
                 .unwrap_or("<P>"),
@@ -215,12 +215,12 @@ pub fn next_actions_patch(ctx: &PatchContext) -> Vec<NextAction> {
 }
 
 /// When a candidate's evidence shows exactly one decisively-passing constraint
-/// primitive (and no failures), surface it as the `--require` argument in the
+/// label (and no failures), surface it as the `--require` argument in the
 /// recommended `admit` command. This lets users run a tighter admit without
 /// having to type the constraint name from memory.
 fn single_decisive_constraint(ctx: &CandidateContext) -> Option<&str> {
-    if ctx.failed == 0 && ctx.passed == 1 && ctx.constraint_primitives.len() == 1 {
-        ctx.constraint_primitives.first().map(|s| s.as_str())
+    if ctx.failed == 0 && ctx.passed == 1 && ctx.constraint_labels.len() == 1 {
+        ctx.constraint_labels.first().map(|s| s.as_str())
     } else {
         None
     }
@@ -237,12 +237,12 @@ mod tests {
             failed: 0,
             unknown: 0,
             skipped: 0,
-            constraint_primitives: vec![],
+            constraint_labels: vec![],
         }
     }
 
     #[test]
-    fn drafted_candidate_without_constraint_primitives_recommends_admit() {
+    fn drafted_candidate_without_constraint_labels_recommends_admit() {
         let ctx = empty_candidate();
         let actions = next_actions(&ctx);
         assert_eq!(actions[0].id, "admit");
@@ -257,9 +257,9 @@ mod tests {
     }
 
     #[test]
-    fn drafted_candidate_with_constraint_primitives_recommends_validate() {
+    fn drafted_candidate_with_constraint_labels_recommends_validate() {
         let ctx = CandidateContext {
-            constraint_primitives: vec!["ReviewPolicy".into()],
+            constraint_labels: vec!["ReviewPolicy".into()],
             ..empty_candidate()
         };
         let actions = next_actions(&ctx);
@@ -307,7 +307,7 @@ mod tests {
     fn passed_evidence_recommends_admit_with_optional_validate_more() {
         let ctx = CandidateContext {
             passed: 1,
-            constraint_primitives: vec!["ReviewPolicy".into()],
+            constraint_labels: vec!["ReviewPolicy".into()],
             ..empty_candidate()
         };
         let actions = next_actions(&ctx);
@@ -321,7 +321,7 @@ mod tests {
     fn admit_recommendation_drops_require_when_constraint_is_ambiguous() {
         let ctx = CandidateContext {
             passed: 2,
-            constraint_primitives: vec!["ReviewPolicy".into(), "TestsPass".into()],
+            constraint_labels: vec!["ReviewPolicy".into(), "TestsPass".into()],
             ..empty_candidate()
         };
         let actions = next_actions(&ctx);
@@ -333,7 +333,7 @@ mod tests {
     fn admitted_patch_recommends_dry_run_materialize() {
         let ctx = PatchContext {
             id: "patch:demo".into(),
-            constraint_primitives: vec!["ReviewPolicy".into()],
+            constraint_labels: vec!["ReviewPolicy".into()],
             materialized: false,
             promoted: false,
         };
@@ -350,7 +350,7 @@ mod tests {
     fn materialized_patch_recommends_promote_dry_run_with_dangerous_apply() {
         let ctx = PatchContext {
             id: "patch:demo".into(),
-            constraint_primitives: vec!["ReviewPolicy".into()],
+            constraint_labels: vec!["ReviewPolicy".into()],
             materialized: true,
             promoted: false,
         };
@@ -367,7 +367,7 @@ mod tests {
     fn promoted_patch_is_terminal() {
         let ctx = PatchContext {
             id: "patch:demo".into(),
-            constraint_primitives: vec!["ReviewPolicy".into()],
+            constraint_labels: vec!["ReviewPolicy".into()],
             materialized: true,
             promoted: true,
         };
@@ -385,7 +385,7 @@ mod tests {
         let _ = next_actions(&empty_candidate());
         let _ = next_actions_patch(&PatchContext {
             id: "patch:demo".into(),
-            constraint_primitives: vec![],
+            constraint_labels: vec![],
             materialized: false,
             promoted: false,
         });

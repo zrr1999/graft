@@ -1,44 +1,28 @@
-# Graft constraint language examples
+# Graft 约束语言示例
 
-> Status: examples for the Roto constraint language. Production loader/lock
-> code discovers top-level `fn name(app: Application) -> Constraint` functions
-> from `constraints.roto`; primitive leaves point to content-addressed `Plan`s.
+> 本目录提供 Roto 约束语言示例。加载和锁定代码会从 `constraints.roto`
+> 中发现顶层 `fn name(app: Application) -> Constraint` 函数；primitive 叶子指向内容寻址的 `Plan`。
 
-Each file under `examples/constraints/` is a self-contained pattern intended
-to be readable in isolation. `examples/full/constraints.roto` shows several
-patterns composed in one workspace source file the way a real project would
-write it.
+`examples/constraints/` 下的每个文件都是可独立阅读的模式示例，也是约束语言示例的唯一维护入口。
 
-## Conventions
+## 约定
 
-- A named constraint is a top-level function `fn name(app: Application) -> Constraint`.
-  The function name is the name exposed to graft. There is no separate
-  `EmptyChange` PascalCase alias and no `constraint_registry()`.
-- A primitive leaf is built with `primitive(observation, assertion, description)`.
-  The `Plan { observation, assertion }` is content-addressed; `description` is
-  display text and does not feed identity.
-- Use `both(left, right)` / `either(left, right)` or n-ary `all_of([...])` /
-  `either_any([...])` to compose constraints. There is no separate `requires`
-  list.
-- Common assertions include `any_match`, `all_match`, `no_match`, `exit_zero`,
-  `exit_nonzero`, `outputs_same`, and `outputs_differ`.
-- Runtime-dependent values are symbolic plan references: `tree.file(path)`
-  builds a `FileRef`, and `app.previous_failure(History.First/Last/Get(n))`
-  builds a historical `Application` reference. Missing files or witnesses
-  evaluate to `Unknown` when a run needs them.
-- Sandbox defaults: no timeout, network allowed, filesystem outside the input
-  tree readable. Determinism is the constraint author's responsibility.
+- 命名约束是顶层函数 `fn name(app: Application) -> Constraint`。函数名就是暴露给 Graft 的名称；没有单独的 `EmptyChange` PascalCase alias，也没有 `constraint_registry()`。
+- primitive leaf 由 `primitive(observation, assertion, description)` 构造。`Plan { observation, assertion }` 内容寻址；`description` 是展示文本，不参与身份计算。
+- 使用 `both(left, right)` / `either(left, right)` 或 n 元 `all_of([...])` / `either_any([...])` 组合约束。没有单独的 `requires` 列表。
+- 常见 assertion 包括 `any_match`、`all_match`、`no_match`、`exit_zero`、`exit_nonzero`、`outputs_same` 和 `outputs_differ`。
+- 依赖运行时的值使用符号 plan 引用：`tree.file(path)` 构造 `FileRef`，`app.previous_failure(History.First/Last/Get(n))` 构造历史 `Application` 引用。缺失的文件或 witness 会在运行需要它们时求值为 `Unknown`。
+- 沙箱默认无超时、允许网络、可读取输入 tree 外部的文件系统。确定性由约束作者负责。
 
-## Index
+## 索引
 
-| File | Pattern |
+| 文件 | 模式 |
 | --- | --- |
-| `constraints/empty_change.roto` | structural predicate over the path set |
-| `constraints/only_touches_docs.roto` | path policy with whitelist match |
-| `constraints/no_generated_artifacts.roto` | path policy with denylist match |
-| `constraints/cargo_tests_pass.roto` | command oracle on `app.target()` |
-| `constraints/cargo_clippy_clean.roto` | command oracle for clippy |
-| `constraints/precision_invariance.roto` | relational `same_output` over base/target |
-| `constraints/training_alignment.roto` | falsifiable command oracle with previous-failure witness |
-| `constraints/safe_patch.roto` | composition via `both` |
-| `full/constraints.roto` | multiple constraints in one file |
+| `constraints/empty_change.roto` | 基于路径集合的结构谓词 |
+| `constraints/only_touches_docs.roto` | 带白名单匹配的路径策略 |
+| `constraints/no_generated_artifacts.roto` | 带拒绝列表匹配的路径策略 |
+| `constraints/cargo_tests_pass.roto` | 针对 `app.target()` 的命令 oracle |
+| `constraints/cargo_clippy_clean.roto` | clippy 命令 oracle |
+| `constraints/precision_invariance.roto` | base/target 之间的 `same_output` 关系约束 |
+| `constraints/training_alignment.roto` | 带 previous-failure witness 的可证伪命令 oracle |
+| `constraints/safe_patch.roto` | 通过 `both` 表达的组合示例 |

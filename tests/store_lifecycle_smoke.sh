@@ -59,7 +59,7 @@ patch=$(first_graft_id patch "$admit")
 [[ -n $(find .graft/store/derived/evidence -type f -print -quit) ]] || { echo "FAIL: derived evidence body missing before sync"; exit 1; }
 
 # 3) materialize writes an isolated state inspection tree and leaves cwd untouched.
-materialize_out=$("$GRAFT" patch materialize "$patch" --discard)
+materialize_out=$("$GRAFT" patch materialize "$patch")
 materialized_path=$(extract_materialize_path <<<"$materialize_out")
 [[ -n $materialized_path ]] || { echo "FAIL: materialize did not report output path"; echo "$materialize_out"; exit 1; }
 [[ "$materialized_path" != *"$patch"* ]] || { echo "FAIL: materialize output path used patch id"; echo "$materialized_path"; exit 1; }
