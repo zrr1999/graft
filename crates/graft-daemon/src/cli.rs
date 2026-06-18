@@ -149,7 +149,9 @@ fn start(cwd: &Path, socket: &Path, foreground: bool) -> Result<(), Box<dyn std:
         delay = (delay * 2).min(Duration::from_millis(400));
     }
     Err(format!(
-        "graftd child (pid {pid}) did not create socket at {} within 5s",
+        "graftd child (pid {pid}) did not create socket at {} within 5s; run `graftd start --fg --cwd {} --socket {}` for diagnostics",
+        socket.display(),
+        cwd.display(),
         socket.display()
     )
     .into())

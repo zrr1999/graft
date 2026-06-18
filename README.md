@@ -24,7 +24,7 @@ scratch operation -> candidate -> validate evidence -> admit patch -> materializ
 graft explain agent-workflow
 ```
 
-pi-graft 的 `graft_help` 工具应默认展示这个 topic；具体概念继续用 `graft explain scratch`、`graft explain candidate`、`graft explain admit`、`graft explain materialize` 等查询。高频智能体主路径是 scratch 草稿（`graft scratch read|write|edit|delete --base/--from ...`）→ `graft patch from-scratch` → `graft patch validate` → `graft patch admit` → `graft patch materialize` / `graft run` 检查输出；只有在已有当前目录 dirty state 时，才用 `graft scratch capture --base <ref>` 显式桥接并恢复当前目录。外部 `graft patch promote`、sync、compose/migrate/revert、`repo add/sync/lock/update`、`bundle import`、`workspace gc --apply` 等低频写命令可通过手动 CLI 或 pi-graft `graft_cli_exec` argv 显式执行，读/检查命令保留本地 CLI 路径。
+pi-graft 的 `graft_help` 工具应默认展示这个 topic；具体概念继续用 `graft explain scratch`、`graft explain candidate`、`graft explain admit`、`graft explain materialize` 等查询。高频智能体主路径是 scratch 草稿（`graft scratch read|write|edit|delete --base/--from ...`）→ `graft patch from-scratch` → `graft patch validate` → `graft patch admit` → `graft patch materialize` / `graft run` 检查输出；只有在已有当前目录 dirty state 时，才用 `graft scratch capture --base <ref>` 显式桥接并恢复当前目录。外部 `graft patch promote`、sync、compose/migrate/revert、`repo add/sync/lock/update`、`bundle import`、`workspace gc --apply` 等低频写命令可通过手动 CLI 或 pi-graft `graft_cli_exec` argv 显式执行，读/检查命令保留本地 CLI 路径。pi-graft typed tools 已验证为显式 UTF-8 文本 read/write/edit/delete 替代路径：首次草稿操作只传 `base`，后续只传 `from`，同一 workspace/daemon 上的 lifecycle 与 inspection 调用应顺序执行而不是并行执行。
 
 ## 当前状态
 

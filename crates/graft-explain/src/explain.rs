@@ -112,7 +112,8 @@ const AGENT_WORKFLOW_LONG_ABOUT: &str = concat!(
     "6. Admit only after required evidence passes: `graft patch admit candidate:<digest> --require <Constraint>`; admit generates a public patch and moves candidate evidence refs to the patch.\n",
     "7. Check output with `graft patch materialize <patch-id>` or `graft run <state-ref> -- <cmd>`; materialize writes isolated `.worktrees/<state>/` inspection output, not cwd or Git refs.\n",
     "8. External promote is low-frequency and explicit: only run `graft patch promote <patch-id> --to <target> --yes` when an approved patch must update an outside Git branch, PR, or release target.\n",
-    "9. Low-frequency advanced write commands such as patch compose/migrate/revert/promote, sync, repo add/sync/lock/update, bundle import, and workspace gc --apply may use pi-graft `graft_cli_exec` argv; keep read/inspect commands on the local CLI path and keep high-frequency agents on typed scratch/patch ops plus validate/admit/show/materialize."
+    "9. Low-frequency advanced write commands such as patch compose/migrate/revert/promote, sync, repo add/sync/lock/update, bundle import, and workspace gc --apply may use pi-graft `graft_cli_exec` argv; keep read/inspect commands on the local CLI path and keep high-frequency agents on typed scratch/patch ops plus validate/admit/show/materialize.\n",
+    "10. pi-graft typed tools are validated as the explicit UTF-8 text replacement path for agent read/write/edit/delete workflows. Use `base` only for the first scratch operation, `from` only for continuation, and sequence shared-workspace lifecycle or inspection calls instead of issuing them in parallel."
 );
 
 const SCRATCH_LONG_ABOUT: &str = concat!(
