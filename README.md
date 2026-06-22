@@ -270,6 +270,18 @@ graft patch from-scratch scratch:<digest> --expect only_touches_docs --message '
 
 `graft patch from-scratch` 调用 daemon `candidate_from_scratch` protocol；CLI 与 pi-graft 插件共享这个规范 op 来写 change、candidate 与空 evidence index。旧的 `graft candidate from-scratch` 仍作为隐藏兼容入口接受，但 README 使用当前 help 暴露的 `patch` namespace。Rename 用 `scratch delete --from <scratch> old/path` 加 `scratch write --from <scratch> new/path --content ...` 表达。
 
+## Tree inspection API
+
+`graft tree` 是只读 tree 访问面，用于让上层适配器在不 materialize 整棵 worktree 的情况下查询 base 或 live scratch。`--base` 支持 `graft:empty`、`tree:<id>`、`candidate:<id>`、`patch:<id>`、`repo:<id>@<treeish>` 或当前 workspace Git treeish；`--from` 通过 graftd 读取 live scratch。命令结果在 `--json` 下包含 `source`、`operation`、limit/truncation 元数据，binary 文件在 grep 中跳过，在 metadata 中只报告安全元数据，不 dump bytes。
+
+```bash
+graft tree list --base patch:<digest> --path src --glob '*.rs' --limit 100
+graft tree grep --base repo:demo@main needle --glob '*.ts' --limit 20
+graft tree metadata --base tree:<digest> assets/logo.png
+graft tree list --from scratch:<digest> --glob '*.md'
+graft tree read-metadata --from scratch:<digest> assets/logo.png
+```
+
 ## 开发检查
 
 本地与 PR 门禁使用同一组入口：

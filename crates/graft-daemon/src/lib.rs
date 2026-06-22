@@ -86,6 +86,20 @@ const CANDIDATE_FROM_SCRATCH_FIELDS: &[ParamField] = &[
 const SCRATCH_DIFF_FIELDS: &[ParamField] = &[required("from"), required("to")];
 const SCRATCH_HANDLE_FIELDS: &[ParamField] = &[required("scratch")];
 const SCRATCH_UNPIN_FIELDS: &[ParamField] = &[required("lease")];
+const TREE_LIST_FIELDS: &[ParamField] = &[
+    required("scratch"),
+    optional("path"),
+    optional("glob"),
+    optional("limit"),
+];
+const TREE_GREP_FIELDS: &[ParamField] = &[
+    required("scratch"),
+    required("pattern"),
+    optional("path"),
+    optional("glob"),
+    optional("limit"),
+];
+const TREE_METADATA_FIELDS: &[ParamField] = &[required("scratch"), required("path")];
 
 #[derive(Debug)]
 pub(crate) struct DaemonState {
@@ -321,6 +335,27 @@ const OP_SPECS: &[OpSpec] = &[
         routing_fields: ROUTING_FIELDS,
         fields: SCRATCH_DIFF_FIELDS,
         handler: scratch_wire::scratch_diff_response,
+    },
+    OpSpec {
+        op: "tree_list",
+        scope: OpScope::Routed,
+        routing_fields: ROUTING_FIELDS,
+        fields: TREE_LIST_FIELDS,
+        handler: scratch_wire::tree_list_response,
+    },
+    OpSpec {
+        op: "tree_grep",
+        scope: OpScope::Routed,
+        routing_fields: ROUTING_FIELDS,
+        fields: TREE_GREP_FIELDS,
+        handler: scratch_wire::tree_grep_response,
+    },
+    OpSpec {
+        op: "tree_metadata",
+        scope: OpScope::Routed,
+        routing_fields: ROUTING_FIELDS,
+        fields: TREE_METADATA_FIELDS,
+        handler: scratch_wire::tree_metadata_response,
     },
     OpSpec {
         op: "scratch_drop",
@@ -704,6 +739,7 @@ mod tests {
             "from" => json!("scratch:from"),
             "lease" => json!("lease:test"),
             "path" => json!("hello.txt"),
+            "pattern" => json!("hello"),
             "scratch" => json!("scratch:test"),
             "target_tree" => json!(tree_id),
             "to" => json!("scratch:to"),

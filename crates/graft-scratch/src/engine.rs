@@ -311,6 +311,10 @@ impl ScratchEngine {
         })
     }
 
+    pub fn tree_snapshot(&self, scratch: &ScratchId) -> Result<TreeSnapshot> {
+        Ok(self.state(scratch)?.tree)
+    }
+
     pub fn store(&self) -> &GraftStore {
         &self.store
     }

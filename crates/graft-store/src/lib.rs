@@ -39,7 +39,12 @@ mod evidence;
 mod index;
 mod objects;
 mod records;
+mod tree_query;
 mod virtual_tree;
+pub use tree_query::{
+    TreeGrepMatch, TreeGrepOptions, TreeGrepResult, TreeListOptions, TreeListResult, TreeMetadata,
+    TreeMetadataKind, TreePathEntry,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {

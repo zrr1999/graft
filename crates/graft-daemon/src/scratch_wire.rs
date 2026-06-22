@@ -7,10 +7,10 @@
 use graft_client::WireResponse;
 use graft_core::{BaseRefSpec, HashlineEdit, ScratchId, StateId};
 use graft_scratch::{ReadMode, ScratchEngine, ScratchError};
-use graft_store::VirtualBaseRef;
+use graft_store::{TreeGrepOptions, TreeListOptions, VirtualBaseRef};
 use serde_json::{Value, json};
 
-use crate::{HandlerResult, WithId, bad_field_type, bad_params, missing_field};
+use crate::{HandlerResult, WithId, bad_field_type, bad_params, bad_params_message, missing_field};
 
 pub(crate) fn scratch_open_response(
     engine: &ScratchEngine,
@@ -210,6 +210,109 @@ pub(crate) fn scratch_diff_response(
             ),
             Err(error) => scratch_error_response(id, error),
         },
+        (Err(response), _) | (_, Err(response)) => (response.with_id(id), false),
+    }
+}
+
+pub(crate) fn tree_list_response(
+    engine: &ScratchEngine,
+    id: String,
+    params: &Value,
+) -> (WireResponse, bool) {
+    let scratch = required_str(params, "scratch").map(ScratchId::new);
+    let path = optional_str(params, "path").map(|value| value.map(ToString::to_string));
+    let glob = optional_str(params, "glob").map(|value| value.map(ToString::to_string));
+    let limit = optional_usize(params, "limit");
+    match (scratch, path, glob, limit) {
+        (Ok(scratch), Ok(path), Ok(glob), Ok(limit)) => {
+            let result = (|| -> graft_scratch::Result<Value> {
+                let snapshot = engine.tree_snapshot(&scratch)?;
+                let result = engine
+                    .store()
+                    .tree_list(&snapshot, &TreeListOptions { path, glob, limit })?;
+                Ok(json_with_scratch_source(
+                    &scratch,
+                    "list",
+                    serde_json::to_value(result).map_err(graft_store::StoreError::Json)?,
+                ))
+            })();
+            match result {
+                Ok(result) => (WireResponse::ok(id, result), false),
+                Err(error) => scratch_error_response(id, error),
+            }
+        }
+        (Err(response), _, _, _)
+        | (_, Err(response), _, _)
+        | (_, _, Err(response), _)
+        | (_, _, _, Err(response)) => (response.with_id(id), false),
+    }
+}
+
+pub(crate) fn tree_grep_response(
+    engine: &ScratchEngine,
+    id: String,
+    params: &Value,
+) -> (WireResponse, bool) {
+    let scratch = required_str(params, "scratch").map(ScratchId::new);
+    let pattern = required_str(params, "pattern").map(ToString::to_string);
+    let path = optional_str(params, "path").map(|value| value.map(ToString::to_string));
+    let glob = optional_str(params, "glob").map(|value| value.map(ToString::to_string));
+    let limit = optional_usize(params, "limit");
+    match (scratch, pattern, path, glob, limit) {
+        (Ok(scratch), Ok(pattern), Ok(path), Ok(glob), Ok(limit)) => {
+            let result = (|| -> graft_scratch::Result<Value> {
+                let snapshot = engine.tree_snapshot(&scratch)?;
+                let result = engine.store().tree_grep(
+                    &snapshot,
+                    &TreeGrepOptions {
+                        pattern,
+                        path,
+                        glob,
+                        limit,
+                    },
+                )?;
+                Ok(json_with_scratch_source(
+                    &scratch,
+                    "grep",
+                    serde_json::to_value(result).map_err(graft_store::StoreError::Json)?,
+                ))
+            })();
+            match result {
+                Ok(result) => (WireResponse::ok(id, result), false),
+                Err(error) => scratch_error_response(id, error),
+            }
+        }
+        (Err(response), _, _, _, _)
+        | (_, Err(response), _, _, _)
+        | (_, _, Err(response), _, _)
+        | (_, _, _, Err(response), _)
+        | (_, _, _, _, Err(response)) => (response.with_id(id), false),
+    }
+}
+
+pub(crate) fn tree_metadata_response(
+    engine: &ScratchEngine,
+    id: String,
+    params: &Value,
+) -> (WireResponse, bool) {
+    let scratch = required_str(params, "scratch").map(ScratchId::new);
+    let path = required_str(params, "path");
+    match (scratch, path) {
+        (Ok(scratch), Ok(path)) => {
+            let result = (|| -> graft_scratch::Result<Value> {
+                let snapshot = engine.tree_snapshot(&scratch)?;
+                let result = engine.store().tree_metadata(&snapshot, path)?;
+                Ok(json_with_scratch_source(
+                    &scratch,
+                    "metadata",
+                    serde_json::to_value(result).map_err(graft_store::StoreError::Json)?,
+                ))
+            })();
+            match result {
+                Ok(result) => (WireResponse::ok(id, result), false),
+                Err(error) => scratch_error_response(id, error),
+            }
+        }
         (Err(response), _) | (_, Err(response)) => (response.with_id(id), false),
     }
 }
@@ -442,7 +545,31 @@ fn optional_str<'a>(params: &'a Value, field: &str) -> HandlerResult<Option<&'a 
         .transpose()
 }
 
+fn optional_usize(params: &Value, field: &str) -> HandlerResult<Option<usize>> {
+    let Some(value) = params.get(field) else {
+        return Ok(None);
+    };
+    let value = value
+        .as_u64()
+        .ok_or_else(|| bad_field_type(field, "non-negative integer"))?;
+    usize::try_from(value).map(Some).map_err(|_| {
+        bad_params_message(format!(
+            "field `{field}` value {value} is too large for this platform"
+        ))
+    })
+}
+
 fn required_state_id(params: &Value, field: &str) -> HandlerResult<StateId> {
     let value = params.get(field).ok_or_else(|| missing_field(field))?;
     serde_json::from_value::<StateId>(value.clone()).map_err(bad_params)
+}
+
+fn json_with_scratch_source(scratch: &ScratchId, operation: &str, mut payload: Value) -> Value {
+    let source = json!({"kind": "scratch", "scratch": scratch});
+    let Some(object) = payload.as_object_mut() else {
+        return json!({"source": source, "operation": operation, "data": payload});
+    };
+    object.insert("source".to_string(), source);
+    object.insert("operation".to_string(), json!(operation));
+    payload
 }

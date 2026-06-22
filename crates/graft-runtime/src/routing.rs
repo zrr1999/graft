@@ -63,6 +63,7 @@ pub(crate) fn command_uses_cli_exec(command: &Command) -> bool {
         } => true,
         Command::Get { .. }
         | Command::Scratch { .. }
+        | Command::Tree { .. }
         | Command::Candidate { .. }
         | Command::Constraint { .. }
         | Command::Init { .. }

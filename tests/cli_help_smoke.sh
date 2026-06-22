@@ -36,7 +36,7 @@ check_help() {
 }
 
 # Visible top-level command groups.
-for sub in get sync workspace scratch patch repo bundle explain run; do
+for sub in get sync workspace scratch patch repo tree bundle explain run; do
   check_help "$sub"
 done
 
@@ -54,6 +54,7 @@ for nest in \
   "patch diff" "patch compose" "patch migrate" "patch revert" "patch materialize" "patch promote" \
   "constraint lock" "constraint check" "constraint list" "constraint show" \
   "repo add" "repo list" "repo sync" "repo lock" "repo update" \
+  "tree list" "tree grep" "tree metadata" "tree read-metadata" \
   "scratch status" "scratch open" "scratch read" "scratch write" "scratch edit" "scratch delete" "scratch rm" \
   "scratch capture" "scratch diff" "scratch drop" "scratch pin" "scratch unpin" \
   "bundle export" "bundle import" "registry export" "registry import" "cache search" "candidate from-scratch"; do
@@ -158,6 +159,18 @@ check_flag "patch revert" "--expect"
 check_flag "patch revert" "--validate"
 check_flag "patch materialize" "--dry-run"
 check_flag "run" "--cwd"
+check_flag "tree list" "--base"
+check_flag "tree list" "--from"
+check_flag "tree list" "--path"
+check_flag "tree list" "--glob"
+check_flag "tree list" "--limit"
+check_flag "tree grep" "--base"
+check_flag "tree grep" "--from"
+check_flag "tree grep" "--path"
+check_flag "tree grep" "--glob"
+check_flag "tree grep" "--limit"
+check_flag "tree metadata" "--base"
+check_flag "tree metadata" "--from"
 check_flag "patch promote" "--to"
 check_flag "patch promote" "--branch"
 check_flag "patch promote" "--yes"

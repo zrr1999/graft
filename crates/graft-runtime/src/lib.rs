@@ -14,6 +14,7 @@ mod roto_constraints;
 mod routing;
 mod scratch;
 mod state_runtime;
+mod tree;
 mod validation;
 mod view;
 mod workspace;
@@ -89,6 +90,7 @@ use scratch::{ScratchCommand, run_scratch_command, run_scratch_status};
 use state_runtime::materialize_worktree_path;
 use state_runtime::{materialize_state, object_diff_summary, run_in_state};
 use time::OffsetDateTime;
+use tree::{TreeCommand, run_tree_command};
 use validation::{
     ensure_change_integrity, evidence_for_current_verifiers, validate_candidate, validate_patch,
 };
@@ -171,6 +173,13 @@ enum Command {
     Repo {
         #[command(subcommand)]
         command: RepoCommand,
+    },
+    /// Inspect base trees and live scratch trees without materializing a worktree
+    Tree {
+        #[command(subcommand)]
+        command: TreeCommand,
+        #[arg(long, help = "graftd Unix socket path for --from scratch inspection")]
+        socket: Option<PathBuf>,
     },
     /// Export or import admitted public objects as a portable bundle
     Bundle {
@@ -1589,6 +1598,17 @@ impl LocalCommandRouter<'_> {
             Command::Repo { command } => {
                 let config = load_graft_config(store)?;
                 run_repo_command(workspace_root, &config, command)
+            }
+            Command::Tree { command, socket } => {
+                let config = load_graft_config(store)?;
+                run_tree_command(
+                    store,
+                    &config,
+                    workspace_root,
+                    workspace_id,
+                    socket.as_deref(),
+                    command,
+                )
             }
             Command::Scratch {
                 command: ScratchCommand::Status,
