@@ -36,6 +36,7 @@ pi-graft 的 `graft_help` 工具应默认展示这个 topic；具体概念继续
 - daemon 是唯一 writer：CLI 写命令自动通过 `$GRAFT_HOME/run/daemon.sock` 发给全局 `graftd`；无 inline writer 路径。
 - `StateId` 是完整 workspace snapshot；constraint 始终在完整 `.base` / `.target` state 上运行。
 - materialize 不写 cwd：`graft patch materialize <patch-id>` 把 admitted patch 的 target state 解析成确定 state，再输出到 workspace `.worktrees/<state>/` 临时检查目录；`graft run <state-ref> -- <cmd>` 仍可对 `tree:*`、`candidate:*`、`patch:*` 或 `repo:<id>@<treeish>` 在临时 state root 执行命令并丢弃写入。
+- `graft tree list|grep|metadata` 是只读 tree inspection backend，可直接查询 base/candidate/patch/repo refs 或 live scratch；适配器（例如 pi-graft sandbox）可用它实现 find/grep/ls/metadata，而不需要临时 materialize 整棵树。
 - sync 使用固定 Git refs：`refs/graft/facts`、`refs/graft/blobs`、`refs/graft/manifests`；candidate 和 evidence body 不 sync。
 - `graft get` 只重建 `.graft/`，不会默认 materialize cwd。
 - `graft patch promote` 是唯一会写外部 Git repo / branch / PR / release 的命令，发布的是 admitted patch 的 `target_state`，并记录 `promotion:<digest>`。
@@ -272,7 +273,7 @@ graft patch from-scratch scratch:<digest> --expect only_touches_docs --message '
 
 ## Tree inspection API
 
-`graft tree` 是只读 tree 访问面，用于让上层适配器在不 materialize 整棵 worktree 的情况下查询 base 或 live scratch。`--base` 支持 `graft:empty`、`tree:<id>`、`candidate:<id>`、`patch:<id>`、`repo:<id>@<treeish>` 或当前 workspace Git treeish；`--from` 通过 graftd 读取 live scratch。命令结果在 `--json` 下包含 `source`、`operation`、limit/truncation 元数据，binary 文件在 grep 中跳过，在 metadata 中只报告安全元数据，不 dump bytes。
+`graft tree` 是只读 tree 访问面，用于让上层适配器在不 materialize 整棵 worktree 的情况下查询 base 或 live scratch。`--base` 支持 `graft:empty`、`tree:<id>`、`candidate:<id>`、`patch:<id>`、`repo:<id>@<treeish>` 或当前 workspace Git treeish；`--from` 通过 graftd 读取 live scratch。命令结果在 `--json` 下包含 `source`、`operation`、limit/truncation 元数据，binary 文件在 grep 中跳过，在 metadata 中只报告安全元数据，不 dump bytes。该 API 是 pi-graft sandbox native backend 的目标集成面：text read/edit/write 仍走 scratch lifecycle，树导航/search/metadata 可走 `graft tree`，fallback 才需要 materialized-run overlay。
 
 ```bash
 graft tree list --base patch:<digest> --path src --glob '*.rs' --limit 100

@@ -66,7 +66,7 @@ jobs:
       - name: Smoke-test built wheel
         shell: bash
         run: |
-          wheel_path="$(ls dist/*.whl | head -n 1)"
+          wheel_path="$(find dist -maxdepth 1 -type f -name '*.whl' -print -quit)"
           tmp_dir="$(mktemp -d)"
           uv tool run --from "$wheel_path" graft --help
           uv tool run --from "$wheel_path" graft --cwd "$tmp_dir" init
@@ -109,7 +109,7 @@ jobs:
       - name: Smoke-test source distribution
         shell: bash
         run: |
-          sdist_path="$(ls dist/*.tar.gz | head -n 1)"
+          sdist_path="$(find dist -maxdepth 1 -type f -name '*.tar.gz' -print -quit)"
           tmp_dir="$(mktemp -d)"
           uv tool run --from "$sdist_path" graft --help
           uv tool run --from "$sdist_path" graft --cwd "$tmp_dir" init

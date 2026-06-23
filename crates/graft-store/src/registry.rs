@@ -7,16 +7,16 @@
 //! - cwd routes (`[[routes]]`)
 //! - local clone paths by RepoId (`[[repo_paths]]`)
 //!
-//! Writes are protected by an advisory flock on `$GRAFT_HOME/.registry.lock`,
+//! Writes are protected by an OS file lock on `$GRAFT_HOME/.registry.lock`,
 //! keep a `.bak` of the last good registry for diagnostics, and publish with
 //! atomic rename. Reads fail loud when the primary registry is corrupt; callers
 //! must not silently route commands through stale backup data.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
@@ -338,11 +338,7 @@ impl RegistryLock {
             .write(true)
             .truncate(false)
             .open(&path)?;
-        let fd = file.as_raw_fd();
-        // SAFETY: fd is owned by `file` for the duration of this call.
-        let rc = unsafe { libc_flock(fd, LOCK_EX | LOCK_NB) };
-        if rc != 0 {
-            let err = std::io::Error::last_os_error();
+        if let Err(err) = file.try_lock_exclusive() {
             return Err(if err.kind() == std::io::ErrorKind::WouldBlock {
                 StoreError::Locked { path }
             } else {
@@ -355,14 +351,11 @@ impl RegistryLock {
 
 impl Drop for RegistryLock {
     fn drop(&mut self) {
-        let fd = self.file.as_raw_fd();
         // Touch the path so the field is considered read outside Debug; this
         // also makes debugging dropped locks easier under breakpoints.
         let _ = &self.path;
-        // SAFETY: fd is valid while `file` is alive; best-effort unlock.
-        unsafe {
-            libc_flock(fd, LOCK_UN);
-        }
+        // Best-effort unlock; on success the OS also releases on close/process exit.
+        let _ = self.file.unlock();
     }
 }
 
@@ -403,19 +396,6 @@ fn now_rfc3339() -> Result<String> {
 
 fn default_schema() -> u32 {
     REGISTRY_SCHEMA
-}
-
-const LOCK_EX: i32 = 2;
-const LOCK_NB: i32 = 4;
-const LOCK_UN: i32 = 8;
-
-unsafe extern "C" {
-    fn flock(fd: std::os::raw::c_int, op: std::os::raw::c_int) -> std::os::raw::c_int;
-}
-
-#[inline]
-unsafe fn libc_flock(fd: std::os::raw::c_int, op: i32) -> std::os::raw::c_int {
-    unsafe { flock(fd, op) }
 }
 
 #[cfg(test)]

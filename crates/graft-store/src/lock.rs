@@ -1,25 +1,26 @@
 //! Filesystem-backed exclusive lock for `.graft/`.
 //!
 //! Only one daemon writer may hold the
-//! lock at a time. The lock is advisory `flock(LOCK_EX | LOCK_NB)` on a
-//! sentinel file at `.graft/.lock`; readers do not need it. The lock is
-//! released automatically when the [`WriteLock`] is dropped or the holding
-//! process exits, so a crashed graftd cannot leave a permanent lock file.
+//! lock at a time. The lock is an OS file lock on a sentinel file at
+//! `.graft/.lock`; readers do not need it. The lock is released automatically
+//! when the [`WriteLock`] is dropped or the holding process exits, so a crashed
+//! graftd cannot leave a permanent lock file.
 //!
-//! Why advisory flock and not e.g. a PID-bearing lockfile?
+//! Why advisory file locking and not e.g. a PID-bearing lockfile?
 //!
-//! - flock is released by the kernel on process exit; we don't need crash
-//!   recovery code or stale-lock heuristics.
-//! - it is non-cooperative across mounts that don't support flock (NFS<v4
-//!   without lockd), which we accept as a known limit; graft is intended
-//!   for local workspaces.
+//! - OS file locks are released on process exit; we don't need crash recovery
+//!   code or stale-lock heuristics.
+//! - it is non-cooperative across mounts that don't support file locking
+//!   reliably, which we accept as a known limit; graft is intended for local
+//!   workspaces.
 //! - acquisition is non-blocking (`LOCK_NB`): a contending caller gets
 //!   `WouldBlock` immediately, which we surface as a typed error so the
 //!   CLI can render `[E_LOCKED]` with a fix hint.
 
 use std::fs::{File, OpenOptions};
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+
+use fs2::FileExt;
 
 use crate::StoreError;
 
@@ -56,11 +57,7 @@ impl WriteLock {
             .truncate(false)
             .open(&path)?;
 
-        let fd = file.as_raw_fd();
-        // SAFETY: fd is owned by `file` for the duration of this call.
-        let rc = unsafe { libc_flock(fd, LOCK_EX | LOCK_NB) };
-        if rc != 0 {
-            let err = std::io::Error::last_os_error();
+        if let Err(err) = file.try_lock_exclusive() {
             return Err(if err.kind() == std::io::ErrorKind::WouldBlock {
                 StoreError::Locked { path }
             } else {
@@ -78,30 +75,9 @@ impl WriteLock {
 
 impl Drop for WriteLock {
     fn drop(&mut self) {
-        let fd = self.file.as_raw_fd();
-        // Best-effort unlock; on success the kernel also releases on close.
-        unsafe {
-            libc_flock(fd, LOCK_UN);
-        }
+        // Best-effort unlock; on success the OS also releases on close/process exit.
+        let _ = self.file.unlock();
     }
-}
-
-// We only need three flock operations and the libc symbol; pulling in the
-// `libc` crate just for these would be heavier than the binding itself. The
-// constants below match `<sys/file.h>` on every Unix platform we target
-// (Linux, macOS, *BSD).
-
-const LOCK_EX: i32 = 2;
-const LOCK_NB: i32 = 4;
-const LOCK_UN: i32 = 8;
-
-unsafe extern "C" {
-    fn flock(fd: std::os::raw::c_int, op: std::os::raw::c_int) -> std::os::raw::c_int;
-}
-
-#[inline]
-unsafe fn libc_flock(fd: std::os::raw::c_int, op: i32) -> std::os::raw::c_int {
-    unsafe { flock(fd, op) }
 }
 
 #[cfg(test)]
