@@ -2,8 +2,13 @@
 
 use std::env;
 use std::ffi::{OsStr, OsString};
-use std::io::{self, BufRead, BufReader, Write};
+#[cfg(any(unix, test))]
+use std::io;
+#[cfg(unix)]
+use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
@@ -22,6 +27,7 @@ pub enum WireErrorKind {
 
 pub type WireResult<T> = std::result::Result<T, WireErrorKind>;
 
+#[cfg(any(unix, test))]
 const CLIENT_REQUEST_ID: &str = "graft-cli";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -173,6 +179,7 @@ fn graft_home_root_from_env(
     bail!("[E_GRAFT_HOME_UNAVAILABLE] set GRAFT_HOME or HOME to locate the global graft daemon")
 }
 
+#[cfg(unix)]
 fn request_response(socket: &Path, op: &str, params: Value) -> Result<WireResponse> {
     let mut stream = UnixStream::connect(socket).with_context(|| {
         format!(
@@ -195,6 +202,15 @@ fn request_response(socket: &Path, op: &str, params: Value) -> Result<WireRespon
     Ok(response)
 }
 
+#[cfg(not(unix))]
+fn request_response(socket: &Path, _op: &str, _params: Value) -> Result<WireResponse> {
+    bail!(
+        "[E_DAEMON_UNSUPPORTED] graftd daemon transport uses Unix-domain sockets and is unsupported on this platform: {}",
+        socket.display()
+    )
+}
+
+#[cfg(any(unix, test))]
 fn request_frame(op: &str, params: Value) -> WireRequest {
     WireRequest {
         id: CLIENT_REQUEST_ID.to_string(),
@@ -203,6 +219,7 @@ fn request_frame(op: &str, params: Value) -> WireRequest {
     }
 }
 
+#[cfg(any(unix, test))]
 fn ensure_response_id(response: &WireResponse) -> Result<()> {
     if response.id == CLIENT_REQUEST_ID {
         Ok(())
@@ -307,6 +324,7 @@ pub fn request_result_or_spawn(
     request_result(socket, op, params)
 }
 
+#[cfg(unix)]
 pub fn daemon_socket_state(socket: &Path) -> Result<DaemonSocketState> {
     let metadata = match std::fs::symlink_metadata(socket) {
         Ok(metadata) => metadata,
@@ -330,6 +348,15 @@ pub fn daemon_socket_state(socket: &Path) -> Result<DaemonSocketState> {
     }
 }
 
+#[cfg(not(unix))]
+pub fn daemon_socket_state(socket: &Path) -> Result<DaemonSocketState> {
+    bail!(
+        "[E_DAEMON_UNSUPPORTED] graftd daemon transport uses Unix-domain sockets and is unsupported on this platform: {}",
+        socket.display()
+    )
+}
+
+#[cfg(any(unix, test))]
 fn classify_daemon_socket_connect_error(
     socket: &Path,
     error: &io::Error,
@@ -355,6 +382,7 @@ pub fn prepare_daemon_socket_for_bind(socket: &Path) -> Result<()> {
     }
 }
 
+#[cfg(unix)]
 pub fn remove_stale_daemon_socket(socket: &Path) -> Result<()> {
     let metadata = match std::fs::symlink_metadata(socket) {
         Ok(metadata) => metadata,
@@ -377,6 +405,14 @@ pub fn remove_stale_daemon_socket(socket: &Path) -> Result<()> {
             Err(error).with_context(|| format!("remove stale graftd socket {}", socket.display()))
         }
     }
+}
+
+#[cfg(not(unix))]
+pub fn remove_stale_daemon_socket(socket: &Path) -> Result<()> {
+    bail!(
+        "[E_DAEMON_UNSUPPORTED] graftd daemon transport uses Unix-domain sockets and is unsupported on this platform: {}",
+        socket.display()
+    )
 }
 
 fn graftd_bin_candidates() -> Vec<OsString> {
@@ -710,6 +746,7 @@ mod tests {
         assert_eq!(resolved, None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn socket_state_returns_missing_for_missing_path() {
         let dir = test_temp_dir("graft-client-missing-socket");
@@ -721,6 +758,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn remove_stale_daemon_socket_reports_non_socket_path() {
         let dir = std::env::temp_dir().join(format!(
@@ -739,6 +777,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[test]
     fn remove_stale_daemon_socket_does_not_delete_regular_file() {
         let dir = std::env::temp_dir().join(format!(
@@ -760,6 +799,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[test]
     fn daemon_socket_state_reports_non_socket_path() {
         let dir = test_temp_dir("graft-client-state-non-socket");
@@ -775,6 +815,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[test]
     fn daemon_socket_state_reports_stale_socket_without_listener() {
         let dir = test_temp_dir("graft-client-state-stale-socket");
@@ -792,6 +833,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[test]
     fn daemon_socket_state_reports_live_socket() {
         let dir = test_temp_dir("graft-client-state-live-socket");
@@ -819,6 +861,7 @@ mod tests {
         assert!(message.contains("refusing to remove it"), "{message}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn prepare_daemon_socket_for_bind_removes_only_stale_socket() {
         let dir = test_temp_dir("graft-client-prepare-stale-socket");
@@ -834,6 +877,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[test]
     fn prepare_daemon_socket_for_bind_rejects_live_socket() {
         let dir = test_temp_dir("graft-client-prepare-live-socket");
