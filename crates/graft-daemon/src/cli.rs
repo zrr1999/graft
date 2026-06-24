@@ -1,7 +1,9 @@
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, Write};
+#[cfg(unix)]
+use std::io::{BufRead, BufReader};
+#[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -10,12 +12,16 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use graft_client::{
-    DaemonSocketState, WireResponse, daemon_socket_path, daemon_socket_state, encode_response,
-    prepare_daemon_socket_for_bind, request_result as client_request_result,
+    DaemonSocketState, daemon_socket_path, daemon_socket_state, prepare_daemon_socket_for_bind,
+    request_result as client_request_result,
 };
+#[cfg(unix)]
+use graft_client::{WireResponse, encode_response};
+#[cfg(unix)]
 use graft_store::GraftStore;
 use serde::Deserialize;
 
+#[cfg(unix)]
 use crate::{DaemonState, handle_frame};
 
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -226,6 +232,7 @@ fn socket_run_dir(socket: &Path) -> Result<&Path, Box<dyn std::error::Error>> {
         })
 }
 
+#[cfg(unix)]
 fn serve(cwd: &Path, socket: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let run_dir = socket_run_dir(socket)?;
     // Ownership checks must precede workspace cleanup. If another daemon is
@@ -306,6 +313,15 @@ fn serve(cwd: &Path, socket: &Path) -> Result<(), Box<dyn std::error::Error>> {
     socket_cleanup?;
     pid_cleanup?;
     Ok(())
+}
+
+#[cfg(not(unix))]
+fn serve(_cwd: &Path, socket: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    Err(format!(
+        "[E_DAEMON_UNSUPPORTED] graftd daemon transport uses Unix-domain sockets and is unsupported on this platform: {}",
+        socket.display()
+    )
+    .into())
 }
 
 fn claim_pid_file(pid_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -409,7 +425,9 @@ fn detach(command: &mut Command) {
     }
 }
 
-#[cfg(unix)]
+#[cfg(not(unix))]
+fn detach(_command: &mut Command) {}
+
 #[cfg(unix)]
 unsafe extern "C" {
     fn setsid() -> i32;
@@ -421,6 +439,7 @@ fn libc_setsid() -> i32 {
     unsafe { setsid() }
 }
 
+#[cfg(unix)]
 fn handle_connection(
     state: &DaemonState,
     mut stream: UnixStream,
@@ -481,6 +500,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -686,6 +706,7 @@ idle_timeout_seconds = "fast"
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[test]
     fn serve_rejects_live_socket_before_workspace_side_effects() {
         let workspace = temp_dir("serve-live-socket-workspace");
@@ -737,6 +758,7 @@ idle_timeout_seconds = "fast"
         let _ = fs::remove_dir_all(&run_dir);
     }
 
+    #[cfg(unix)]
     #[test]
     fn restart_fails_when_shutdown_does_not_release_socket() {
         let workspace = temp_dir("restart-timeout-workspace");
@@ -769,11 +791,13 @@ idle_timeout_seconds = "fast"
         let _ = fs::remove_dir_all(&run_dir);
     }
 
+    #[cfg(unix)]
     struct StubbornDaemon {
         running: Arc<AtomicBool>,
         handle: thread::JoinHandle<()>,
     }
 
+    #[cfg(unix)]
     impl StubbornDaemon {
         fn listen(socket: &Path) -> Self {
             let listener = UnixListener::bind(socket).unwrap();
