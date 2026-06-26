@@ -14,7 +14,7 @@ graft patch incoming
 
 ### 6.1 远端约定
 
-Graft 远端是一个 Git 仓库，负责存储以下三个固定 refs：
+Graft 远端是一个 Git 仓库（Git URL 或本地 bare/storage repo 路径），负责存储以下三个固定 refs：
 
 ```text
 refs/graft/facts          镜像 store/public/{tree,action,application,change,

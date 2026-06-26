@@ -40,7 +40,11 @@ const NO_FIELDS: &[ParamField] = &[];
 const CLI_EXEC_FIELDS: &[ParamField] = &[required("argv")];
 const WORKSPACE_ATTACH_FIELDS: &[ParamField] = &[required("cwd"), optional("workspace")];
 const WORKSPACE_DETACH_FIELDS: &[ParamField] = &[required("cwd")];
-const SCRATCH_OPEN_FIELDS: &[ParamField] = &[required("base")];
+const SCRATCH_OPEN_FIELDS: &[ParamField] = &[
+    optional("base"),
+    optional("base_state"),
+    optional("base_tree"),
+];
 const SCRATCH_READ_FIELDS: &[ParamField] = &[
     optional("base"),
     optional("base_state"),
@@ -648,7 +652,7 @@ fn bad_field_type(field: &str, expected: &str) -> Box<WireResponse> {
 mod tests {
     use super::*;
     use graft_client::encode_response;
-    use graft_core::{Constraint, TreeEntry, TreeSnapshot};
+    use graft_core::{Constraint, StateId, TreeEntry, TreeSnapshot};
     use graft_store::{
         DEFAULT_WORKSPACE_ID, GraftStore, RegistryStore, VirtualBaseRef, WorkspaceKind,
     };
@@ -1160,6 +1164,150 @@ mod tests {
         );
 
         drop(store);
+        let _ = std::fs::remove_dir_all(workspace);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn routed_typed_ops_keep_scratch_state_per_workspace() {
+        let home =
+            std::env::temp_dir().join(format!("graftd-route-isolation-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let (workspace_a, _store_a, _tree_a) = seeded_store("route_isolation_a");
+        let (workspace_b, _store_b, _tree_b) = seeded_store("route_isolation_b");
+        let registry = RegistryStore::new(&home);
+        registry
+            .ensure_workspace("ws:a", WorkspaceKind::Local, &workspace_a)
+            .unwrap();
+        registry
+            .ensure_workspace("ws:b", WorkspaceKind::Local, &workspace_b)
+            .unwrap();
+        let state = DaemonState::new_with_registry(GraftStore::open(&workspace_a), registry);
+
+        let write_a = handle_routed_request(
+            &state,
+            WireRequest {
+                id: "write-a".to_string(),
+                op: "scratch_write".to_string(),
+                params: json!({
+                    "workspace_id": "ws:a",
+                    "workspace_root": workspace_a.clone(),
+                    "base": "graft:empty",
+                    "path": "only-a.txt",
+                    "content": "from a\n"
+                }),
+            },
+        )
+        .0;
+        assert!(write_a.ok, "{write_a:?}");
+        let scratch_a = write_a.result.as_ref().unwrap()["scratch"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let read_a = handle_routed_request(
+            &state,
+            WireRequest {
+                id: "read-a".to_string(),
+                op: "scratch_read".to_string(),
+                params: json!({
+                    "workspace_id": "ws:a",
+                    "workspace_root": workspace_a.clone(),
+                    "from": scratch_a,
+                    "path": "only-a.txt",
+                    "mode": "text"
+                }),
+            },
+        )
+        .0;
+        assert!(read_a.ok, "{read_a:?}");
+        assert_eq!(
+            read_a.result.as_ref().unwrap()["content"],
+            json!("from a\n")
+        );
+
+        let read_a_from_b = handle_routed_request(
+            &state,
+            WireRequest {
+                id: "read-a-from-b".to_string(),
+                op: "scratch_read".to_string(),
+                params: json!({
+                    "workspace_id": "ws:b",
+                    "workspace_root": workspace_b.clone(),
+                    "from": scratch_a,
+                    "path": "only-a.txt",
+                    "mode": "text"
+                }),
+            },
+        )
+        .0;
+        assert!(!read_a_from_b.ok, "{read_a_from_b:?}");
+        assert_eq!(read_a_from_b.error.unwrap().code, "E_SCRATCH_LOST");
+
+        let write_b = handle_routed_request(
+            &state,
+            WireRequest {
+                id: "write-b".to_string(),
+                op: "scratch_write".to_string(),
+                params: json!({
+                    "workspace_id": "ws:b",
+                    "workspace_root": workspace_b.clone(),
+                    "base": "graft:empty",
+                    "path": "only-b.txt",
+                    "content": "from b\n"
+                }),
+            },
+        )
+        .0;
+        assert!(write_b.ok, "{write_b:?}");
+        assert!(state.engines.lock().unwrap().len() >= 2);
+
+        let _ = std::fs::remove_dir_all(workspace_a);
+        let _ = std::fs::remove_dir_all(workspace_b);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn routed_scratch_open_accepts_materialized_base() {
+        let home =
+            std::env::temp_dir().join(format!("graftd-open-materialized-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let (workspace, _store, tree_id) = seeded_store("open_materialized_workspace");
+        let registry = RegistryStore::new(&home);
+        registry
+            .ensure_workspace("ws:registered", WorkspaceKind::Local, &workspace)
+            .unwrap();
+        let state = DaemonState::new_with_registry(GraftStore::open(&workspace), registry);
+
+        let (response, _) = handle_routed_request(
+            &state,
+            WireRequest {
+                id: "open".to_string(),
+                op: "scratch_open".to_string(),
+                params: json!({
+                    "workspace_id": "ws:registered",
+                    "workspace_root": workspace.clone(),
+                    "base_state": StateId::GraftTree(tree_id.clone()),
+                    "base_tree": tree_id.clone()
+                }),
+            },
+        );
+
+        assert!(response.ok, "{response:?}");
+        let result = response.result.as_ref().unwrap();
+        assert!(
+            result["scratch"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("scratch:"))
+        );
+        assert_eq!(
+            result["base_state"],
+            json!(StateId::GraftTree(tree_id.clone()))
+        );
+        assert_eq!(result["base_tree"], json!(tree_id));
+
         let _ = std::fs::remove_dir_all(workspace);
         let _ = std::fs::remove_dir_all(home);
     }

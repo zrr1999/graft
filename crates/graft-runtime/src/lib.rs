@@ -131,14 +131,14 @@ struct Cli {
 enum Command {
     /// Clone a Graft object store into a new empty workspace
     Get {
-        /// Remote storage directory or bundle source to copy from
+        /// Git URL or local storage repository to copy from
         remote: PathBuf,
         /// Destination directory for the new empty workspace
         dir: PathBuf,
     },
     /// Synchronize public graft objects with a remote object store
     Sync {
-        /// Remote storage directory for public graft objects
+        /// Git URL or local storage repository for public graft objects
         remote: Option<PathBuf>,
         #[arg(long, help = "Only fetch remote public objects")]
         fetch_only: bool,
@@ -227,7 +227,7 @@ enum Command {
     /// Clone a Graft object store into a new empty workspace
     #[command(hide = true)]
     Clone {
-        /// Remote storage directory or bundle source to copy from
+        /// Git URL or local storage repository to copy from
         remote: PathBuf,
         /// Destination directory for the new empty workspace
         dir: PathBuf,
@@ -1799,6 +1799,43 @@ fn resolve_sync_remote(store: &GraftStore, remote: Option<&Path>) -> Result<Path
     }
 }
 
+fn url_scheme_prefix(value: &str) -> Option<&str> {
+    let (scheme, rest) = value.split_once("://")?;
+    if rest.is_empty() || !is_url_scheme(scheme) {
+        return None;
+    }
+    Some(scheme)
+}
+
+fn is_url_scheme(scheme: &str) -> bool {
+    let mut chars = scheme.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    first.is_ascii_alphabetic()
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
+}
+
+fn is_scp_like_remote(value: &str) -> bool {
+    if value.starts_with('/') || value.starts_with("./") || value.starts_with("../") {
+        return false;
+    }
+    let Some((host, path)) = value.split_once(':') else {
+        return false;
+    };
+    !host.is_empty()
+        && !path.is_empty()
+        && !host.contains('/')
+        && (host.contains('@') || host.contains('.'))
+}
+
+fn is_url_like_sync_remote(remote: &Path) -> bool {
+    remote
+        .as_os_str()
+        .to_str()
+        .is_some_and(|value| url_scheme_prefix(value).is_some() || is_scp_like_remote(value))
+}
+
 fn read_default_sync_remote(store: &GraftStore) -> Result<PathBuf> {
     let path = default_sync_remote_path(store);
     let text = fs::read_to_string(&path).with_context(|| {
@@ -1838,10 +1875,16 @@ fn default_sync_remote_path(store: &GraftStore) -> PathBuf {
 }
 
 fn normalize_sync_remote_path(remote: &Path) -> PathBuf {
+    if is_url_like_sync_remote(remote) {
+        return remote.to_path_buf();
+    }
     normalize_workspace_path(remote)
 }
 
 fn normalize_sync_remote_path_from(base: &Path, remote: &Path) -> PathBuf {
+    if is_url_like_sync_remote(remote) {
+        return remote.to_path_buf();
+    }
     let remote = if remote.is_absolute() {
         remote.to_path_buf()
     } else {

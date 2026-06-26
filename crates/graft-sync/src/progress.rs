@@ -170,9 +170,46 @@ fn remote_last_synced_path(workspace_root: &Path, remote: &Path) -> PathBuf {
 
 fn remote_state_key(remote: &Path) -> String {
     let normalized = remote
-        .canonicalize()
-        .unwrap_or_else(|_| remote.to_path_buf())
-        .to_string_lossy()
-        .into_owned();
+        .as_os_str()
+        .to_str()
+        .filter(|value| url_scheme_prefix(value).is_some() || is_scp_like_remote(value))
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            remote
+                .canonicalize()
+                .unwrap_or_else(|_| remote.to_path_buf())
+                .to_string_lossy()
+                .into_owned()
+        });
     blake3_hex_digest(normalized.as_bytes())[..12].to_string()
+}
+
+fn url_scheme_prefix(value: &str) -> Option<&str> {
+    let (scheme, rest) = value.split_once("://")?;
+    if rest.is_empty() || !is_url_scheme(scheme) {
+        return None;
+    }
+    Some(scheme)
+}
+
+fn is_url_scheme(scheme: &str) -> bool {
+    let mut chars = scheme.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    first.is_ascii_alphabetic()
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
+}
+
+fn is_scp_like_remote(value: &str) -> bool {
+    if value.starts_with('/') || value.starts_with("./") || value.starts_with("../") {
+        return false;
+    }
+    let Some((host, path)) = value.split_once(':') else {
+        return false;
+    };
+    !host.is_empty()
+        && !path.is_empty()
+        && !host.contains('/')
+        && (host.contains('@') || host.contains('.'))
 }

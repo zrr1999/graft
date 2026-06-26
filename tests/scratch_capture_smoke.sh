@@ -58,7 +58,15 @@ candidate=$(first_graft_id candidate "$candidate_out")
 grep -q 'first.txt' <<<"$candidate_out" || { echo "FAIL: candidate missing captured first.txt"; echo "$candidate_out"; exit 1; }
 
 printf 'second\n' > second.txt
-second_out=$("$GRAFT" scratch capture --base "$base_patch")
+second_out=$(GRAFT_BASE_REF="$base_patch" "$GRAFT" --json scratch capture)
+SECOND_OUT="$second_out" python3 - <<'PY' || { echo "FAIL: env capture result missing provenance"; echo "$second_out"; exit 1; }
+import json, os
+result = json.loads(os.environ["SECOND_OUT"])["result"]
+assert result["scratch"].startswith("scratch:"), result
+assert result["base_state"], result
+assert result["base_tree"].startswith("tree:"), result
+assert "second.txt" in result["changed_paths"], result
+PY
 second_scratch=$(first_graft_id scratch "$second_out")
 [[ -n $second_scratch ]] || { echo "FAIL: second capture did not return scratch"; echo "$second_out"; exit 1; }
 grep -q 'second.txt' <<<"$second_out" || { echo "FAIL: second capture missing second.txt"; echo "$second_out"; exit 1; }

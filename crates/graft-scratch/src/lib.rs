@@ -58,6 +58,19 @@ pub enum ReadMode {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScratchBaseMetadata {
+    pub base_state: StateId,
+    pub base_tree: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScratchOpen {
+    pub scratch: ScratchId,
+    pub base_state: StateId,
+    pub base_tree: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScratchRead {
     pub scratch: ScratchId,
     pub path: String,
@@ -94,6 +107,7 @@ pub struct ScratchDelete {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScratchCapture {
     pub scratch: ScratchId,
+    pub base_state: StateId,
     pub base_tree: String,
     pub target_tree: String,
     pub changed_paths: Vec<String>,

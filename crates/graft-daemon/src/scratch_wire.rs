@@ -6,7 +6,7 @@
 
 use graft_client::WireResponse;
 use graft_core::{BaseRefSpec, HashlineEdit, ScratchId, StateId};
-use graft_scratch::{ReadMode, ScratchEngine, ScratchError};
+use graft_scratch::{ReadMode, ScratchBaseMetadata, ScratchEngine, ScratchError, ScratchOpen};
 use graft_store::{TreeGrepOptions, TreeListOptions, VirtualBaseRef};
 use serde_json::{Value, json};
 
@@ -17,11 +17,26 @@ pub(crate) fn scratch_open_response(
     id: String,
     params: &Value,
 ) -> (WireResponse, bool) {
-    match required_str(params, "base").and_then(parse_base_ref) {
-        Ok(base) => match engine.open(base) {
-            Ok(scratch) => (WireResponse::ok(id, json!({"scratch":scratch})), false),
+    match scratch_source(params) {
+        Ok(ScratchSourceParam::Base(base)) => match engine.open_with_metadata(base) {
+            Ok(open) => (WireResponse::ok(id, scratch_open_json(open)), false),
             Err(error) => scratch_error_response(id, error),
         },
+        Ok(ScratchSourceParam::Materialized {
+            base_state,
+            tree_id,
+        }) => match engine.open_materialized_with_metadata(base_state, &tree_id) {
+            Ok(open) => (WireResponse::ok(id, scratch_open_json(open)), false),
+            Err(error) => scratch_error_response(id, error),
+        },
+        Ok(ScratchSourceParam::From(_)) => (
+            WireResponse::error(
+                id,
+                "E_BAD_PARAMS",
+                "scratch_open does not accept from; provide base or resolved base_state/base_tree",
+            ),
+            false,
+        ),
         Err(response) => (response.with_id(id), false),
     }
 }
@@ -36,24 +51,30 @@ pub(crate) fn scratch_read_response(
     let mode = optional_str(params, "mode")
         .and_then(|mode| mode.map(parse_read_mode).unwrap_or(Ok(ReadMode::Hashlines)));
     match (source, path, mode) {
-        (Ok(source), Ok(path), Ok(mode)) => match resolve_scratch_source(engine, source)
-            .and_then(|scratch| engine.read(&scratch, path, mode))
-        {
-            Ok(read) => (
-                WireResponse::ok(
-                    id,
-                    json!({
-                        "scratch": read.scratch,
-                        "path": read.path,
-                        "file_view_hash": read.file_view_hash,
-                        "content": read.content,
-                        "bytes_len": read.bytes.len()
-                    }),
+        (Ok(source), Ok(path), Ok(mode)) => {
+            match resolve_scratch_source(engine, source).and_then(|source| {
+                engine
+                    .read(&source.scratch, path, mode)
+                    .map(|read| (source, read))
+            }) {
+                Ok((source, read)) => (
+                    WireResponse::ok(
+                        id,
+                        json!({
+                            "scratch": read.scratch,
+                            "base_state": source.base_state,
+                            "base_tree": source.base_tree,
+                            "path": read.path,
+                            "file_view_hash": read.file_view_hash,
+                            "content": read.content,
+                            "bytes_len": read.bytes.len()
+                        }),
+                    ),
+                    false,
                 ),
-                false,
-            ),
-            Err(error) => scratch_error_response(id, error),
-        },
+                Err(error) => scratch_error_response(id, error),
+            }
+        }
         (Err(response), _, _) | (_, Err(response), _) | (_, _, Err(response)) => {
             (response.with_id(id), false)
         }
@@ -70,14 +91,19 @@ pub(crate) fn scratch_write_response(
     let content = required_str(params, "content");
     match (source, path, content) {
         (Ok(source), Ok(path), Ok(content)) => match resolve_scratch_source(engine, source)
-            .and_then(|scratch| engine.write(&scratch, path, content.as_bytes()))
-        {
-            Ok(write) => (
+            .and_then(|source| {
+                engine
+                    .write(&source.scratch, path, content.as_bytes())
+                    .map(|write| (source, write))
+            }) {
+            Ok((source, write)) => (
                 WireResponse::ok(
                     id,
                     json!({
                         "parent": write.parent,
                         "scratch": write.scratch,
+                        "base_state": source.base_state,
+                        "base_tree": source.base_tree,
                         "path": write.path,
                         "changed_paths": [write.path],
                         "content_hash": write.content_hash,
@@ -102,15 +128,19 @@ pub(crate) fn scratch_delete_response(
     let source = scratch_source(params);
     let path = required_str(params, "path");
     match (source, path) {
-        (Ok(source), Ok(path)) => match resolve_scratch_source(engine, source)
-            .and_then(|scratch| engine.delete(&scratch, path))
-        {
-            Ok(delete) => (
+        (Ok(source), Ok(path)) => match resolve_scratch_source(engine, source).and_then(|source| {
+            engine
+                .delete(&source.scratch, path)
+                .map(|delete| (source, delete))
+        }) {
+            Ok((source, delete)) => (
                 WireResponse::ok(
                     id,
                     json!({
                         "parent": delete.parent,
                         "scratch": delete.scratch,
+                        "base_state": source.base_state,
+                        "base_tree": source.base_tree,
                         "path": delete.path,
                         "changed_paths": [delete.path]
                     }),
@@ -136,24 +166,30 @@ pub(crate) fn scratch_edit_response(
         .ok_or_else(|| missing_field("edits"))
         .and_then(|value| serde_json::from_value::<Vec<HashlineEdit>>(value).map_err(bad_params));
     match (source, path, edits) {
-        (Ok(source), Ok(path), Ok(edits)) => match resolve_scratch_source(engine, source)
-            .and_then(|scratch| engine.edit(&scratch, path, edits))
-        {
-            Ok(edit) => (
-                WireResponse::ok(
-                    id,
-                    json!({
-                        "parent": edit.parent,
-                        "scratch": edit.scratch,
-                        "path": edit.path,
-                        "changed_paths": [edit.path],
-                        "updated_anchors": edit.updated_anchors
-                    }),
+        (Ok(source), Ok(path), Ok(edits)) => {
+            match resolve_scratch_source(engine, source).and_then(|source| {
+                engine
+                    .edit(&source.scratch, path, edits)
+                    .map(|edit| (source, edit))
+            }) {
+                Ok((source, edit)) => (
+                    WireResponse::ok(
+                        id,
+                        json!({
+                            "parent": edit.parent,
+                            "scratch": edit.scratch,
+                            "base_state": source.base_state,
+                            "base_tree": source.base_tree,
+                            "path": edit.path,
+                            "changed_paths": [edit.path],
+                            "updated_anchors": edit.updated_anchors
+                        }),
+                    ),
+                    false,
                 ),
-                false,
-            ),
-            Err(error) => scratch_error_response(id, error),
-        },
+                Err(error) => scratch_error_response(id, error),
+            }
+        }
         (Err(response), _, _) | (_, Err(response), _) | (_, _, Err(response)) => {
             (response.with_id(id), false)
         }
@@ -176,6 +212,7 @@ pub(crate) fn scratch_capture_response(
                         id,
                         json!({
                             "scratch": capture.scratch,
+                            "base_state": capture.base_state,
                             "base_tree": capture.base_tree,
                             "target_tree": capture.target_tree,
                             "changed_paths": capture.changed_paths
@@ -478,17 +515,55 @@ fn materialized_base(params: &Value) -> HandlerResult<Option<(StateId, String)>>
     }
 }
 
+struct ResolvedScratchSource {
+    scratch: ScratchId,
+    base_state: StateId,
+    base_tree: String,
+}
+
+fn scratch_open_json(open: ScratchOpen) -> Value {
+    json!({
+        "scratch": open.scratch,
+        "base_state": open.base_state,
+        "base_tree": open.base_tree
+    })
+}
+
 fn resolve_scratch_source(
     engine: &ScratchEngine,
     source: ScratchSourceParam,
-) -> graft_scratch::Result<ScratchId> {
+) -> graft_scratch::Result<ResolvedScratchSource> {
     match source {
-        ScratchSourceParam::Base(base) => engine.open(base),
+        ScratchSourceParam::Base(base) => {
+            let open = engine.open_with_metadata(base)?;
+            Ok(ResolvedScratchSource {
+                scratch: open.scratch,
+                base_state: open.base_state,
+                base_tree: open.base_tree,
+            })
+        }
         ScratchSourceParam::Materialized {
             base_state,
             tree_id,
-        } => engine.open_materialized(base_state, &tree_id),
-        ScratchSourceParam::From(scratch) => Ok(scratch),
+        } => {
+            let open = engine.open_materialized_with_metadata(base_state, &tree_id)?;
+            Ok(ResolvedScratchSource {
+                scratch: open.scratch,
+                base_state: open.base_state,
+                base_tree: open.base_tree,
+            })
+        }
+        ScratchSourceParam::From(scratch) => {
+            let ScratchBaseMetadata {
+                base_state,
+                base_tree,
+            } = engine.base_metadata(&scratch)?;
+            Ok(ResolvedScratchSource {
+                scratch,
+                base_state,
+                base_tree,
+            })
+        }
     }
 }
 

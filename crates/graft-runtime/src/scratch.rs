@@ -1,3 +1,4 @@
+use std::env;
 use std::io::{self, Read};
 use std::path::Path;
 
@@ -16,20 +17,20 @@ use crate::daemon_client::{
 use crate::repo::{materialized_snapshot_for_state, resolve_base_state};
 use crate::view::CommandEnvelope;
 
+const GRAFT_BASE_REF_ENV: &str = "GRAFT_BASE_REF";
+
 #[derive(Args, Debug)]
 pub(crate) struct ScratchSource {
     #[arg(
         long,
         value_name = "BASE",
-        required_unless_present = "from",
         conflicts_with = "from",
-        help = "Base ref for the first scratch operation; bare refs resolve in --repo or workspace context"
+        help = "Base ref for the first scratch operation; bare refs resolve in --repo or workspace context. Defaults to GRAFT_BASE_REF when omitted."
     )]
     base: Option<String>,
     #[arg(
         long,
         value_name = "SCRATCH",
-        required_unless_present = "base",
         conflicts_with = "base",
         help = "Scratch id to continue editing"
     )]
@@ -52,9 +53,9 @@ pub(crate) enum ScratchCommand {
         #[arg(
             long,
             value_name = "BASE",
-            help = "Base ref to open: graft:empty, tree:<id>, candidate:<id>, or patch:<id>"
+            help = "Base ref to open: graft:empty, tree:<id>, candidate:<id>, patch:<id>, or a treeish resolved by the CLI. Defaults to GRAFT_BASE_REF when omitted."
         )]
-        base: String,
+        base: Option<String>,
     },
     /// Read a file from a base tree or scratch
     Read {
@@ -106,9 +107,9 @@ pub(crate) enum ScratchCommand {
         #[arg(
             long,
             value_name = "BASE",
-            help = "Base ref to restore cwd to after capture"
+            help = "Base ref to restore cwd to after capture. Defaults to GRAFT_BASE_REF when omitted."
         )]
-        base: String,
+        base: Option<String>,
         #[arg(
             long,
             value_name = "REPO",
@@ -148,7 +149,7 @@ pub(crate) fn run_scratch_command(
         }
         ScratchCommand::Open { base } => (
             "scratch_open",
-            json!({"base": base}),
+            params_with_base(workspace_root, None, base.as_deref())?,
             ScratchResultContract::Open,
         ),
         ScratchCommand::Read { source, path, mode } => (
@@ -215,7 +216,7 @@ pub(crate) fn run_scratch_command(
                 workspace_root,
                 workspace_id,
                 &socket,
-                base,
+                base.as_deref(),
                 repo.as_deref(),
                 *dry_run,
             );
@@ -297,31 +298,86 @@ fn params_with_source(
     source: &ScratchSource,
     extra: impl IntoIterator<Item = (&'static str, Value)>,
 ) -> Result<Value> {
-    let mut params = Map::new();
-    if let Some(base) = &source.base {
-        match scratch_base_params(workspace_root, source.repo.as_deref(), base)? {
-            ScratchBaseParams::Raw(base) => {
-                params.insert("base".to_string(), json!(base));
-            }
-            ScratchBaseParams::Materialized {
-                base_state,
-                tree_id,
-            } => {
-                params.insert("base_state".to_string(), serde_json::to_value(base_state)?);
-                params.insert("base_tree".to_string(), json!(tree_id));
-            }
-        }
-    }
-    if let Some(from) = &source.from {
+    let mut params = if let Some(from) = &source.from {
         if source.repo.is_some() {
             bail!("[E_BAD_PARAMS] --repo only scopes --base; omit it when using --from");
         }
+        let mut params = Map::new();
         params.insert("from".to_string(), json!(from));
-    }
+        params
+    } else {
+        params_with_base_map(
+            workspace_root,
+            source.repo.as_deref(),
+            source.base.as_deref(),
+        )?
+    };
     for (key, value) in extra {
         params.insert(key.to_string(), value);
     }
     Ok(Value::Object(params))
+}
+
+fn params_with_base(
+    workspace_root: &Path,
+    repo: Option<&str>,
+    base: Option<&str>,
+) -> Result<Value> {
+    Ok(Value::Object(params_with_base_map(
+        workspace_root,
+        repo,
+        base,
+    )?))
+}
+
+fn params_with_base_map(
+    workspace_root: &Path,
+    repo: Option<&str>,
+    base: Option<&str>,
+) -> Result<Map<String, Value>> {
+    if base.is_none() && repo.is_some() {
+        bail!(
+            "[E_BAD_PARAMS] --repo only scopes --base; pass --base, or set {GRAFT_BASE_REF_ENV}=repo:<id>@<treeish>"
+        );
+    }
+    let base = base_or_env(base)?;
+    let mut params = Map::new();
+    match scratch_base_params(workspace_root, repo, &base)? {
+        ScratchBaseParams::Raw(base) => {
+            params.insert("base".to_string(), json!(base));
+        }
+        ScratchBaseParams::Materialized {
+            base_state,
+            tree_id,
+        } => {
+            params.insert("base_state".to_string(), serde_json::to_value(base_state)?);
+            params.insert("base_tree".to_string(), json!(tree_id));
+        }
+    }
+    Ok(params)
+}
+
+fn base_or_env(base: Option<&str>) -> Result<String> {
+    if let Some(base) = base {
+        return Ok(base.to_string());
+    }
+    match env::var(GRAFT_BASE_REF_ENV) {
+        Ok(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                bail!(
+                    "[E_MISSING_BASE] {GRAFT_BASE_REF_ENV} is set but empty; pass --base or --from, or set {GRAFT_BASE_REF_ENV}"
+                );
+            }
+            Ok(trimmed.to_string())
+        }
+        Err(env::VarError::NotPresent) => bail!(
+            "[E_MISSING_BASE] scratch operation requires --base or --from, or set {GRAFT_BASE_REF_ENV} for the first operation"
+        ),
+        Err(env::VarError::NotUnicode(_)) => {
+            bail!("[E_INVALID_BASE] {GRAFT_BASE_REF_ENV} must be valid UTF-8")
+        }
+    }
 }
 
 enum ScratchBaseParams {
@@ -385,11 +441,17 @@ fn materialized_scratch_base(workspace_root: &Path, base: &str) -> Result<Scratc
 fn resolved_capture_base(
     workspace_root: &Path,
     repo: Option<&str>,
-    base: &str,
+    base: Option<&str>,
 ) -> Result<(StateId, String, graft_core::TreeSnapshot)> {
+    if base.is_none() && repo.is_some() {
+        bail!(
+            "[E_BAD_PARAMS] --repo only scopes --base; pass --base, or set {GRAFT_BASE_REF_ENV}=repo:<id>@<treeish>"
+        );
+    }
+    let base = base_or_env(base)?;
     let base = match repo {
-        Some(repo_id) => repo_context_base(repo_id, base)?,
-        None => base.to_string(),
+        Some(repo_id) => repo_context_base(repo_id, &base)?,
+        None => base,
     };
     let store = GraftStore::open(workspace_root);
     let config = load_graft_config_metadata(&store)?;
@@ -403,7 +465,7 @@ fn run_scratch_capture(
     workspace_root: &Path,
     workspace_id: &str,
     socket: &Path,
-    base: &str,
+    base: Option<&str>,
     repo: Option<&str>,
     dry_run: bool,
 ) -> Result<CommandEnvelope> {
@@ -426,9 +488,13 @@ fn run_scratch_capture(
     }
 
     if dry_run {
-        let scratch = scratch_id(&ScratchNode::root(base_state, target_tree_id.clone()))?;
+        let scratch = scratch_id(&ScratchNode::root(
+            base_state.clone(),
+            target_tree_id.clone(),
+        ))?;
         let result = json!({
             "scratch": scratch,
+            "base_state": base_state,
             "base_tree": base_tree_id,
             "target_tree": target_tree_id,
             "changed_paths": changed_paths,
@@ -480,31 +546,36 @@ fn validate_result_contract(result: &Value, contract: ScratchResultContract) -> 
         }
         ScratchResultContract::Open => {
             required_string_field(result, "scratch_open", "scratch")?;
+            require_scratch_base_fields(result, "scratch_open")?;
         }
         ScratchResultContract::Read => {
             require_scratch_path_fields(result, "scratch_read")?;
+            require_scratch_base_fields(result, "scratch_read")?;
             required_string_field(result, "scratch_read", "file_view_hash")?;
             required_string_field(result, "scratch_read", "content")?;
             require_u64_field(result, "scratch_read", "bytes_len")?;
         }
         ScratchResultContract::Write => {
             require_scratch_path_fields(result, "scratch_write")?;
+            require_scratch_base_fields(result, "scratch_write")?;
             require_string_array_field(result, "scratch_write", "changed_paths")?;
             required_string_field(result, "scratch_write", "content_hash")?;
             require_u64_field(result, "scratch_write", "size")?;
         }
         ScratchResultContract::Edit => {
             require_scratch_path_fields(result, "scratch_edit")?;
+            require_scratch_base_fields(result, "scratch_edit")?;
             require_string_array_field(result, "scratch_edit", "changed_paths")?;
             required_string_field(result, "scratch_edit", "updated_anchors")?;
         }
         ScratchResultContract::Delete => {
             require_scratch_path_fields(result, "scratch_delete")?;
+            require_scratch_base_fields(result, "scratch_delete")?;
             require_string_array_field(result, "scratch_delete", "changed_paths")?;
         }
         ScratchResultContract::Capture => {
             required_string_field(result, "scratch_capture", "scratch")?;
-            required_string_field(result, "scratch_capture", "base_tree")?;
+            require_scratch_base_fields(result, "scratch_capture")?;
             required_string_field(result, "scratch_capture", "target_tree")?;
             require_string_array_field(result, "scratch_capture", "changed_paths")?;
         }
@@ -543,6 +614,14 @@ fn require_scratch_path_fields(result: &Value, context: &str) -> Result<()> {
     Ok(())
 }
 
+fn require_scratch_base_fields(result: &Value, context: &str) -> Result<()> {
+    if result.get("base_state").is_none() {
+        bail!("[E_BAD_DAEMON_RESPONSE] {context} result missing field `base_state`");
+    }
+    required_string_field(result, context, "base_tree")?;
+    Ok(())
+}
+
 fn render_result(result: &Value) -> Result<String> {
     if let Some(content) = result.get("content").and_then(Value::as_str) {
         return Ok(content.to_string());
@@ -554,6 +633,44 @@ fn render_result(result: &Value) -> Result<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    struct EnvGuard {
+        key: &'static str,
+        old: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let old = env::var_os(key);
+            unsafe { env::set_var(key, value) };
+            Self { key, old }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let old = env::var_os(key);
+            unsafe { env::remove_var(key) };
+            Self { key, old }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.old {
+                Some(old) => unsafe { env::set_var(self.key, old) },
+                None => unsafe { env::remove_var(self.key) },
+            }
+        }
+    }
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env lock poisoned")
+    }
 
     #[test]
     fn daemon_socket_path_uses_run_daemon_sock() {
@@ -594,6 +711,118 @@ mod tests {
     }
 
     #[test]
+    fn params_with_source_defaults_to_graft_base_ref_env() {
+        let _lock = env_lock();
+        let _guard = EnvGuard::set(GRAFT_BASE_REF_ENV, " graft:empty ");
+        let source = ScratchSource {
+            base: None,
+            from: None,
+            repo: None,
+        };
+
+        let params =
+            params_with_source(Path::new("."), &source, [("path", json!("note.txt"))]).unwrap();
+
+        assert_eq!(params["base"].as_str(), Some("graft:empty"));
+        assert_eq!(params["path"].as_str(), Some("note.txt"));
+        assert!(params.get("from").is_none());
+    }
+
+    #[test]
+    fn params_with_source_explicit_base_wins_over_env() {
+        let _lock = env_lock();
+        let _guard = EnvGuard::set(GRAFT_BASE_REF_ENV, "candidate:env");
+        let source = ScratchSource {
+            base: Some("graft:empty".to_string()),
+            from: None,
+            repo: None,
+        };
+
+        let params =
+            params_with_source(Path::new("."), &source, [("path", json!("note.txt"))]).unwrap();
+
+        assert_eq!(params["base"].as_str(), Some("graft:empty"));
+    }
+
+    #[test]
+    fn params_with_source_from_ignores_env() {
+        let _lock = env_lock();
+        let _guard = EnvGuard::set(GRAFT_BASE_REF_ENV, "graft:empty");
+        let source = ScratchSource {
+            base: None,
+            from: Some("scratch:abc".to_string()),
+            repo: None,
+        };
+
+        let params =
+            params_with_source(Path::new("."), &source, [("path", json!("note.txt"))]).unwrap();
+
+        assert_eq!(params["from"].as_str(), Some("scratch:abc"));
+        assert!(params.get("base").is_none());
+    }
+
+    #[test]
+    fn params_with_source_requires_base_from_or_env() {
+        let _lock = env_lock();
+        let _guard = EnvGuard::remove(GRAFT_BASE_REF_ENV);
+        let source = ScratchSource {
+            base: None,
+            from: None,
+            repo: None,
+        };
+
+        let error = params_with_source(Path::new("."), &source, [("path", json!("note.txt"))])
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("E_MISSING_BASE"), "{error}");
+        assert!(error.contains(GRAFT_BASE_REF_ENV), "{error}");
+    }
+
+    #[test]
+    fn params_with_source_rejects_blank_env_base() {
+        let _lock = env_lock();
+        let _guard = EnvGuard::set(GRAFT_BASE_REF_ENV, " \t ");
+        let source = ScratchSource {
+            base: None,
+            from: None,
+            repo: None,
+        };
+
+        let error = params_with_source(Path::new("."), &source, [("path", json!("note.txt"))])
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("E_MISSING_BASE"), "{error}");
+        assert!(error.contains("set but empty"), "{error}");
+    }
+
+    #[test]
+    fn params_with_source_rejects_invalid_env_base_ref() {
+        let _lock = env_lock();
+        let _guard = EnvGuard::set(GRAFT_BASE_REF_ENV, "repo:missing@main");
+        let workspace = env::temp_dir().join(format!(
+            "graft-runtime-invalid-env-base-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&workspace);
+        std::fs::create_dir_all(&workspace).unwrap();
+        GraftStore::open(&workspace).init().unwrap();
+        let source = ScratchSource {
+            base: None,
+            from: None,
+            repo: None,
+        };
+
+        let error = params_with_source(&workspace, &source, [("path", json!("note.txt"))])
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("repo:missing@main"), "{error}");
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
     fn repo_context_base_rewrites_bare_treeish_only() {
         assert_eq!(repo_context_base("C", "main").unwrap(), "repo:C@main");
         assert!(repo_context_base("workspace", "main").is_err());
@@ -605,7 +834,9 @@ mod tests {
     fn result_to_envelope_accepts_valid_open_payload() {
         let envelope = result_to_envelope(
             json!({
-                "scratch": "scratch:next"
+                "scratch": "scratch:next",
+                "base_state": StateId::GraftTree("tree:base".to_string()),
+                "base_tree": "tree:base"
             }),
             ScratchResultContract::Open,
         )
@@ -621,6 +852,8 @@ mod tests {
             json!({
                 "parent": "scratch:parent",
                 "scratch": "scratch:next",
+                "base_state": StateId::GraftTree("tree:base".to_string()),
+                "base_tree": "tree:base",
                 "path": "note.txt",
                 "changed_paths": ["note.txt"],
                 "content_hash": "blob:abc",
@@ -656,6 +889,8 @@ mod tests {
             json!({
                 "parent": "scratch:parent",
                 "scratch": "scratch:next",
+                "base_state": StateId::GraftTree("tree:base".to_string()),
+                "base_tree": "tree:base",
                 "path": "note.txt",
                 "changed_paths": ["note.txt"],
                 "updated_anchors": "1#abc:hello"
@@ -673,6 +908,7 @@ mod tests {
         let envelope = result_to_envelope(
             json!({
                 "scratch": "scratch:next",
+                "base_state": StateId::GraftTree("tree:base".to_string()),
                 "base_tree": "tree:base",
                 "target_tree": "tree:target",
                 "changed_paths": ["note.txt"]
@@ -719,6 +955,8 @@ mod tests {
                 ScratchResultContract::Read,
                 json!({
                     "scratch": "scratch:next",
+                    "base_state": StateId::GraftTree("tree:base".to_string()),
+                    "base_tree": "tree:base",
                     "path": "note.txt",
                     "content": "hello",
                     "bytes_len": 5
@@ -729,6 +967,8 @@ mod tests {
                 ScratchResultContract::Write,
                 json!({
                     "scratch": "scratch:next",
+                    "base_state": StateId::GraftTree("tree:base".to_string()),
+                    "base_tree": "tree:base",
                     "path": "note.txt",
                     "changed_paths": ["note.txt"],
                     "content_hash": "blob:abc"
@@ -739,6 +979,8 @@ mod tests {
                 ScratchResultContract::Edit,
                 json!({
                     "scratch": "scratch:next",
+                    "base_state": StateId::GraftTree("tree:base".to_string()),
+                    "base_tree": "tree:base",
                     "path": "note.txt",
                     "changed_paths": ["note.txt", false],
                     "updated_anchors": "fresh"
@@ -749,6 +991,7 @@ mod tests {
                 ScratchResultContract::Capture,
                 json!({
                     "scratch": "scratch:next",
+                    "base_state": StateId::GraftTree("tree:base".to_string()),
                     "base_tree": "tree:base",
                     "target_tree": "tree:target"
                 }),

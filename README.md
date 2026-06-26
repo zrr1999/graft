@@ -24,7 +24,7 @@ scratch operation -> candidate -> validate evidence -> admit patch -> materializ
 graft explain agent-workflow
 ```
 
-pi-graft 的 `graft_help` 工具应默认展示这个 topic；具体概念继续用 `graft explain scratch`、`graft explain candidate`、`graft explain admit`、`graft explain materialize` 等查询。高频智能体主路径是 scratch 草稿（`graft scratch read|write|edit|delete --base/--from ...`）→ `graft patch from-scratch` → `graft patch validate` → `graft patch admit` → `graft patch materialize` / `graft run` 检查输出；只有在已有当前目录 dirty state 时，才用 `graft scratch capture --base <ref>` 显式桥接并恢复当前目录。外部 `graft patch promote`、sync、compose/migrate/revert、`repo add/sync/lock/update`、`bundle import`、`workspace gc --apply` 等低频写命令可通过手动 CLI 或 pi-graft `graft_cli_exec` argv 显式执行，读/检查命令保留本地 CLI 路径。pi-graft typed tools 已验证为显式 UTF-8 文本 read/write/edit/delete 替代路径：首次草稿操作只传 `base`，后续只传 `from`，同一 workspace/daemon 上的 lifecycle 与 inspection 调用应顺序执行而不是并行执行。
+pi-graft 的 `graft_help` 工具应默认展示这个 topic；具体概念继续用 `graft explain scratch`、`graft explain candidate`、`graft explain admit`、`graft explain materialize` 等查询。高频智能体主路径是 scratch 草稿（`graft scratch read|write|edit|delete --base/--from ...`，或由工作流环境 `GRAFT_BASE_REF` 提供首次操作的隐式 base）→ `graft patch from-scratch` → `graft patch validate` → `graft patch admit` → `graft patch materialize` / `graft run` 检查输出；只有在已有当前目录 dirty state 时，才用 `graft scratch capture --base <ref>`（或 `GRAFT_BASE_REF=<ref> graft scratch capture`）显式桥接并恢复当前目录。外部 `graft patch promote`、sync、compose/migrate/revert、`repo add/sync/lock/update`、`bundle import`、`workspace gc --apply` 等低频写命令可通过手动 CLI 或 pi-graft `graft_cli_exec` argv 显式执行，读/检查命令保留本地 CLI 路径。pi-graft typed tools 已验证为显式 UTF-8 文本 read/write/edit/delete 替代路径：首次草稿操作只传 `base` 或依赖 `GRAFT_BASE_REF`，后续只传 `from`，同一 workspace/daemon 上的 lifecycle 与 inspection 调用应顺序执行而不是并行执行。
 
 ## 当前状态
 
@@ -210,22 +210,22 @@ refs/graft/manifests
 # enabled by default for normal workspaces; set false to opt out:
 # [sync]
 # enabled = true
-graft sync /path/to/storage.git
+graft sync https://github.com/org/graft-store.git
 graft sync                         # reuse the last explicit sync remote
 graft sync /path/to/storage.git --fetch-only
-graft sync /path/to/storage.git --push-only
+graft sync https://github.com/org/graft-store.git --push-only
 graft patch incoming
 graft verify-pending
 ```
 
-`ws:default` 永不同步。其他工作区默认同步，除非在 `graft.toml` 中设置 `[sync] enabled = false`。第一次显式执行 `graft sync <remote>` 会记录该工作区的默认 remote；后续 `graft sync` 使用这个已记录 remote。
+`ws:default` 永不同步。其他工作区默认同步，除非在 `graft.toml` 中设置 `[sync] enabled = false`。第一次显式执行 `graft sync <remote>` 会记录该工作区的默认 remote；后续 `graft sync` 使用这个已记录 remote。`<remote>` 可以是本地 storage repo 路径，也可以是支持 push/fetch `refs/graft/*` 的 Git URL（例如 `https://github.com/org/graft-store.git`）。
 
 `evidence_refs` 会同步；`store/derived/evidence/` 不同步，新 clone 需要通过 `graft verify-pending` 在本地重建。
 
 克隆不物化当前目录：
 
 ```bash
-graft get /path/to/storage.git ./clone
+graft get https://github.com/org/graft-store.git ./clone
 cd clone
 graft patch incoming
 graft patch materialize patch:<digest>
@@ -252,12 +252,12 @@ graft patch promote patch:<digest> --to docs --yes
 
 ## Scratch 草稿
 
-`scratch` 是由 daemon 支持的临时草稿状态图。第一次读、写、编辑或删除直接用 `--base`，后续草稿变更用 `--from` 续写；`--repo <id>` 只用于指定 `--base` 的 repo 上下文，不写则使用 workspace。candidate 生成不属于 `scratch` namespace，而是独立的 candidate 生命周期入口：
+`scratch` 是由 daemon 支持的临时草稿状态图。第一次 open/read/write/edit/delete/capture 直接用 `--base`；也可以由工作流/子进程环境设置 `GRAFT_BASE_REF`，在未提供 `--base` 且未提供 `--from` 时作为隐式 base。显式 `--base` 总是优先，显式 `--from` 不读取环境 base；缺少三者会以 `E_MISSING_BASE` 失败。`GRAFT_BASE_REF` 与 `--base` 走同一解析路径，支持 `graft:empty`、`tree:`、`candidate:`、`patch:`、`repo:<id>@<treeish>` 以及 workspace git commit/treeish。`--repo <id>` 只用于指定 `--base` 的 repo 上下文，不写则使用 workspace。candidate 生成不属于 `scratch` namespace，而是独立的 candidate 生命周期入口：
 
 ```bash
 graft scratch read --base patch:<digest> path/to/file --mode hashlines
 graft scratch read --repo C --base main graft.toml --mode text
-graft scratch write --base patch:<digest> new.txt --content $'hello
+GRAFT_BASE_REF=patch:<digest> graft scratch write new.txt --content $'hello
 '
 graft scratch edit --from scratch:<digest> file.txt --edits '[...]'
 graft scratch delete --from scratch:<digest> file.txt   # alias: rm

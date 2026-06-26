@@ -14,13 +14,24 @@ source tests/lib/smoke.sh
 setup_bins
 setup_workspace
 PROJECT="$WORKDIR/project"
+REPO="$WORKDIR/base-repo"
 trap cleanup_workspace EXIT
-mkdir -p "$PROJECT"
+mkdir -p "$PROJECT" "$REPO"
 require_local_socket_bind
 printf 'hello\n' > "$PROJECT/hello.txt"
+printf 'hello\n' > "$REPO/hello.txt"
 mkdir -p "$PROJECT/nested"
+git -C "$REPO" init -q
+git -C "$REPO" config user.email "graft-smoke@example.invalid"
+git -C "$REPO" config user.name "Graft Smoke"
+git -C "$REPO" config commit.gpgsign false
+git -C "$REPO" add hello.txt
+git -C "$REPO" commit -qm base
+base_commit=$(git -C "$REPO" rev-parse HEAD)
 
 "$GRAFT" --cwd "$PROJECT" init >/dev/null
+"$GRAFT" --cwd "$PROJECT" repo add --default-branch "$base_commit" base "$REPO" >/dev/null
+"$GRAFT" --cwd "$PROJECT" repo lock base >/dev/null
 seed_write=$("$GRAFT" --cwd "$PROJECT/nested" scratch write --base graft:empty hello.txt --content $'hello\n')
 seed_scratch=$(grep -oE 'scratch:[0-9a-f]+' <<<"$seed_write" | tail -n1)
 [[ -n $seed_scratch ]] || { echo "FAIL: no seed scratch"; echo "$seed_write"; exit 1; }
@@ -41,6 +52,45 @@ status_no_workspace=$("$GRAFT" --cwd "$NO_WORKSPACE" scratch status)
 grep -q '"daemon": "graftd"' <<<"$status_no_workspace" || {
   echo "FAIL: scratch status should not require workspace discovery"; echo "$status_no_workspace"; exit 1;
 }
+
+if env -u GRAFT_BASE_REF "$GRAFT" --cwd "$PROJECT" scratch read hello.txt --mode text >/tmp/graft-scratch-missing-base.out 2>&1; then
+  echo "FAIL: scratch read without base/from/GRAFT_BASE_REF unexpectedly succeeded"; exit 1
+fi
+grep -q 'E_MISSING_BASE' /tmp/graft-scratch-missing-base.out || {
+  echo "FAIL: missing implicit base did not mention E_MISSING_BASE"; cat /tmp/graft-scratch-missing-base.out; exit 1;
+}
+
+env_read=$(GRAFT_BASE_REF="$candidate" "$GRAFT" --cwd "$PROJECT" scratch read hello.txt --mode text)
+grep -q 'hello' <<<"$env_read" || { echo "FAIL: env base candidate read missing content"; echo "$env_read"; exit 1; }
+
+git_hash_read=$(GRAFT_BASE_REF="repo:base@$base_commit" "$GRAFT" --cwd "$PROJECT" --json scratch read hello.txt --mode text)
+GIT_HASH_READ="$git_hash_read" python3 - <<'PY' || { echo "FAIL: env base repo git hash read missing provenance"; echo "$git_hash_read"; exit 1; }
+import json, os
+result = json.loads(os.environ["GIT_HASH_READ"])["result"]
+assert result["content"] == "hello\n", result
+assert result["base_state"], result
+assert result["base_tree"].startswith("tree:"), result
+PY
+
+if GRAFT_BASE_REF="repo:missing@main" "$GRAFT" --cwd "$PROJECT" scratch read hello.txt --mode text >/tmp/graft-scratch-invalid-env.out 2>&1; then
+  echo "FAIL: invalid GRAFT_BASE_REF unexpectedly succeeded"; exit 1
+fi
+grep -q 'repo:missing@main' /tmp/graft-scratch-invalid-env.out || {
+  echo "FAIL: invalid GRAFT_BASE_REF did not mention the bad ref"; cat /tmp/graft-scratch-invalid-env.out; exit 1;
+}
+
+env_open=$(GRAFT_BASE_REF="$candidate" "$GRAFT" --cwd "$PROJECT" --json scratch open)
+ENV_OPEN="$env_open" python3 - <<'PY' || { echo "FAIL: env base scratch open missing provenance"; echo "$env_open"; exit 1; }
+import json, os
+result = json.loads(os.environ["ENV_OPEN"])["result"]
+assert result["scratch"].startswith("scratch:"), result
+assert result["base_state"], result
+assert result["base_tree"].startswith("tree:"), result
+PY
+
+override_write=$(GRAFT_BASE_REF="repo:missing@main" "$GRAFT" --cwd "$PROJECT" scratch write --base graft:empty override.txt --content $'override\n')
+override_scratch=$(grep -oE 'scratch:[0-9a-f]+' <<<"$override_write" | tail -n1)
+[[ -n $override_scratch ]] || { echo "FAIL: explicit base did not override invalid env base"; echo "$override_write"; exit 1; }
 
 open_out=$("$GRAFT" --cwd "$PROJECT" --json scratch open --base "$candidate")
 open_scratch=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["scratch"])' <<<"$open_out")

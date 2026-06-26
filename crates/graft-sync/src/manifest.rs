@@ -2,7 +2,9 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-use graft_core::{blake3_hex_digest, stable_typed_id};
+#[cfg(test)]
+use graft_core::blake3_hex_digest;
+use graft_core::stable_typed_id;
 use serde::{Deserialize, Serialize};
 
 use crate::{Result, SyncError};
@@ -54,19 +56,22 @@ pub(crate) fn write_partition_ref(
     remote_public: &Path,
     partition: PublicPartition,
 ) -> Result<String> {
-    let digest = digest_public_partition(remote_public, partition)?;
-    let body = serde_json::json!({
-        "version": 1,
-        "partition": partition.label(),
-        "digest": digest,
-        "written_at": time::OffsetDateTime::now_utc().to_string(),
-    });
-    let bytes = serde_json::to_vec_pretty(&body)?;
-    let blob = repo
-        .write_blob(bytes)
-        .map_err(|err| SyncError::Gix(err.to_string()))?;
-    update_ref(repo, partition.ref_name(), blob.to_string())?;
-    Ok(blob.to_string())
+    match partition {
+        PublicPartition::Facts => crate::write_tree_commit_ref(
+            repo,
+            remote_public,
+            is_public_fact_path,
+            partition.ref_name(),
+            "graft sync facts",
+        ),
+        PublicPartition::Blobs => crate::write_tree_commit_ref(
+            repo,
+            &remote_public.join("blob"),
+            |_| true,
+            partition.ref_name(),
+            "graft sync blobs",
+        ),
+    }
 }
 
 pub(crate) fn write_manifest(
@@ -89,10 +94,13 @@ pub(crate) fn write_manifest(
     };
     manifest.id = expected_manifest_id(&manifest)?;
     write_manifest_sidecar(remote_public, &manifest)?;
-    let blob = repo
-        .write_blob(serde_json::to_vec_pretty(&manifest)?)
-        .map_err(|err| SyncError::Gix(err.to_string()))?;
-    update_ref(repo, "refs/graft/manifests", blob.to_string())?;
+    crate::write_tree_commit_ref(
+        repo,
+        &remote_public.join("manifest"),
+        |_| true,
+        crate::MANIFESTS_REF,
+        "graft sync manifests",
+    )?;
     Ok(manifest)
 }
 
@@ -366,24 +374,12 @@ fn is_lower_hex_digit(byte: u8) -> bool {
     byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
 }
 
-fn update_ref(repo: &gix::Repository, ref_name: &str, target: String) -> Result<()> {
-    use std::str::FromStr;
-
-    let target = gix::ObjectId::from_str(&target).map_err(|err| SyncError::Gix(err.to_string()))?;
-    repo.reference(
-        ref_name,
-        target,
-        gix::refs::transaction::PreviousValue::Any,
-        format!("graft sync update {ref_name}"),
-    )
-    .map_err(|err| SyncError::Gix(err.to_string()))?;
-    Ok(())
-}
-
+#[cfg(test)]
 fn digest_public_tree(root: &Path) -> Result<String> {
     digest_tree_filtered(root, |_| true)
 }
 
+#[cfg(test)]
 pub(crate) fn digest_public_partition(root: &Path, partition: PublicPartition) -> Result<String> {
     match partition {
         PublicPartition::Facts => digest_tree_filtered(root, is_public_fact_path),
@@ -391,6 +387,7 @@ pub(crate) fn digest_public_partition(root: &Path, partition: PublicPartition) -
     }
 }
 
+#[cfg(test)]
 fn digest_tree_filtered<F>(root: &Path, include: F) -> Result<String>
 where
     F: Copy + Fn(&Path) -> bool,
@@ -401,6 +398,7 @@ where
     Ok(blake3_hex_digest(rows.join("\n").as_bytes()))
 }
 
+#[cfg(test)]
 fn collect_digest_rows<F>(
     root: &Path,
     path: &Path,

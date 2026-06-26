@@ -280,6 +280,15 @@ fn new_and_hidden_compatibility_commands_parse() {
             ..
         }
     ));
+    assert!(matches!(
+        Cli::try_parse_from(["graft", "scratch", "open"])
+            .unwrap()
+            .command,
+        Command::Scratch {
+            command: ScratchCommand::Open { base: None },
+            ..
+        }
+    ));
     match Cli::try_parse_from([
         "graft",
         "scratch",
@@ -307,6 +316,37 @@ fn new_and_hidden_compatibility_commands_parse() {
         }
         other => panic!("unexpected command: {other:?}"),
     }
+    match Cli::try_parse_from(["graft", "scratch", "write", "note.txt", "--content", "env"])
+        .unwrap()
+        .command
+    {
+        Command::Scratch {
+            command:
+                ScratchCommand::Write {
+                    source,
+                    content,
+                    content_stdin,
+                    ..
+                },
+            ..
+        } => {
+            let source_debug = format!("{source:?}");
+            assert!(source_debug.contains("base: None"), "{source_debug}");
+            assert!(source_debug.contains("from: None"), "{source_debug}");
+            assert_eq!(content.as_deref(), Some("env"));
+            assert!(!content_stdin);
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+    assert!(matches!(
+        Cli::try_parse_from(["graft", "scratch", "capture"])
+            .unwrap()
+            .command,
+        Command::Scratch {
+            command: ScratchCommand::Capture { base: None, .. },
+            ..
+        }
+    ));
     match Cli::try_parse_from([
         "graft",
         "scratch",
@@ -2470,6 +2510,23 @@ fn daemon_argv_rejects_sync_when_workspace_explicitly_disables_it() {
 
     let _ = fs::remove_dir_all(&dir);
     let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn sync_url_remote_is_not_normalized_as_relative_path() {
+    let base = Path::new("/tmp/graft-workspace");
+    let remote = Path::new("https://github.com/zrr1999/graft-demo");
+
+    let normalized = normalize_sync_remote_path_from(base, remote);
+
+    assert_eq!(
+        normalized,
+        PathBuf::from("https://github.com/zrr1999/graft-demo")
+    );
+    assert_eq!(
+        normalize_sync_remote_path_from(base, Path::new("git@github.com:zrr1999/graft-demo.git")),
+        PathBuf::from("git@github.com:zrr1999/graft-demo.git")
+    );
 }
 
 #[test]

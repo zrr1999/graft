@@ -523,6 +523,37 @@ fn fetch_records_remote_last_synced() {
 }
 
 #[test]
+fn sync_supports_git_url_remote_refs_without_filesystem_sidecar() {
+    let dir = test_dir("git-url-remote");
+    let source = dir.join("source");
+    let dest = dir.join("dest");
+    let remote = dir.join("remote.git");
+    let source_public = source.join("store").join("public");
+    let patch = write_valid_patch_object(&source_public, "git-url-remote");
+    fs::create_dir_all(&dest).unwrap();
+    gix::init_bare(&remote).unwrap();
+    let remote_url = format!("file://{}", remote.display());
+
+    let pushed = sync_public_store(&source, Path::new(&remote_url), true, false).unwrap();
+
+    assert!(pushed.manifest_id.is_some());
+    assert!(
+        !remote.join("graft-public").exists(),
+        "URL sync should transfer through refs, not a filesystem sidecar"
+    );
+
+    let fetched = sync_public_store(&dest, Path::new(&remote_url), false, true).unwrap();
+
+    assert!(fetched.fetched >= 5, "{fetched:?}");
+    assert!(
+        dest.join("store/public/patch")
+            .join(format!("{patch}.json"))
+            .exists()
+    );
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
 fn push_only_updates_last_synced_when_remote_is_at_recorded_tip() {
     let dir = test_dir("push-recorded-tip");
     let workspace = dir.join("workspace");

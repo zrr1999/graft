@@ -277,6 +277,7 @@ pub(crate) fn load_graft_config_metadata(store: &GraftStore) -> Result<GraftConf
     }
     let text =
         std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    reject_legacy_graft_config(&text, &path)?;
     let config: GraftConfig =
         toml::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
     config.validate()?;
@@ -285,6 +286,111 @@ pub(crate) fn load_graft_config_metadata(store: &GraftStore) -> Result<GraftConf
         let _ = config.repo_path(workspace, repo_id)?;
     }
     Ok(config)
+}
+
+fn reject_legacy_graft_config(text: &str, path: &Path) -> Result<()> {
+    let Ok(value) = toml::from_str::<toml::Value>(text) else {
+        return Ok(());
+    };
+    let Some(table) = value.as_table() else {
+        return Ok(());
+    };
+
+    let mut findings = Vec::new();
+
+    if table.contains_key("create") {
+        findings.push((
+            "[create]",
+            "delete this section; schema 1 no longer configures default_base/default_mode in graft.toml. Choose bases explicitly with the scratch/candidate base argument when needed.",
+        ));
+    }
+    if table.contains_key("constraints") {
+        findings.push((
+            "[constraints]",
+            "move inline constraint definitions out of graft.toml and into top-level constraint functions in constraints.roto.",
+        ));
+    }
+
+    if let Some(admission) = table.get("admission").and_then(toml::Value::as_table) {
+        if admission.contains_key("base_properties") {
+            findings.push((
+                "admission.base_properties",
+                "rename to admission.required; keep the same list syntax and make each name a constraint defined in constraints.roto.",
+            ));
+        }
+        if admission.contains_key("required_properties") {
+            findings.push((
+                "admission.required_properties",
+                "rename to admission.required; keep the same list syntax and make each name a constraint defined in constraints.roto.",
+            ));
+        }
+    }
+    if let Some(promotion) = table.get("promotion").and_then(toml::Value::as_table) {
+        if promotion.contains_key("required_properties") {
+            findings.push((
+                "promotion.required_properties",
+                "rename to promotion.required; keep the same list syntax and make each name a constraint defined in constraints.roto.",
+            ));
+        }
+        if promotion.contains_key("base_properties") {
+            findings.push((
+                "promotion.base_properties",
+                "rename to promotion.required; keep the same list syntax and make each name a constraint defined in constraints.roto.",
+            ));
+        }
+    }
+
+    if legacy_property_name_is_used(table, "ValidPatch") {
+        findings.push((
+            "ValidPatch",
+            "replace the legacy property name with a schema-1 constraint name defined in constraints.roto.",
+        ));
+    }
+
+    if findings.is_empty() {
+        return Ok(());
+    }
+
+    let mut message = format!(
+        "[E_LEGACY_GRAFT_CONFIG] {} uses legacy graft.toml keys that schema {} no longer accepts.",
+        path.display(),
+        default_config_schema()
+    );
+    message.push_str("\n  migrate:");
+    for (key, hint) in findings {
+        message.push_str(&format!("\n  - {key}: {hint}"));
+    }
+    message.push_str(
+        "\n  example: [admission] required = [\"no_generated_artifacts\"]; [promotion] required = []\n  next: update graft.toml, then run `graft constraint lock` if constraint requirements changed.",
+    );
+    bail!("{message}")
+}
+
+fn legacy_property_name_is_used(table: &toml::map::Map<String, toml::Value>, name: &str) -> bool {
+    ["admission", "promotion"].iter().any(|section| {
+        table
+            .get(*section)
+            .and_then(toml::Value::as_table)
+            .is_some_and(|section_table| {
+                ["base_properties", "required_properties", "required"]
+                    .iter()
+                    .filter_map(|key| section_table.get(*key))
+                    .any(|value| toml_value_contains_string(value, name))
+            })
+    })
+}
+
+fn toml_value_contains_string(value: &toml::Value, needle: &str) -> bool {
+    match value {
+        toml::Value::String(value) => value == needle,
+        toml::Value::Array(values) => values
+            .iter()
+            .any(|value| toml_value_contains_string(value, needle)),
+        toml::Value::Table(table) => table
+            .values()
+            .any(|value| toml_value_contains_string(value, needle)),
+        _ => false,
+    }
 }
 
 pub(crate) fn load_constraint_catalog(store: &GraftStore) -> Result<LoadedConstraints> {
@@ -823,6 +929,64 @@ any_of = ["fast_check", "slow_check"]
         let config: GraftConfig = toml::from_str("schema = 2").unwrap();
         let error = config.validate().unwrap_err().to_string();
         assert!(error.contains("[E_UNSUPPORTED_CONFIG_SCHEMA]"), "{error}");
+    }
+
+    #[test]
+    fn load_graft_config_metadata_reports_actionable_legacy_config_keys() {
+        let dir = test_workspace("legacy-config-keys");
+        let store = GraftStore::open(&dir);
+        store.init().unwrap();
+        std::fs::write(
+            dir.join("graft.toml"),
+            r#"
+[create]
+default_base = "graft:empty"
+default_mode = "scratch"
+
+[admission]
+base_properties = ["ValidPatch"]
+
+[promotion]
+required_properties = []
+"#,
+        )
+        .unwrap();
+
+        let error = load_graft_config_metadata(&store).unwrap_err().to_string();
+
+        let config_path = dir.join("graft.toml").display().to_string();
+        assert!(error.contains("[E_LEGACY_GRAFT_CONFIG]"), "{error}");
+        assert!(error.contains(&config_path), "{error}");
+        for needle in [
+            "[create]",
+            "admission.base_properties",
+            "admission.required",
+            "promotion.required_properties",
+            "promotion.required",
+            "ValidPatch",
+            "constraints.roto",
+            "graft constraint lock",
+        ] {
+            assert!(error.contains(needle), "missing {needle}: {error}");
+        }
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn load_graft_config_metadata_preserves_unknown_non_legacy_parse_context() {
+        let dir = test_workspace("unknown-config-key");
+        let store = GraftStore::open(&dir);
+        store.init().unwrap();
+        std::fs::write(dir.join("graft.toml"), "schema = 1\nsurprise = true\n").unwrap();
+
+        let error = load_graft_config_metadata(&store).unwrap_err();
+        let message = format!("{error:#}");
+
+        assert!(!message.contains("[E_LEGACY_GRAFT_CONFIG]"), "{message}");
+        assert!(message.contains("parse"), "{message}");
+        assert!(message.contains("unknown field"), "{message}");
+        assert!(message.contains("surprise"), "{message}");
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

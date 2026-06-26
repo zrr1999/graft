@@ -106,7 +106,7 @@ const AGENT_WORKFLOW_LONG_ABOUT: &str = concat!(
     "Recommended workflow for agents and pi-graft tools:\n",
     "1. Use `graft explain agent-workflow` or pi-graft `graft_help` when unsure; direct tool descriptions should stay short.\n",
     "2. Bootstrap and diagnose with `graft workspace init`, `graft workspace ps`, and `graft workspace doctor` before writing changes.\n",
-    "3. Draft only in scratch: use `graft scratch read|write|edit|delete --base <base> ...` and continue with `--from scratch:<digest>`, or use `graft scratch capture --base <base>` to stash-like capture cwd changes into scratch; scratch is daemon-backed draft state, not a candidate, patch, sync object, or Git ref.\n",
+    "3. Draft only in scratch: use `graft scratch read|write|edit|delete --base <base> ...` (or set `GRAFT_BASE_REF` as the implicit first-operation base) and continue with `--from scratch:<digest>`, or use `graft scratch capture --base <base>` / `GRAFT_BASE_REF=<base> graft scratch capture` to stash-like capture cwd changes into scratch; scratch is daemon-backed draft state, not a candidate, patch, sync object, or Git ref.\n",
     "4. Turn draft into reviewable state with `graft patch from-scratch scratch:<digest> --expect <Constraint> --message <msg>`; the patch from-scratch command generates a private local candidate and immediately validates any `--expect` constraints, but does not admit or promote it.\n",
     "5. Re-run or add evidence with `graft patch validate candidate:<digest> --expect <Constraint>` and inspect with `graft patch show`, `graft patch list --candidates`, or `graft patch search`.\n",
     "6. Admit only after required evidence passes: `graft patch admit candidate:<digest> --require <Constraint>`; admit generates a public patch and moves candidate evidence refs to the patch.\n",
@@ -117,8 +117,8 @@ const AGENT_WORKFLOW_LONG_ABOUT: &str = concat!(
 );
 
 const SCRATCH_LONG_ABOUT: &str = concat!(
-    "Scratch is only for draft file graph operations. Use `--base graft:empty|tree:<id>|candidate:<id>|patch:<id>` for the first read/write/edit/delete and `--from scratch:<digest>` for each continuation.\n",
-    "Scratch never creates a candidate or patch, never syncs, and never updates Git refs. `graft scratch capture --base <ref>` is the explicit stash-like cwd bridge: it captures cwd into scratch and restores captured paths to the base. Encode rename as delete plus write, then leave scratch with `graft patch from-scratch`."
+    "Scratch is only for draft file graph operations. Use `--base graft:empty|tree:<id>|candidate:<id>|patch:<id>` for the first read/write/edit/delete, or set process env `GRAFT_BASE_REF` and omit `--base` for the first operation. Use `--from scratch:<digest>` for each continuation; explicit `--base` wins and explicit `--from` ignores `GRAFT_BASE_REF`.\n",
+    "Scratch never creates a candidate or patch, never syncs, and never updates Git refs. `graft scratch capture --base <ref>` (or `GRAFT_BASE_REF=<ref> graft scratch capture`) is the explicit stash-like cwd bridge: it captures cwd into scratch and restores captured paths to the base. Encode rename as delete plus write, then leave scratch with `graft patch from-scratch`."
 );
 
 const CANDIDATE_LONG_ABOUT: &str = concat!(

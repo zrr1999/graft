@@ -12,19 +12,33 @@ impl ScratchEngine {
     }
 
     pub fn open(&self, base: VirtualBaseRef) -> Result<ScratchId> {
+        Ok(self.open_with_metadata(base)?.scratch)
+    }
+
+    pub fn open_with_metadata(&self, base: VirtualBaseRef) -> Result<ScratchOpen> {
         let base_tree = self.store.virtual_tree(&base)?;
         let base_state = base_state_for_ref(&self.store, &base)?;
         self.open_resolved(base_state, base_tree)
     }
 
     pub fn open_materialized(&self, base_state: StateId, tree_id: &str) -> Result<ScratchId> {
+        Ok(self
+            .open_materialized_with_metadata(base_state, tree_id)?
+            .scratch)
+    }
+
+    pub fn open_materialized_with_metadata(
+        &self,
+        base_state: StateId,
+        tree_id: &str,
+    ) -> Result<ScratchOpen> {
         let base_tree = self.store.read_tree_snapshot(tree_id)?;
         self.open_resolved(base_state, base_tree)
     }
 
-    fn open_resolved(&self, base_state: StateId, base_tree: TreeSnapshot) -> Result<ScratchId> {
+    fn open_resolved(&self, base_state: StateId, base_tree: TreeSnapshot) -> Result<ScratchOpen> {
         let tree_id = base_tree.id()?;
-        let node = ScratchNode::root(base_state, tree_id);
+        let node = ScratchNode::root(base_state.clone(), tree_id.clone());
         let id = scratch_id(&node)?;
         self.states.lock().expect("scratch state poisoned").insert(
             id.clone(),
@@ -34,7 +48,19 @@ impl ScratchEngine {
                 tree: base_tree,
             },
         );
-        Ok(id)
+        Ok(ScratchOpen {
+            scratch: id,
+            base_state,
+            base_tree: tree_id,
+        })
+    }
+
+    pub fn base_metadata(&self, scratch: &ScratchId) -> Result<ScratchBaseMetadata> {
+        let state = self.state(scratch)?;
+        Ok(ScratchBaseMetadata {
+            base_state: state.node.base_state,
+            base_tree: state.base_tree.id()?,
+        })
     }
 
     pub fn read(&self, scratch: &ScratchId, path: &str, mode: ReadMode) -> Result<ScratchRead> {
@@ -193,7 +219,7 @@ impl ScratchEngine {
             return Err(ScratchError::EmptyChange);
         }
 
-        let node = ScratchNode::root(base_state, target_tree_id.to_string());
+        let node = ScratchNode::root(base_state.clone(), target_tree_id.to_string());
         let id = scratch_id(&node)?;
         self.states.lock().expect("scratch state poisoned").insert(
             id.clone(),
@@ -206,6 +232,7 @@ impl ScratchEngine {
 
         Ok(ScratchCapture {
             scratch: id,
+            base_state,
             base_tree: base_tree_id.to_string(),
             target_tree: target_tree_id.to_string(),
             changed_paths,

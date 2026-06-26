@@ -62,7 +62,7 @@
 | `[E_SYNC_DEFAULT_WORKSPACE]`    | `ws:default` 是 machine-local workspace，不能 sync                         | 创建或 attach 一个 local workspace                                   |
 | `[E_SYNC_DISABLED]`             | 当前 workspace 显式设置了 `[sync] enabled = false`                              | 删除该 override，或在 graft.toml 设置 `[sync] enabled = true`          |
 | `[E_SYNC_REMOTE_REQUIRED]`      | `graft sync` 未传 `<remote>` 且 workspace 还没有 `.graft/local/remotes/default` | 先运行一次 `graft sync <remote>`                                      |
-| `[E_SYNC_REMOTE_INVALID]`       | sync remote 不存在、不是 Git 仓库，或已有非空非 Git 内容                                | 检查 remote 路径；首次 push 可用空目录或新路径                                  |
+| `[E_SYNC_REMOTE_INVALID]`       | sync remote 不存在、不是 Git 仓库/URL，或已有非空非 Git 内容                                | 检查 remote 路径/URL；本地首次 push 可用空目录或新路径                                  |
 | `[E_SYNC_DIVERGENCE]`           | sync manifest history 与本地 last_synced 不兼容                              | 先 fetch/review；或在允许 fetch 的 sync 中显式 `--on-divergence keep-remote` |
 | `[E_REMOTE_INCOMPLETE]`         | remote refs 指向的 facts/blobs/manifests object 缺失或不可解析              | 检查/修复 remote；不要接受这次 sync                              |
 
@@ -204,10 +204,10 @@ graft patch revert <patch:a>                # may [E_COMPOSE_CONFLICT]
 ### Scratch 草稿
 
 ```bash
-graft scratch read [--repo <repo-id>] (--base <base> | --from <scratch-id>) <path> --mode <hashlines|...>
-graft scratch write [--repo <repo-id>] (--base <base> | --from <scratch-id>) <path> --content <bytes>
-graft scratch edit [--repo <repo-id>] (--base <base> | --from <scratch-id>) <path> --edits <json>
-graft scratch delete [--repo <repo-id>] (--base <base> | --from <scratch-id>) <path>    # alias: rm
+graft scratch read [--repo <repo-id>] [--base <base> | --from <scratch-id>] <path> --mode <hashlines|...>
+graft scratch write [--repo <repo-id>] [--base <base> | --from <scratch-id>] <path> --content <bytes>
+graft scratch edit [--repo <repo-id>] [--base <base> | --from <scratch-id>] <path> --edits <json>
+graft scratch delete [--repo <repo-id>] [--base <base> | --from <scratch-id>] <path>    # alias: rm
 graft scratch diff <from-scratch-id> <to-scratch-id>
 graft scratch drop <scratch-id>
 graft scratch pin / unpin
@@ -216,7 +216,7 @@ graft scratch status
 graft patch from-scratch <scratch-id> --expect <constraint>... --message <msg>
 ```
 
-`scratch` namespace 只负责临时草稿读写、编辑、删除、diff、pin/drop；第一次操作用 `--base` 隐式创建 root scratch，后续操作用 `--from` 指向上一版 scratch。Rename 由 delete+write 表达，candidate / patch 生成在 scratch 外部完成。`graft patch from-scratch` 是 scratch→candidate 的规范生命周期命令；CLI 与 pi-graft 插件共同调用 daemon `candidate_from_scratch` wire op（request: `scratch`, `expected`, `producer`, `message`; response: `candidate`, `changed_paths`）。
+`scratch` namespace 只负责临时草稿读写、编辑、删除、diff、pin/drop；第一次操作用 `--base` 隐式创建 root scratch，或在 `--base`/`--from` 都省略时使用进程环境 `GRAFT_BASE_REF`。显式 `--base` 优先于环境，显式 `--from` 不读取环境；缺少三者时命令以 `E_MISSING_BASE` 失败。Rename 由 delete+write 表达，candidate / patch 生成在 scratch 外部完成。`graft patch from-scratch` 是 scratch→candidate 的规范生命周期命令；CLI 与 pi-graft 插件共同调用 daemon `candidate_from_scratch` wire op（request: `scratch`, `expected`, `producer`, `message`; response: `candidate`, `changed_paths`）。
 
 ### 维护
 
