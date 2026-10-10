@@ -4,7 +4,7 @@ default:
 
 # Install local development hooks and the CLI into the active Python environment
 install:
-    uvx prek install --install-hooks --hook-type pre-commit --hook-type commit-msg
+    uvx prek install --prepare-hooks
     uvx maturin develop
 
 # Build a platform wheel for the packaged CLI into dist/
