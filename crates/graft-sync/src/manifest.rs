@@ -7,9 +7,11 @@ use graft_core::blake3_hex_digest;
 use graft_core::stable_typed_id;
 use serde::{Deserialize, Serialize};
 
+use crate::git_transport::write_tree_commit_ref;
 use crate::{Result, SyncError};
 
 const MANIFEST_VERSION: u32 = 2;
+pub(crate) const MANIFESTS_REF: &str = "refs/graft/manifests";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -57,14 +59,14 @@ pub(crate) fn write_partition_ref(
     partition: PublicPartition,
 ) -> Result<String> {
     match partition {
-        PublicPartition::Facts => crate::write_tree_commit_ref(
+        PublicPartition::Facts => write_tree_commit_ref(
             repo,
             remote_public,
             is_public_fact_path,
             partition.ref_name(),
             "graft sync facts",
         ),
-        PublicPartition::Blobs => crate::write_tree_commit_ref(
+        PublicPartition::Blobs => write_tree_commit_ref(
             repo,
             &remote_public.join("blob"),
             |_| true,
@@ -94,11 +96,11 @@ pub(crate) fn write_manifest(
     };
     manifest.id = expected_manifest_id(&manifest)?;
     write_manifest_sidecar(remote_public, &manifest)?;
-    crate::write_tree_commit_ref(
+    write_tree_commit_ref(
         repo,
         &remote_public.join("manifest"),
         |_| true,
-        crate::MANIFESTS_REF,
+        MANIFESTS_REF,
         "graft sync manifests",
     )?;
     Ok(manifest)
