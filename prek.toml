@@ -17,7 +17,7 @@ hooks = [
 
 [[repos]]
 repo = "https://github.com/tombi-toml/tombi-pre-commit"
-rev = "v0.9.20"
+rev = "v1.9.0"
 hooks = [
   { id = "tombi-format", exclude = "^Cargo\\.lock$" },
   { id = "tombi-lint", args = ["--error-on-warnings"] },
@@ -32,43 +32,22 @@ hooks = [
 
 [[repos]]
 repo = "https://github.com/crate-ci/typos"
-rev = "v1.33.1"
+rev = "v1.51.1"
 hooks = [
   { id = "typos", args = ["--force-exclude"] },
 ]
 
 [[repos]]
 repo = "https://github.com/zendev-lab/zendev"
-rev = "v0.1.0"
+rev = "v0.5.0"
 hooks = [
-  { id = "zendev-commit-msg" },
+  { id = "zendev-message-check", args = ["--profile", "zendev"] },
 ]
 
 [[repos]]
 repo = "local"
 hooks = [
-  {
-    id = "cargo-fmt",
-    name = "cargo-fmt",
-    entry = "cargo fmt --all --",
-    language = "system",
-    types = ["rust"],
-    pass_filenames = false
-  },
-  {
-    id = "cargo-clippy",
-    name = "cargo-clippy",
-    entry = "cargo clippy --locked --workspace --all-targets -- -D warnings",
-    language = "system",
-    types = ["rust"],
-    pass_filenames = false
-  },
-  {
-    id = "lean-kernel",
-    name = "lean-kernel",
-    entry = "lean formal/kernel.lean",
-    language = "system",
-    files = '^formal/kernel\.lean$',
-    pass_filenames = false
-  },
+  { id = "cargo-fmt", name = "cargo-fmt", entry = "cargo fmt --all --", language = "system", types = ["rust"], pass_filenames = false },
+  { id = "cargo-clippy", name = "cargo-clippy", entry = "cargo clippy --locked --workspace --all-targets -- -D warnings", language = "system", types = ["rust"], pass_filenames = false },
+  { id = "lean-kernel", name = "lean-kernel", entry = "lean formal/kernel.lean", language = "system", files = '^formal/kernel\.lean$', pass_filenames = false },
 ]
